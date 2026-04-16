@@ -687,7 +687,7 @@
   <div class="callout callout-info">
     <strong>MCP OAuth</strong>
     Use browser-first alias login with <code>loom mcp auth login &lt;alias&gt;</code>.
-    MCP alias OAuth tokens are stored in <code>~/.loom/mcp_oauth_tokens.json</code> and are intentionally separate from <code>/auth</code> profile token refs.
+    New MCP OAuth writes use Loom's secret-ref account storage. The legacy <code>~/.loom/mcp_oauth_tokens.json</code> file is still readable during migration, but it is no longer the preferred credential authority.
     For headless flows, use manual fallback flags (<code>--manual-token</code> or callback-code entry).
   </div>
 

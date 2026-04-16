@@ -2,6 +2,9 @@ import { useState } from "react";
 
 import type {
   ApprovalFeedItem,
+  AccountCreateRequest,
+  AccountUpdateRequest,
+  AuthDraftSyncResult,
   ConversationApproval,
   ConversationDetail,
   ConversationMessage,
@@ -9,6 +12,11 @@ import type {
   ConversationSummary,
   ConversationStatus,
   ConversationStreamEvent,
+  IntegrationOAuthCompleteResult,
+  IntegrationOAuthStart,
+  MCPServerCreateRequest,
+  MCPServerActionResult,
+  MCPServerUpdateRequest,
   ModelInfo,
   NotificationEvent,
   RunArtifact,
@@ -17,10 +25,13 @@ import type {
   RunTimelineEvent,
   RuntimeStatus,
   SettingsPayload,
+  SetupCompleteRequest,
+  SetupStatus,
   WorkspaceArtifact,
   WorkspaceFileEntry,
   WorkspaceFilePreview,
   WorkspaceInventory,
+  WorkspaceIntegrations,
   WorkspaceOverview,
   WorkspaceSearchResponse,
   WorkspaceSettingsPayload,
@@ -48,6 +59,7 @@ export interface AppState {
   models: ModelInfo[];
   workspaces: WorkspaceSummary[];
   settings: SettingsPayload | null;
+  setupStatus: SetupStatus | null;
   runtimeManaged: boolean;
   connectionState: "connecting" | "connected" | "failed";
   desktopActivity: DesktopActivityState;
@@ -91,6 +103,11 @@ export interface AppState {
   // Overview & inventory
   overview: WorkspaceOverview | null;
   inventory: WorkspaceInventory | null;
+  integrations: WorkspaceIntegrations | null;
+  integrationIntent: {
+    kind: "add_local_server" | "add_remote_server" | "create_account" | "focus_issues";
+    requestedAt: number;
+  } | null;
   loadingOverview: boolean;
 
   // File tree
@@ -223,6 +240,8 @@ export interface AppState {
   filteredProcesses: Array<{ name: string; version: string; description: string; author: string; path: string }>;
   filteredMcpServers: Array<{ alias: string; type: string; enabled: boolean; source: string; command: string; url: string; cwd: string; timeout_seconds: number; oauth_enabled: boolean }>;
   filteredTools: Array<{ name: string; description: string; auth_mode: string; auth_required: boolean; execution_surfaces: string[] }>;
+  filteredIntegrationServers: WorkspaceIntegrations["mcp_servers"];
+  filteredAccounts: WorkspaceIntegrations["accounts"];
   filteredWorkspaceArtifacts: WorkspaceArtifact[];
   recentWorkspaceArtifacts: WorkspaceArtifact[];
   recentNotifications: NotificationEvent[];
@@ -323,7 +342,14 @@ export interface AppActions {
   setApprovalReplyDrafts: React.Dispatch<React.SetStateAction<Record<string, string>>>;
   setError: React.Dispatch<React.SetStateAction<string>>;
   retryConnection: () => void;
+  discoverSetupModels: (provider: string, baseUrl: string, apiKey?: string) => Promise<string[]>;
+  completeInitialSetup: (payload: SetupCompleteRequest) => Promise<void>;
   setNotice: React.Dispatch<React.SetStateAction<string>>;
+  setIntegrationIntent: React.Dispatch<React.SetStateAction<{
+    kind: "add_local_server" | "add_remote_server" | "create_account" | "focus_issues";
+    requestedAt: number;
+  } | null>>;
+  clearIntegrationIntent: () => void;
   setSelectedWorkspaceFilePath: React.Dispatch<React.SetStateAction<string>>;
   setWorkspaceFileEditorDraft: React.Dispatch<React.SetStateAction<string>>;
   setWorkspaceFileEditorDirty: React.Dispatch<React.SetStateAction<boolean>>;
@@ -407,6 +433,58 @@ export interface AppActions {
     },
   ) => Promise<void>;
   refreshApprovalInbox: (workspaceId: string) => Promise<void>;
+  handleCreateIntegrationServer: (
+    payload: MCPServerCreateRequest,
+    options?: {
+      testAfterSave?: boolean;
+    },
+  ) => Promise<boolean>;
+  handleUpdateIntegrationServer: (
+    alias: string,
+    payload: MCPServerUpdateRequest,
+    options?: {
+      testAfterSave?: boolean;
+    },
+  ) => Promise<boolean>;
+  handleDeleteIntegrationServer: (alias: string) => Promise<void>;
+  handleSetIntegrationEnabled: (
+    alias: string,
+    enabled: boolean,
+  ) => Promise<void>;
+  handleSetIntegrationApproval: (
+    alias: string,
+    nextState: "approved" | "rejected",
+  ) => Promise<void>;
+  handleSyncIntegrationDrafts: () => Promise<AuthDraftSyncResult | null>;
+  handleCreateIntegrationAccount: (
+    payload: AccountCreateRequest,
+  ) => Promise<boolean>;
+  handleUpdateIntegrationAccount: (
+    profileId: string,
+    payload: AccountUpdateRequest,
+  ) => Promise<boolean>;
+  handleArchiveIntegrationAccount: (profileId: string) => Promise<void>;
+  handleRestoreIntegrationAccount: (profileId: string) => Promise<void>;
+  handleTestIntegrationServer: (
+    alias: string,
+  ) => Promise<MCPServerActionResult | null>;
+  handleReconnectIntegrationServer: (
+    alias: string,
+  ) => Promise<MCPServerActionResult | null>;
+  handleSelectIntegrationAccountForServer: (
+    alias: string,
+    profileId: string,
+  ) => Promise<MCPServerActionResult | null>;
+  handleStartIntegrationAccountLogin: (
+    profileId: string,
+  ) => Promise<IntegrationOAuthStart | null>;
+  handleCompleteIntegrationAccountLogin: (
+    profileId: string,
+    flowId: string,
+    callbackInput?: string,
+  ) => Promise<IntegrationOAuthCompleteResult | null>;
+  handleRefreshIntegrationAccount: (profileId: string) => Promise<void>;
+  handleLogoutIntegrationAccount: (profileId: string) => Promise<void>;
   syncConversationSummary: (
     detail: ConversationDetail | ConversationSummary,
     options?: {
@@ -448,6 +526,10 @@ export function useAppState(): AppState & AppActions {
   const [showNewWorkspace, setShowNewWorkspace] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const [integrationIntent, setIntegrationIntent] = useState<{
+    kind: "add_local_server" | "add_remote_server" | "create_account" | "focus_issues";
+    requestedAt: number;
+  } | null>(null);
   const [selectedWorkspaceId, setSelectedWorkspaceId] = useState("");
   const [selectedConversationId, setSelectedConversationId] = useState("");
   const [selectedRunId, setSelectedRunId] = useState("");
@@ -561,6 +643,7 @@ export function useAppState(): AppState & AppActions {
     setSelectedWorkspaceId,
     setSelectedConversationId,
     setSelectedRunId,
+    setWorkspaceSearchQuery: workspace.setWorkspaceSearchQuery,
     setActiveTab,
     setRunProcess: runs.setRunProcess,
     setError,
@@ -584,6 +667,7 @@ export function useAppState(): AppState & AppActions {
     setActiveTab,
     setError,
     setNotice,
+    setIntegrationIntent,
     focusSearch: workspace.focusSearch,
     focusConversationComposer: conversation.focusConversationComposer,
     focusRunComposer: runs.focusRunComposer,
@@ -625,6 +709,9 @@ export function useAppState(): AppState & AppActions {
     setError,
     notice,
     setNotice,
+    integrationIntent,
+    setIntegrationIntent,
+    clearIntegrationIntent: () => setIntegrationIntent(null),
     selectedWorkspaceId,
     setSelectedWorkspaceId,
     selectedConversationId,
@@ -641,11 +728,14 @@ export function useAppState(): AppState & AppActions {
     models: connection.models,
     workspaces: connection.workspaces,
     settings: connection.settings,
+    setupStatus: connection.setupStatus,
     runtimeManaged: connection.runtimeManaged,
     connectionState: connection.connectionState,
     desktopActivity,
     settingsPreview: connection.settingsPreview,
     retryConnection: connection.retryConnection,
+    discoverSetupModels: connection.discoverSetupModels,
+    completeInitialSetup: connection.completeInitialSetup,
 
     // Workspace
     workspaceNameDraft: workspace.workspaceNameDraft,
@@ -673,6 +763,7 @@ export function useAppState(): AppState & AppActions {
     setWorkspaceSearchQuery: workspace.setWorkspaceSearchQuery,
     overview: workspace.overview,
     inventory: workspace.inventory,
+    integrations: workspace.integrations,
     loadingOverview: workspace.loadingOverview,
     approvalInbox: workspace.approvalInbox,
     notifications: workspace.notifications,
@@ -695,6 +786,8 @@ export function useAppState(): AppState & AppActions {
     filteredProcesses: workspace.filteredProcesses,
     filteredMcpServers: workspace.filteredMcpServers,
     filteredTools: workspace.filteredTools,
+    filteredIntegrationServers: workspace.filteredIntegrationServers,
+    filteredAccounts: workspace.filteredAccounts,
     filteredWorkspaceArtifacts: workspace.filteredWorkspaceArtifacts,
     recentWorkspaceArtifacts: workspace.recentWorkspaceArtifacts,
     recentNotifications: workspace.recentNotifications,
@@ -712,6 +805,24 @@ export function useAppState(): AppState & AppActions {
     refreshWorkspaceSurface: workspace.refreshWorkspaceSurface,
     refreshWorkspaceArtifacts: workspace.refreshWorkspaceArtifacts,
     refreshApprovalInbox: workspace.refreshApprovalInbox,
+    handleCreateIntegrationServer: workspace.handleCreateIntegrationServer,
+    handleUpdateIntegrationServer: workspace.handleUpdateIntegrationServer,
+    handleDeleteIntegrationServer: workspace.handleDeleteIntegrationServer,
+    handleSetIntegrationEnabled: workspace.handleSetIntegrationEnabled,
+    handleSetIntegrationApproval: workspace.handleSetIntegrationApproval,
+    handleSyncIntegrationDrafts: workspace.handleSyncIntegrationDrafts,
+    handleCreateIntegrationAccount: workspace.handleCreateIntegrationAccount,
+    handleUpdateIntegrationAccount: workspace.handleUpdateIntegrationAccount,
+    handleArchiveIntegrationAccount: workspace.handleArchiveIntegrationAccount,
+    handleRestoreIntegrationAccount: workspace.handleRestoreIntegrationAccount,
+    handleTestIntegrationServer: workspace.handleTestIntegrationServer,
+    handleReconnectIntegrationServer: workspace.handleReconnectIntegrationServer,
+    handleSelectIntegrationAccountForServer:
+      workspace.handleSelectIntegrationAccountForServer,
+    handleStartIntegrationAccountLogin: workspace.handleStartIntegrationAccountLogin,
+    handleCompleteIntegrationAccountLogin: workspace.handleCompleteIntegrationAccountLogin,
+    handleRefreshIntegrationAccount: workspace.handleRefreshIntegrationAccount,
+    handleLogoutIntegrationAccount: workspace.handleLogoutIntegrationAccount,
     syncConversationSummary: workspace.syncConversationSummary,
     setConversationProcessing: workspace.setConversationProcessing,
     removeConversationSummary: workspace.removeConversationSummary,

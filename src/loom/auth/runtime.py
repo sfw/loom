@@ -442,9 +442,9 @@ def _metadata_value(profile: AuthProfile, *keys: str) -> str:
 def oauth_provider_config_for_profile(profile: AuthProfile) -> OAuthProviderConfig | None:
     """Build shared OAuth engine provider config for one auth profile.
 
-    This is intentionally separate from MCP alias token storage. `/auth`
-    profiles continue using `token_ref`-backed secrets, while this helper only
-    exposes reusable browser-login metadata.
+    `/auth` profiles remain the durable credential authority. This helper only
+    exposes reusable browser-login metadata so CLI, TUI, API, and desktop flows
+    can share the same OAuth engine behavior.
     """
     mode = str(profile.mode or "").strip().lower()
     if mode not in {"oauth2_pkce", "oauth2_device"}:
@@ -504,8 +504,8 @@ def _validate_token_ref_separation(profile: AuthProfile) -> None:
     )
     if any(fragment in token_ref for fragment in forbidden_fragments):
         raise AuthResolutionError(
-            "Auth profile token_ref cannot point to MCP alias OAuth token store. "
-            "Keep `/auth` OAuth tokens separate from `~/.loom/mcp_oauth_tokens.json`."
+            "Auth profile token_ref cannot point to the legacy MCP alias OAuth "
+            "token store. Use Loom secret refs or keychain-backed token refs instead."
         )
 
 

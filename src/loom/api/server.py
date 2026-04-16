@@ -40,6 +40,15 @@ def create_app(config: Config | None = None, *, runtime_role: str = "api") -> Fa
             raise
         app.state.engine = engine
         yield
+        integration_oauth_runtime = getattr(app.state, "integration_oauth_runtime", None)
+        if integration_oauth_runtime is not None:
+            shutdown = getattr(
+                getattr(integration_oauth_runtime, "engine", None),
+                "shutdown",
+                None,
+            )
+            if callable(shutdown):
+                shutdown()
         await engine.shutdown()
 
     app = FastAPI(

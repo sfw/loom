@@ -15,6 +15,7 @@ import {
   MessageSquare,
   Play,
   FolderOpen,
+  Cable,
   Plus,
   ChevronDown,
   ChevronRight,
@@ -28,6 +29,7 @@ const NAV_ITEMS: Array<{ tab: ViewTab; label: string; icon: typeof LayoutDashboa
   { tab: "threads", label: "Threads", icon: MessageSquare },
   { tab: "runs", label: "Runs", icon: Play },
   { tab: "files", label: "Files", icon: FolderOpen },
+  { tab: "integrations", label: "Integrations", icon: Cable },
 ];
 
 type SectionKey = "conversations" | "runs";

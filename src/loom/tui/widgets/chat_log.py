@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 
+from rich.console import Group
 from rich.markdown import Markdown as RichMarkdown
 from rich.style import Style
+from rich.text import Text
 from textual import events
 from textual._context import NoActiveAppError
 from textual.containers import VerticalScroll
@@ -83,6 +86,66 @@ class LiveMarkdownWidget(VerticalScroll):
         self.border_title = title
 
 
+def _markdown_block_boundary(text: str) -> int:
+    """Return a safe prefix length that ends on a stable markdown block."""
+    if not text:
+        return 0
+
+    boundary = 0
+    in_fence = False
+    fence_marker = ""
+    consumed = 0
+    for line in text.splitlines(keepends=True):
+        stripped = line.strip()
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            marker = "```" if stripped.startswith("```") else "~~~"
+            if not in_fence:
+                in_fence = True
+                fence_marker = marker
+            elif marker == fence_marker:
+                in_fence = False
+                boundary = consumed + len(line)
+        elif not in_fence and not stripped:
+            boundary = consumed + len(line)
+        consumed += len(line)
+    return boundary
+
+
+@dataclass
+class StreamingMarkdownState:
+    """Keep a stable markdown prefix rendered separately during streaming."""
+
+    stable_prefix: str = ""
+    stable_renderable: object | None = None
+
+    def reset(self) -> None:
+        self.stable_prefix = ""
+        self.stable_renderable = None
+
+    def render(self, text: str) -> object:
+        current = str(text or "")
+        if not current.startswith(self.stable_prefix):
+            self.reset()
+
+        suffix = current[len(self.stable_prefix):]
+        advance = _markdown_block_boundary(suffix)
+        if advance > 0:
+            self.stable_prefix += suffix[:advance]
+            self.stable_renderable = RichMarkdown(self.stable_prefix)
+
+        unstable_suffix = current[len(self.stable_prefix):]
+        parts: list[object] = []
+        if self.stable_renderable is not None:
+            parts.append(self.stable_renderable)
+        if unstable_suffix:
+            parts.append(RichMarkdown(unstable_suffix))
+        if not parts:
+            return RichMarkdown("")
+        if len(parts) == 1:
+            return parts[0]
+        return Group(*parts)
+
+
 def append_live_feedback_chunk(current: str, chunk: str) -> str:
     """Join live-feedback chunks without breaking word-by-word streams."""
     normalized_chunk = str(chunk or "").replace("\r\n", "\n").replace("\r", "\n")
@@ -132,6 +195,13 @@ class ChatLog(VerticalScroll):
         padding: 0;
         width: 100%;
         max-width: 140;
+    }
+    ChatLog .thinking-msg {
+        margin: 0 0 1 0;
+        padding: 0 0 0 1;
+        width: 100%;
+        max-width: 140;
+        color: $text-muted;
     }
     ChatLog LiveMarkdownWidget {
         margin: 0 0 1 0;
@@ -188,6 +258,7 @@ class ChatLog(VerticalScroll):
         self._stream_buffer: list[str] = []
         self._stream_widget: LiveMarkdownWidget | Static | None = None
         self._stream_text: str = ""
+        self._stream_markdown = StreamingMarkdownState()
         self._stream_flush_interval_s = 0.12
         self._stream_flush_timer_pending = False
         self._feedback_widget: LiveMarkdownWidget | None = None
@@ -225,6 +296,21 @@ class ChatLog(VerticalScroll):
                 classes="model-text",
                 expand=True,
             )
+        self.mount(widget)
+        self._scroll_to_end()
+
+    def add_thinking_text(self, text: str) -> None:
+        """Append a transcript-only assistant thinking block."""
+        self._finalize_live_feedback()
+        self._flush_and_reset_stream()
+        widget = LinkAwareStatic(
+            Group(
+                Text("Thinking", style="italic dim"),
+                RichMarkdown(text or ""),
+            ),
+            classes="thinking-msg",
+            expand=True,
+        )
         self.mount(widget)
         self._scroll_to_end()
 
@@ -291,7 +377,7 @@ class ChatLog(VerticalScroll):
         if not self._stream_buffer or self._stream_widget is None:
             return False
         self._stream_text += "".join(self._stream_buffer)
-        self._stream_widget.update(RichMarkdown(self._stream_text))
+        self._stream_widget.update(self._stream_markdown.render(self._stream_text))
         self._stream_buffer.clear()
         return True
 
@@ -302,9 +388,10 @@ class ChatLog(VerticalScroll):
             if isinstance(self._stream_widget, LiveMarkdownWidget):
                 self._stream_widget.finalize(flatten=True)
             else:
-                self._stream_widget.update(RichMarkdown(self._stream_text))
+                self._stream_widget.update(self._stream_markdown.render(self._stream_text))
         self._stream_widget = None
         self._stream_text = ""
+        self._stream_markdown.reset()
         self._stream_flush_timer_pending = False
 
     def add_live_feedback(self, text: str) -> None:
@@ -447,6 +534,7 @@ class ChatLog(VerticalScroll):
         self._stream_buffer.clear()
         self._stream_widget = None
         self._stream_text = ""
+        self._stream_markdown.reset()
         self._stream_flush_timer_pending = False
         self._feedback_widget = None
         self._feedback_text = ""

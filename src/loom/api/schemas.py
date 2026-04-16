@@ -108,6 +108,27 @@ class ApprovalReplyRequest(BaseModel):
     client_id: str | None = None
 
 
+class SetupDiscoverModelsRequest(BaseModel):
+    provider: str
+    base_url: str
+    api_key: str = ""
+
+
+class SetupModelDraftRequest(BaseModel):
+    name: str
+    provider: str
+    base_url: str = ""
+    model: str
+    api_key: str = ""
+    roles: list[str] = Field(default_factory=list)
+    max_tokens: int = 8192
+    temperature: float = 0.1
+
+
+class SetupCompleteRequest(BaseModel):
+    models: list[SetupModelDraftRequest] = Field(default_factory=list)
+
+
 # --- Response Schemas ---
 
 
@@ -258,6 +279,29 @@ class RuntimeStatusResponse(BaseModel):
     tool_availability: list[dict[str, Any]] = Field(default_factory=list)
 
 
+class SetupProviderResponse(BaseModel):
+    display_name: str
+    provider_key: str
+    needs_api_key: bool = False
+    default_base_url: str = ""
+
+
+class SetupStatusResponse(BaseModel):
+    needs_setup: bool
+    config_path: str
+    providers: list[SetupProviderResponse] = Field(default_factory=list)
+    role_presets: dict[str, list[str]] = Field(default_factory=dict)
+
+
+class SetupDiscoverModelsResponse(BaseModel):
+    models: list[str] = Field(default_factory=list)
+
+
+class SetupCompleteResponse(BaseModel):
+    status: str
+    config_path: str
+
+
 class ActivitySummaryResponse(BaseModel):
     status: str
     active: bool
@@ -386,6 +430,7 @@ class WorkspaceSearchResponse(BaseModel):
     artifacts: list[WorkspaceSearchItemResponse] = Field(default_factory=list)
     files: list[WorkspaceSearchItemResponse] = Field(default_factory=list)
     processes: list[WorkspaceSearchItemResponse] = Field(default_factory=list)
+    accounts: list[WorkspaceSearchItemResponse] = Field(default_factory=list)
     mcp_servers: list[WorkspaceSearchItemResponse] = Field(default_factory=list)
     tools: list[WorkspaceSearchItemResponse] = Field(default_factory=list)
 
@@ -416,6 +461,193 @@ class MCPServerInfoResponse(BaseModel):
     cwd: str = ""
     timeout_seconds: int = 0
     oauth_enabled: bool = False
+
+
+class IntegrationAuthStateResponse(BaseModel):
+    state: str
+    label: str = ""
+    reason: str = ""
+    storage: str = ""
+    has_token: bool = False
+    expired: bool = False
+    expires_at: int | None = None
+    token_type: str | None = None
+    scopes: list[str] = Field(default_factory=list)
+    profile_id: str = ""
+    account_label: str = ""
+    mode: str = ""
+
+
+class IntegrationEffectiveAccountResponse(BaseModel):
+    profile_id: str
+    provider: str
+    account_label: str = ""
+    mode: str
+    status: str = "ready"
+    source: str = ""
+    source_path: str = ""
+    routing_reason: str = ""
+    auth_state: IntegrationAuthStateResponse
+
+
+class MCPServerManagementResponse(BaseModel):
+    alias: str
+    type: str
+    enabled: bool = True
+    source: str = ""
+    source_path: str = ""
+    source_label: str = ""
+    command: str = ""
+    args: list[str] = Field(default_factory=list)
+    url: str = ""
+    fallback_sse_url: str = ""
+    cwd: str = ""
+    timeout_seconds: int = 0
+    oauth_enabled: bool = False
+    oauth_scopes: list[str] = Field(default_factory=list)
+    allow_insecure_http: bool = False
+    allow_private_network: bool = False
+    trust_state: str = ""
+    trust_summary: str = ""
+    approval_required: bool = False
+    approval_state: str = "not_required"
+    runtime_state: str = ""
+    resource_id: str = ""
+    auth_provider: str = ""
+    auth_state: IntegrationAuthStateResponse
+    effective_account: IntegrationEffectiveAccountResponse | None = None
+    bound_profile_ids: list[str] = Field(default_factory=list)
+    remediation: list[str] = Field(default_factory=list)
+    flags: list[str] = Field(default_factory=list)
+
+
+class AccountInfoResponse(BaseModel):
+    profile_id: str
+    provider: str
+    account_label: str = ""
+    mode: str
+    status: str = "ready"
+    source: str = ""
+    source_path: str = ""
+    mcp_server: str = ""
+    token_ref: str = ""
+    secret_ref: str = ""
+    writable_storage_kind: str = ""
+    auth_state: IntegrationAuthStateResponse
+    default_selectors: list[str] = Field(default_factory=list)
+    bound_resource_refs: list[str] = Field(default_factory=list)
+    used_by_mcp_servers: list[str] = Field(default_factory=list)
+    effective_for_mcp_servers: list[str] = Field(default_factory=list)
+    remediation: list[str] = Field(default_factory=list)
+
+
+class AccountCreateRequest(BaseModel):
+    profile_id: str
+    provider: str
+    mode: str
+    account_label: str = ""
+    mcp_server: str = ""
+    secret_ref: str = ""
+    token_ref: str = ""
+    scopes: list[str] = Field(default_factory=list)
+    env: dict[str, str] = Field(default_factory=dict)
+    command: str = ""
+    auth_check: list[str] = Field(default_factory=list)
+    metadata: dict[str, str] = Field(default_factory=dict)
+    status: str = "draft"
+
+
+class AccountUpdateRequest(BaseModel):
+    account_label: str | None = None
+    mcp_server: str | None = None
+    clear_mcp_server: bool = False
+    secret_ref: str | None = None
+    token_ref: str | None = None
+    scopes: list[str] | None = None
+    env: dict[str, str] | None = None
+    command: str | None = None
+    auth_check: list[str] | None = None
+    metadata: dict[str, str] | None = None
+
+
+class WorkspaceIntegrationsResponse(BaseModel):
+    workspace: WorkspaceSummaryResponse
+    mcp_servers: list[MCPServerManagementResponse] = Field(default_factory=list)
+    accounts: list[AccountInfoResponse] = Field(default_factory=list)
+    counts: dict[str, int] = Field(default_factory=dict)
+
+
+class MCPServerCreateRequest(BaseModel):
+    alias: str
+    type: str
+    command: str = ""
+    args: list[str] = Field(default_factory=list)
+    env: dict[str, str] = Field(default_factory=dict)
+    url: str = ""
+    fallback_sse_url: str = ""
+    headers: dict[str, str] = Field(default_factory=dict)
+    oauth_enabled: bool = False
+    oauth_scopes: list[str] = Field(default_factory=list)
+    allow_insecure_http: bool = False
+    allow_private_network: bool = False
+    cwd: str = ""
+    timeout_seconds: int = 30
+    enabled: bool = True
+
+
+class MCPServerUpdateRequest(BaseModel):
+    type: str | None = None
+    command: str | None = None
+    args: list[str] | None = None
+    env: dict[str, str] | None = None
+    url: str | None = None
+    fallback_sse_url: str | None = None
+    headers: dict[str, str] | None = None
+    oauth_enabled: bool | None = None
+    oauth_scopes: list[str] | None = None
+    allow_insecure_http: bool | None = None
+    allow_private_network: bool | None = None
+    cwd: str | None = None
+    timeout_seconds: int | None = None
+    enabled: bool | None = None
+
+
+class MCPServerActionResponse(BaseModel):
+    alias: str
+    status: str = ""
+    message: str = ""
+    tool_count: int = 0
+    tool_names: list[str] = Field(default_factory=list)
+
+
+class IntegrationOAuthStartResponse(BaseModel):
+    flow_id: str
+    authorization_url: str
+    redirect_uri: str = ""
+    callback_mode: str = ""
+    expires_at_unix: int = 0
+    browser_warning: str = ""
+
+
+class IntegrationOAuthCompleteRequest(BaseModel):
+    flow_id: str
+    callback_input: str = ""
+
+
+class IntegrationOAuthCompleteResponse(BaseModel):
+    status: str
+    message: str = ""
+    account: AccountInfoResponse | None = None
+    expires_at: int | None = None
+    scopes: list[str] = Field(default_factory=list)
+
+
+class AuthDraftSyncResponse(BaseModel):
+    created_drafts: int = 0
+    created_bindings: int = 0
+    updated_defaults: int = 0
+    warnings: list[str] = Field(default_factory=list)
+    integrations: WorkspaceIntegrationsResponse
 
 
 class WorkspaceInventoryResponse(BaseModel):

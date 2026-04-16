@@ -57,6 +57,7 @@ export function useInbox(deps: {
   setSelectedWorkspaceId: React.Dispatch<React.SetStateAction<string>>;
   setSelectedConversationId: React.Dispatch<React.SetStateAction<string>>;
   setSelectedRunId: React.Dispatch<React.SetStateAction<string>>;
+  setWorkspaceSearchQuery: React.Dispatch<React.SetStateAction<string>>;
   setActiveTab: React.Dispatch<React.SetStateAction<ViewTab>>;
   setRunProcess: React.Dispatch<React.SetStateAction<string>>;
   setError: React.Dispatch<React.SetStateAction<string>>;
@@ -74,6 +75,7 @@ export function useInbox(deps: {
     setSelectedWorkspaceId,
     setSelectedConversationId,
     setSelectedRunId,
+    setWorkspaceSearchQuery,
     setActiveTab,
     setRunProcess,
     setError,
@@ -196,6 +198,24 @@ export function useInbox(deps: {
         setRunProcess(String(result.item_id || result.title || "").trim());
       });
       focusRunComposer();
+      return;
+    }
+    if (result.kind === "account" || result.kind === "mcp_server") {
+      const searchTerm = String(result.title || result.item_id || "").trim();
+      startTransition(() => {
+        if (targetWorkspaceId) {
+          setSelectedWorkspaceId(targetWorkspaceId);
+        }
+        setSelectedConversationId("");
+        setSelectedRunId("");
+        setWorkspaceSearchQuery(searchTerm);
+        setActiveTab("integrations");
+      });
+      setNotice(
+        result.kind === "account"
+          ? `Opened integrations for account ${String(result.title || result.item_id || "").trim()}.`
+          : `Opened integrations for server ${String(result.title || result.item_id || "").trim()}.`,
+      );
       return;
     }
     if ((result.kind === "artifact" || result.kind === "file") && result.path) {

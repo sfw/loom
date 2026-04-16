@@ -8,26 +8,54 @@ import {
 } from "react";
 
 import {
+  approveWorkspaceMcpServer,
+  archiveWorkspaceAuthAccount,
+  createWorkspaceAuthAccount,
+  completeWorkspaceAuthAccountLogin,
+  createWorkspaceMcpServer,
   createWorkspace,
   createWorkspaceDirectory,
+  deleteWorkspaceMcpServer,
   fetchApprovals,
   fetchWorkspaceArtifacts,
   fetchWorkspaceInventory,
+  fetchWorkspaceIntegrations,
   fetchWorkspaceOverview,
   fetchWorkspaceSearch,
   fetchWorkspaceSettings,
   fetchWorkspaces,
+  logoutWorkspaceAuthAccount,
   patchWorkspace,
+  selectWorkspaceMcpAccount,
+  reconnectWorkspaceMcpServer,
+  refreshWorkspaceAuthAccount,
+  rejectWorkspaceMcpServer,
+  restoreWorkspaceAuthAccount,
+  setWorkspaceMcpServerEnabled,
+  startWorkspaceAuthAccountLogin,
   subscribeNotificationsStream,
+  syncWorkspaceAuthDrafts,
+  testWorkspaceMcpServer,
+  updateWorkspaceAuthAccount,
+  updateWorkspaceMcpServer,
   type ApprovalFeedItem,
+  type AccountCreateRequest,
+  type AccountUpdateRequest,
+  type AuthDraftSyncResult,
   type ConversationDetail,
   type ConversationSummary,
+  type IntegrationOAuthCompleteResult,
+  type IntegrationOAuthStart,
+  type MCPServerCreateRequest,
+  type MCPServerActionResult,
+  type MCPServerUpdateRequest,
   type NotificationEvent,
   type RunDetail,
   type RunSummary,
   type RuntimeStatus,
   type WorkspaceArtifact,
   type WorkspaceInventory,
+  type WorkspaceIntegrations,
   type WorkspaceOverview,
   type WorkspaceSearchResponse,
   type WorkspaceSettingsPayload,
@@ -69,6 +97,7 @@ export interface WorkspaceState {
   workspaceSearchQuery: string;
   overview: WorkspaceOverview | null;
   inventory: WorkspaceInventory | null;
+  integrations: WorkspaceIntegrations | null;
   loadingOverview: boolean;
   approvalInbox: ApprovalFeedItem[];
   notifications: NotificationEvent[];
@@ -93,6 +122,8 @@ export interface WorkspaceState {
   filteredProcesses: Array<{ name: string; version: string; description: string; author: string; path: string }>;
   filteredMcpServers: Array<{ alias: string; type: string; enabled: boolean; source: string; command: string; url: string; cwd: string; timeout_seconds: number; oauth_enabled: boolean }>;
   filteredTools: Array<{ name: string; description: string; auth_mode: string; auth_required: boolean; execution_surfaces: string[] }>;
+  filteredIntegrationServers: WorkspaceIntegrations["mcp_servers"];
+  filteredAccounts: WorkspaceIntegrations["accounts"];
   filteredWorkspaceArtifacts: WorkspaceArtifact[];
   recentWorkspaceArtifacts: WorkspaceArtifact[];
   recentNotifications: NotificationEvent[];
@@ -133,6 +164,56 @@ export interface WorkspaceActions {
     },
   ) => Promise<void>;
   refreshApprovalInbox: (workspaceId: string) => Promise<void>;
+  handleCreateIntegrationServer: (
+    payload: MCPServerCreateRequest,
+    options?: {
+      testAfterSave?: boolean;
+    },
+  ) => Promise<boolean>;
+  handleUpdateIntegrationServer: (
+    alias: string,
+    payload: MCPServerUpdateRequest,
+    options?: {
+      testAfterSave?: boolean;
+    },
+  ) => Promise<boolean>;
+  handleDeleteIntegrationServer: (alias: string) => Promise<void>;
+  handleSetIntegrationEnabled: (
+    alias: string,
+    enabled: boolean,
+  ) => Promise<void>;
+  handleSetIntegrationApproval: (
+    alias: string,
+    nextState: "approved" | "rejected",
+  ) => Promise<void>;
+  handleSyncIntegrationDrafts: () => Promise<AuthDraftSyncResult | null>;
+  handleCreateIntegrationAccount: (
+    payload: AccountCreateRequest,
+  ) => Promise<boolean>;
+  handleUpdateIntegrationAccount: (
+    profileId: string,
+    payload: AccountUpdateRequest,
+  ) => Promise<boolean>;
+  handleArchiveIntegrationAccount: (profileId: string) => Promise<void>;
+  handleRestoreIntegrationAccount: (profileId: string) => Promise<void>;
+  handleTestIntegrationServer: (alias: string) => Promise<MCPServerActionResult | null>;
+  handleReconnectIntegrationServer: (
+    alias: string,
+  ) => Promise<MCPServerActionResult | null>;
+  handleSelectIntegrationAccountForServer: (
+    alias: string,
+    profileId: string,
+  ) => Promise<MCPServerActionResult | null>;
+  handleStartIntegrationAccountLogin: (
+    profileId: string,
+  ) => Promise<IntegrationOAuthStart | null>;
+  handleCompleteIntegrationAccountLogin: (
+    profileId: string,
+    flowId: string,
+    callbackInput?: string,
+  ) => Promise<IntegrationOAuthCompleteResult | null>;
+  handleRefreshIntegrationAccount: (profileId: string) => Promise<void>;
+  handleLogoutIntegrationAccount: (profileId: string) => Promise<void>;
   syncConversationSummary: (
     detail: ConversationSummary | ConversationDetail,
     options?: {
@@ -225,6 +306,7 @@ export function useWorkspace(deps: {
 
   const [overview, setOverview] = useState<WorkspaceOverview | null>(null);
   const [inventory, setInventory] = useState<WorkspaceInventory | null>(null);
+  const [integrations, setIntegrations] = useState<WorkspaceIntegrations | null>(null);
   const [loadingOverview, setLoadingOverview] = useState(false);
   const [approvalInbox, setApprovalInbox] = useState<ApprovalFeedItem[]>([]);
   const [notifications, setNotifications] = useState<NotificationEvent[]>([]);
@@ -267,9 +349,11 @@ export function useWorkspace(deps: {
   const overviewRef = useRef<WorkspaceOverview | null>(null);
   const loadedWorkspaceArtifactsIdRef = useRef("");
   const loadedWorkspaceInventoryIdRef = useRef("");
+  const loadedWorkspaceIntegrationsIdRef = useRef("");
   const loadedWorkspaceSettingsIdRef = useRef("");
   const loadingWorkspaceArtifactsIdRef = useRef("");
   const loadingWorkspaceInventoryIdRef = useRef("");
+  const loadingWorkspaceIntegrationsIdRef = useRef("");
   const loadingWorkspaceSettingsIdRef = useRef("");
 
   // ---------------------------------------------------------------------------
@@ -606,6 +690,28 @@ export function useWorkspace(deps: {
     }
   });
 
+  const refreshWorkspaceIntegrationsState = useEffectEvent(async (workspaceId: string) => {
+    if (
+      loadedWorkspaceIntegrationsIdRef.current === workspaceId
+      || loadingWorkspaceIntegrationsIdRef.current === workspaceId
+    ) {
+      return;
+    }
+    loadingWorkspaceIntegrationsIdRef.current = workspaceId;
+    try {
+      const integrationsPayload = await fetchWorkspaceIntegrations(workspaceId);
+      if (selectedWorkspaceIdRef.current !== workspaceId) {
+        return;
+      }
+      setIntegrations(integrationsPayload);
+      loadedWorkspaceIntegrationsIdRef.current = workspaceId;
+    } finally {
+      if (loadingWorkspaceIntegrationsIdRef.current === workspaceId) {
+        loadingWorkspaceIntegrationsIdRef.current = "";
+      }
+    }
+  });
+
   const refreshWorkspaceSettingsState = useEffectEvent(async (workspaceId: string) => {
     if (
       loadedWorkspaceSettingsIdRef.current === workspaceId
@@ -635,6 +741,10 @@ export function useWorkspace(deps: {
     }
     if (activeTab === "runs") {
       await refreshWorkspaceInventoryState(workspaceId);
+      return;
+    }
+    if (activeTab === "integrations") {
+      await refreshWorkspaceIntegrationsState(workspaceId);
       return;
     }
     if (activeTab === "settings") {
@@ -1251,14 +1361,17 @@ export function useWorkspace(deps: {
       setApprovalInbox([]);
       setNotifications([]);
       setInventory(null);
+      setIntegrations(null);
       setWorkspaceArtifacts([]);
       setWorkspaceSearchResults(null);
       setWorkspaceSettings(null);
       loadedWorkspaceArtifactsIdRef.current = "";
       loadedWorkspaceInventoryIdRef.current = "";
+      loadedWorkspaceIntegrationsIdRef.current = "";
       loadedWorkspaceSettingsIdRef.current = "";
       loadingWorkspaceArtifactsIdRef.current = "";
       loadingWorkspaceInventoryIdRef.current = "";
+      loadingWorkspaceIntegrationsIdRef.current = "";
       loadingWorkspaceSettingsIdRef.current = "";
       lastSeenNotificationStreamIdRef.current = 0;
       previousWorkspaceIdRef.current = "";
@@ -1269,23 +1382,28 @@ export function useWorkspace(deps: {
     if (connectionState !== "connected") {
       loadedWorkspaceArtifactsIdRef.current = "";
       loadedWorkspaceInventoryIdRef.current = "";
+      loadedWorkspaceIntegrationsIdRef.current = "";
       loadedWorkspaceSettingsIdRef.current = "";
       loadingWorkspaceArtifactsIdRef.current = "";
       loadingWorkspaceInventoryIdRef.current = "";
+      loadingWorkspaceIntegrationsIdRef.current = "";
       loadingWorkspaceSettingsIdRef.current = "";
       if (!hasMatchingOverview) {
         setOverview(null);
         setApprovalInbox([]);
         setNotifications([]);
         setInventory(null);
+        setIntegrations(null);
         setWorkspaceArtifacts([]);
         setWorkspaceSearchResults(null);
         setWorkspaceSettings(null);
         loadedWorkspaceArtifactsIdRef.current = "";
         loadedWorkspaceInventoryIdRef.current = "";
+        loadedWorkspaceIntegrationsIdRef.current = "";
         loadedWorkspaceSettingsIdRef.current = "";
         loadingWorkspaceArtifactsIdRef.current = "";
         loadingWorkspaceInventoryIdRef.current = "";
+        loadingWorkspaceIntegrationsIdRef.current = "";
         loadingWorkspaceSettingsIdRef.current = "";
         lastSeenNotificationStreamIdRef.current = 0;
       }
@@ -1300,14 +1418,17 @@ export function useWorkspace(deps: {
       setApprovalInbox([]);
       setNotifications([]);
       setInventory(null);
+      setIntegrations(null);
       setWorkspaceArtifacts([]);
       setWorkspaceSearchResults(null);
       setWorkspaceSettings(null);
       loadedWorkspaceArtifactsIdRef.current = "";
       loadedWorkspaceInventoryIdRef.current = "";
+      loadedWorkspaceIntegrationsIdRef.current = "";
       loadedWorkspaceSettingsIdRef.current = "";
       loadingWorkspaceArtifactsIdRef.current = "";
       loadingWorkspaceInventoryIdRef.current = "";
+      loadingWorkspaceIntegrationsIdRef.current = "";
       loadingWorkspaceSettingsIdRef.current = "";
       lastSeenNotificationStreamIdRef.current = 0;
     }
@@ -1359,6 +1480,7 @@ export function useWorkspace(deps: {
             setOverview(null);
             setWorkspaceSettings(null);
             setInventory(null);
+            setIntegrations(null);
             setWorkspaceArtifacts([]);
           }
         }
@@ -1396,6 +1518,17 @@ export function useWorkspace(deps: {
       void refreshWorkspaceInventoryState(selectedWorkspaceId).catch((err) => {
         if (!isTransientRequestError(err)) {
           setError(err instanceof Error ? err.message : "Failed to load workspace inventory.");
+        }
+      });
+      return;
+    }
+    if (activeTab === "integrations") {
+      if (loadedWorkspaceIntegrationsIdRef.current === selectedWorkspaceId) {
+        return;
+      }
+      void refreshWorkspaceIntegrationsState(selectedWorkspaceId).catch((err) => {
+        if (!isTransientRequestError(err)) {
+          setError(err instanceof Error ? err.message : "Failed to load integrations.");
         }
       });
       return;
@@ -1596,6 +1729,34 @@ export function useWorkspace(deps: {
       tool.execution_surfaces.join(" "),
     ),
   );
+  const filteredIntegrationServers = (integrations?.mcp_servers || []).filter((server) =>
+    matchesWorkspaceSearch(
+      workspaceSearchQuery,
+      server.alias,
+      server.type,
+      server.source_label,
+      server.trust_summary,
+      server.runtime_state,
+      server.auth_state.label,
+      server.auth_provider,
+      server.effective_account?.account_label,
+      server.remediation.join(" "),
+    ),
+  );
+  const filteredAccounts = (integrations?.accounts || []).filter((account) =>
+    matchesWorkspaceSearch(
+      workspaceSearchQuery,
+      account.profile_id,
+      account.provider,
+      account.account_label,
+      account.mode,
+      account.status,
+      account.auth_state.label,
+      account.used_by_mcp_servers.join(" "),
+      account.effective_for_mcp_servers.join(" "),
+      account.remediation.join(" "),
+    ),
+  );
   const filteredWorkspaceArtifacts = workspaceArtifacts.filter((artifact) =>
     matchesWorkspaceSearch(
       workspaceSearchQuery,
@@ -1635,6 +1796,7 @@ export function useWorkspace(deps: {
         { label: "Artifacts", rows: workspaceSearchResults.artifacts },
         { label: "Files", rows: workspaceSearchResults.files },
         { label: "Processes", rows: workspaceSearchResults.processes },
+        { label: "Accounts", rows: workspaceSearchResults.accounts },
         { label: "MCP servers", rows: workspaceSearchResults.mcp_servers },
         { label: "Tools", rows: workspaceSearchResults.tools },
       ]
@@ -1836,12 +1998,425 @@ export function useWorkspace(deps: {
     }
   }
 
+  async function handleSetIntegrationApproval(
+    alias: string,
+    nextState: "approved" | "rejected",
+  ) {
+    if (!selectedWorkspaceId) {
+      setError("Select a workspace before updating integrations.");
+      return;
+    }
+    setError("");
+    setNotice("");
+    try {
+      if (nextState === "approved") {
+        await approveWorkspaceMcpServer(selectedWorkspaceId, alias);
+      } else {
+        await rejectWorkspaceMcpServer(selectedWorkspaceId, alias);
+      }
+      loadedWorkspaceIntegrationsIdRef.current = "";
+      await refreshWorkspaceIntegrationsState(selectedWorkspaceId);
+      setNotice(
+        nextState === "approved"
+          ? `Approved MCP server ${alias}.`
+          : `Rejected MCP server ${alias}.`,
+      );
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : `Failed to ${nextState === "approved" ? "approve" : "reject"} ${alias}.`,
+      );
+    }
+  }
+
+  async function handleCreateIntegrationServer(
+    payload: MCPServerCreateRequest,
+    options?: {
+      testAfterSave?: boolean;
+    },
+  ) {
+    if (!selectedWorkspaceId) {
+      setError("Select a workspace before updating integrations.");
+      return false;
+    }
+    setError("");
+    setNotice("");
+    try {
+      const created = await createWorkspaceMcpServer(selectedWorkspaceId, payload);
+      loadedWorkspaceIntegrationsIdRef.current = "";
+      await refreshWorkspaceIntegrationsState(selectedWorkspaceId);
+      if (options?.testAfterSave) {
+        const tested = await testWorkspaceMcpServer(selectedWorkspaceId, created.alias);
+        setNotice(tested.message || `Saved and tested MCP server ${created.alias}.`);
+      } else {
+        setNotice(`Added MCP server ${created.alias}.`);
+      }
+      return true;
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : "Failed to create MCP server.",
+      );
+      return false;
+    }
+  }
+
+  async function handleUpdateIntegrationServer(
+    alias: string,
+    payload: MCPServerUpdateRequest,
+    options?: {
+      testAfterSave?: boolean;
+    },
+  ) {
+    if (!selectedWorkspaceId) {
+      setError("Select a workspace before updating integrations.");
+      return false;
+    }
+    setError("");
+    setNotice("");
+    try {
+      await updateWorkspaceMcpServer(selectedWorkspaceId, alias, payload);
+      loadedWorkspaceIntegrationsIdRef.current = "";
+      await refreshWorkspaceIntegrationsState(selectedWorkspaceId);
+      if (options?.testAfterSave) {
+        const tested = await testWorkspaceMcpServer(selectedWorkspaceId, alias);
+        setNotice(tested.message || `Saved and tested MCP server ${alias}.`);
+      } else {
+        setNotice(`Updated MCP server ${alias}.`);
+      }
+      return true;
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : `Failed to update MCP server ${alias}.`,
+      );
+      return false;
+    }
+  }
+
+  async function handleDeleteIntegrationServer(alias: string) {
+    if (!selectedWorkspaceId) {
+      setError("Select a workspace before updating integrations.");
+      return;
+    }
+    setError("");
+    setNotice("");
+    try {
+      const result = await deleteWorkspaceMcpServer(selectedWorkspaceId, alias);
+      loadedWorkspaceIntegrationsIdRef.current = "";
+      await refreshWorkspaceIntegrationsState(selectedWorkspaceId);
+      setNotice(result.message || `Deleted MCP server ${alias}.`);
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : `Failed to delete MCP server ${alias}.`,
+      );
+    }
+  }
+
+  async function handleSetIntegrationEnabled(alias: string, enabled: boolean) {
+    if (!selectedWorkspaceId) {
+      setError("Select a workspace before updating integrations.");
+      return;
+    }
+    setError("");
+    setNotice("");
+    try {
+      const updated = await setWorkspaceMcpServerEnabled(
+        selectedWorkspaceId,
+        alias,
+        enabled,
+      );
+      loadedWorkspaceIntegrationsIdRef.current = "";
+      await refreshWorkspaceIntegrationsState(selectedWorkspaceId);
+      setNotice(
+        enabled
+          ? `Enabled MCP server ${updated.alias}.`
+          : `Disabled MCP server ${updated.alias}.`,
+      );
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : `Failed to ${enabled ? "enable" : "disable"} MCP server ${alias}.`,
+      );
+    }
+  }
+
+  async function handleSyncIntegrationDrafts() {
+    if (!selectedWorkspaceId) {
+      setError("Select a workspace before updating integrations.");
+      return null;
+    }
+    setError("");
+    setNotice("");
+    try {
+      const result = await syncWorkspaceAuthDrafts(selectedWorkspaceId);
+      setIntegrations(result.integrations);
+      loadedWorkspaceIntegrationsIdRef.current = selectedWorkspaceId;
+      setNotice(
+        result.created_drafts > 0
+          ? `Created ${result.created_drafts} draft account${result.created_drafts === 1 ? "" : "s"}.`
+          : "Checked for missing account drafts.",
+      );
+      return result;
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : "Failed to create account drafts.",
+      );
+      return null;
+    }
+  }
+
+  async function handleCreateIntegrationAccount(payload: AccountCreateRequest) {
+    if (!selectedWorkspaceId) {
+      setError("Select a workspace before updating integrations.");
+      return false;
+    }
+    setError("");
+    setNotice("");
+    try {
+      const account = await createWorkspaceAuthAccount(selectedWorkspaceId, payload);
+      loadedWorkspaceIntegrationsIdRef.current = "";
+      await refreshWorkspaceIntegrationsState(selectedWorkspaceId);
+      setNotice(`Added account ${account.account_label || account.profile_id}.`);
+      return true;
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : "Failed to create account.",
+      );
+      return false;
+    }
+  }
+
+  async function handleUpdateIntegrationAccount(
+    profileId: string,
+    payload: AccountUpdateRequest,
+  ) {
+    if (!selectedWorkspaceId) {
+      setError("Select a workspace before updating integrations.");
+      return false;
+    }
+    setError("");
+    setNotice("");
+    try {
+      const account = await updateWorkspaceAuthAccount(
+        selectedWorkspaceId,
+        profileId,
+        payload,
+      );
+      loadedWorkspaceIntegrationsIdRef.current = "";
+      await refreshWorkspaceIntegrationsState(selectedWorkspaceId);
+      setNotice(`Updated account ${account.account_label || account.profile_id}.`);
+      return true;
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : `Failed to update account ${profileId}.`,
+      );
+      return false;
+    }
+  }
+
+  async function handleArchiveIntegrationAccount(profileId: string) {
+    if (!selectedWorkspaceId) {
+      setError("Select a workspace before updating integrations.");
+      return;
+    }
+    setError("");
+    setNotice("");
+    try {
+      const account = await archiveWorkspaceAuthAccount(selectedWorkspaceId, profileId);
+      loadedWorkspaceIntegrationsIdRef.current = "";
+      await refreshWorkspaceIntegrationsState(selectedWorkspaceId);
+      setNotice(`Archived account ${account.account_label || account.profile_id}.`);
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : `Failed to archive account ${profileId}.`,
+      );
+    }
+  }
+
+  async function handleRestoreIntegrationAccount(profileId: string) {
+    if (!selectedWorkspaceId) {
+      setError("Select a workspace before updating integrations.");
+      return;
+    }
+    setError("");
+    setNotice("");
+    try {
+      const account = await restoreWorkspaceAuthAccount(selectedWorkspaceId, profileId);
+      loadedWorkspaceIntegrationsIdRef.current = "";
+      await refreshWorkspaceIntegrationsState(selectedWorkspaceId);
+      setNotice(`Restored account ${account.account_label || account.profile_id}.`);
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : `Failed to restore account ${profileId}.`,
+      );
+    }
+  }
+
+  async function handleTestIntegrationServer(alias: string) {
+    if (!selectedWorkspaceId) {
+      setError("Select a workspace before testing integrations.");
+      return null;
+    }
+    setError("");
+    setNotice("");
+    try {
+      const result = await testWorkspaceMcpServer(selectedWorkspaceId, alias);
+      setNotice(result.message || `Tested MCP server ${alias}.`);
+      return result;
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : `Failed to test MCP server ${alias}.`,
+      );
+      return null;
+    }
+  }
+
+  async function handleReconnectIntegrationServer(alias: string) {
+    if (!selectedWorkspaceId) {
+      setError("Select a workspace before reconnecting integrations.");
+      return null;
+    }
+    setError("");
+    setNotice("");
+    try {
+      const result = await reconnectWorkspaceMcpServer(selectedWorkspaceId, alias);
+      loadedWorkspaceIntegrationsIdRef.current = "";
+      await refreshWorkspaceIntegrationsState(selectedWorkspaceId);
+      setNotice(result.message || `Reconnected MCP server ${alias}.`);
+      return result;
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : `Failed to reconnect MCP server ${alias}.`,
+      );
+      return null;
+    }
+  }
+
+  async function handleSelectIntegrationAccountForServer(
+    alias: string,
+    profileId: string,
+  ) {
+    if (!selectedWorkspaceId) {
+      setError("Select a workspace before updating integrations.");
+      return null;
+    }
+    setError("");
+    setNotice("");
+    try {
+      const result = await selectWorkspaceMcpAccount(
+        selectedWorkspaceId,
+        alias,
+        profileId,
+      );
+      loadedWorkspaceIntegrationsIdRef.current = "";
+      await refreshWorkspaceIntegrationsState(selectedWorkspaceId);
+      setNotice(result.message || `Updated account routing for ${alias}.`);
+      return result;
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : `Failed to select account ${profileId} for ${alias}.`,
+      );
+      return null;
+    }
+  }
+
+  async function handleStartIntegrationAccountLogin(profileId: string) {
+    if (!selectedWorkspaceId) {
+      setError("Select a workspace before connecting an account.");
+      return null;
+    }
+    setError("");
+    setNotice("");
+    try {
+      return await startWorkspaceAuthAccountLogin(selectedWorkspaceId, profileId);
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : `Failed to start login for ${profileId}.`,
+      );
+      return null;
+    }
+  }
+
+  async function handleCompleteIntegrationAccountLogin(
+    profileId: string,
+    flowId: string,
+    callbackInput = "",
+  ) {
+    if (!selectedWorkspaceId) {
+      setError("Select a workspace before connecting an account.");
+      return null;
+    }
+    setError("");
+    try {
+      const result = await completeWorkspaceAuthAccountLogin(
+        selectedWorkspaceId,
+        profileId,
+        {
+          flow_id: flowId,
+          callback_input: callbackInput,
+        },
+      );
+      if (result.status === "completed") {
+        loadedWorkspaceIntegrationsIdRef.current = "";
+        await refreshWorkspaceIntegrationsState(selectedWorkspaceId);
+        setNotice(result.message || `Connected account ${profileId}.`);
+      }
+      return result;
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : `Failed to complete login for ${profileId}.`,
+      );
+      return null;
+    }
+  }
+
+  async function handleRefreshIntegrationAccount(profileId: string) {
+    if (!selectedWorkspaceId) {
+      setError("Select a workspace before refreshing an account.");
+      return;
+    }
+    setError("");
+    setNotice("");
+    try {
+      await refreshWorkspaceAuthAccount(selectedWorkspaceId, profileId);
+      loadedWorkspaceIntegrationsIdRef.current = "";
+      await refreshWorkspaceIntegrationsState(selectedWorkspaceId);
+      setNotice(`Refreshed account ${profileId}.`);
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : `Failed to refresh account ${profileId}.`,
+      );
+    }
+  }
+
+  async function handleLogoutIntegrationAccount(profileId: string) {
+    if (!selectedWorkspaceId) {
+      setError("Select a workspace before disconnecting an account.");
+      return;
+    }
+    setError("");
+    setNotice("");
+    try {
+      await logoutWorkspaceAuthAccount(selectedWorkspaceId, profileId);
+      loadedWorkspaceIntegrationsIdRef.current = "";
+      await refreshWorkspaceIntegrationsState(selectedWorkspaceId);
+      setNotice(`Disconnected account ${profileId}.`);
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : `Failed to disconnect account ${profileId}.`,
+      );
+    }
+  }
+
   function handlePrefillStarterWorkspace() {
     const defaultParent = runtime?.workspace_default_path || createParentPath || "";
     setCreateParentPath(defaultParent);
     setCreateFolderName((current) => current || "loom-starter");
     setCreateDisplayName((current) => current || "Starter Workspace");
-    
+
     setError("");
   }
 
@@ -1870,6 +2445,7 @@ export function useWorkspace(deps: {
     workspaceSearchQuery,
     overview,
     inventory,
+    integrations,
     loadingOverview,
     approvalInbox,
     notifications,
@@ -1894,6 +2470,8 @@ export function useWorkspace(deps: {
     filteredProcesses,
     filteredMcpServers,
     filteredTools,
+    filteredIntegrationServers,
+    filteredAccounts,
     filteredWorkspaceArtifacts,
     recentWorkspaceArtifacts,
     recentNotifications,
@@ -1930,6 +2508,23 @@ export function useWorkspace(deps: {
     refreshWorkspaceSurface,
     refreshWorkspaceArtifacts,
     refreshApprovalInbox,
+    handleCreateIntegrationServer,
+    handleUpdateIntegrationServer,
+    handleDeleteIntegrationServer,
+    handleSetIntegrationEnabled,
+    handleSetIntegrationApproval,
+    handleSyncIntegrationDrafts,
+    handleCreateIntegrationAccount,
+    handleUpdateIntegrationAccount,
+    handleArchiveIntegrationAccount,
+    handleRestoreIntegrationAccount,
+    handleTestIntegrationServer,
+    handleReconnectIntegrationServer,
+    handleSelectIntegrationAccountForServer,
+    handleStartIntegrationAccountLogin,
+    handleCompleteIntegrationAccountLogin,
+    handleRefreshIntegrationAccount,
+    handleLogoutIntegrationAccount,
     syncConversationSummary,
     setConversationProcessing,
     removeConversationSummary,

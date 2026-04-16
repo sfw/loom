@@ -21,6 +21,8 @@ vi.mock("./OverviewTab", () => ({ default: () => <div>Overview</div> }));
 vi.mock("./ThreadsTab", () => ({ default: () => <div>Threads</div> }));
 vi.mock("./RunsTab", () => ({ default: () => <div>Runs</div> }));
 vi.mock("./FilesTab", () => ({ default: () => <div>Files</div> }));
+vi.mock("./IntegrationsTab", () => ({ default: () => <div>Integrations</div> }));
+vi.mock("./DesktopSetupWizard", () => ({ default: () => <div>Setup Wizard</div> }));
 vi.mock("./SettingsPanel", () => ({ default: () => <div>Settings</div> }));
 vi.mock("./WorkspaceModal", () => ({ default: () => <div>Workspace Modal</div> }));
 vi.mock("../CommandPalette", () => ({ default: () => <div>Command Palette</div> }));
@@ -89,6 +91,8 @@ describe("AppShell close confirmation", () => {
       selectedWorkspaceId: "workspace-1",
       commandPaletteOpen: false,
       setCommandPaletteOpen: vi.fn(),
+      discoverSetupModels: vi.fn(),
+      completeInitialSetup: vi.fn(),
       commandDraft: "",
       setCommandDraft: vi.fn(),
       commandInputRef: { current: null },
@@ -106,6 +110,7 @@ describe("AppShell close confirmation", () => {
       setError: vi.fn(),
       setNotice: vi.fn(),
       runtime: { ready: true, version: "0.3.0" },
+      setupStatus: { needs_setup: false, config_path: "/tmp/.loom/loom.toml", providers: [], role_presets: {} },
       overview: {
         workspace: null,
         recent_conversations: [],
@@ -213,5 +218,28 @@ describe("AppShell close confirmation", () => {
       screen.getByText("Connection to Loomd dropped. Retrying automatically..."),
     ).toBeInTheDocument();
     expect(screen.queryByText("Cannot reach Loomd")).not.toBeInTheDocument();
+  });
+
+  it("renders the integrations tab as a first-class top-level surface", () => {
+    mockApp.activeTab = "integrations";
+
+    render(<AppShell />);
+
+    expect(screen.getByText("Integrations")).toBeInTheDocument();
+    expect(screen.queryByText("Settings")).not.toBeInTheDocument();
+  });
+
+  it("blocks on the first-run setup wizard when models are not configured yet", () => {
+    mockApp.setupStatus = {
+      needs_setup: true,
+      config_path: "/tmp/.loom/loom.toml",
+      providers: [],
+      role_presets: {},
+    };
+
+    render(<AppShell />);
+
+    expect(screen.getByText("Setup Wizard")).toBeInTheDocument();
+    expect(screen.queryByText("Sidebar")).not.toBeInTheDocument();
   });
 });

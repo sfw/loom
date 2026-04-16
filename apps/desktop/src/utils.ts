@@ -183,4 +183,4 @@ export function isTransientRequestError(error: unknown): boolean {
   ].some((needle) => message.includes(needle));
 }
 
-export type ViewTab = "overview" | "threads" | "runs" | "files" | "settings";
+export type ViewTab = "overview" | "threads" | "runs" | "files" | "integrations" | "settings";

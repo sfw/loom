@@ -211,7 +211,7 @@ client.patch(
 
 Loom exposes itself as an [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server, making it discoverable as a tool by any MCP-compatible agent.
 
-For remote MCP aliases that require OAuth, Loom uses browser-first login (`loom mcp auth login <alias>`) and stores alias tokens in `~/.loom/mcp_oauth_tokens.json`. This storage is separate from `/auth` profile token refs.
+For remote MCP aliases that require OAuth, Loom uses browser-first login (`loom mcp auth login <alias>`) and now persists new token material through Loom's secret-ref account storage. The legacy `~/.loom/mcp_oauth_tokens.json` file remains readable during migration, but it is no longer the preferred credential authority.
 
 ### Available MCP Tools
 

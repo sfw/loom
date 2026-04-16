@@ -5,31 +5,69 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useWorkspace } from "./useWorkspace";
 
 const apiMocks = vi.hoisted(() => ({
+  approveWorkspaceMcpServer: vi.fn(),
+  archiveWorkspaceAuthAccount: vi.fn(),
+  createWorkspaceAuthAccount: vi.fn(),
+  completeWorkspaceAuthAccountLogin: vi.fn(),
+  createWorkspaceMcpServer: vi.fn(),
   createWorkspace: vi.fn(),
   createWorkspaceDirectory: vi.fn(),
+  deleteWorkspaceMcpServer: vi.fn(),
   fetchApprovals: vi.fn(),
   fetchWorkspaceArtifacts: vi.fn(),
   fetchWorkspaceInventory: vi.fn(),
+  fetchWorkspaceIntegrations: vi.fn(),
   fetchWorkspaceOverview: vi.fn(),
   fetchWorkspaceSearch: vi.fn(),
   fetchWorkspaceSettings: vi.fn(),
   fetchWorkspaces: vi.fn(),
+  logoutWorkspaceAuthAccount: vi.fn(),
   patchWorkspace: vi.fn(),
+  selectWorkspaceMcpAccount: vi.fn(),
+  reconnectWorkspaceMcpServer: vi.fn(),
+  refreshWorkspaceAuthAccount: vi.fn(),
+  rejectWorkspaceMcpServer: vi.fn(),
+  restoreWorkspaceAuthAccount: vi.fn(),
+  setWorkspaceMcpServerEnabled: vi.fn(),
+  startWorkspaceAuthAccountLogin: vi.fn(),
   subscribeNotificationsStream: vi.fn(() => () => {}),
+  syncWorkspaceAuthDrafts: vi.fn(),
+  testWorkspaceMcpServer: vi.fn(),
+  updateWorkspaceAuthAccount: vi.fn(),
+  updateWorkspaceMcpServer: vi.fn(),
 }));
 
 vi.mock("../api", () => ({
+  approveWorkspaceMcpServer: apiMocks.approveWorkspaceMcpServer,
+  archiveWorkspaceAuthAccount: apiMocks.archiveWorkspaceAuthAccount,
+  createWorkspaceAuthAccount: apiMocks.createWorkspaceAuthAccount,
+  completeWorkspaceAuthAccountLogin: apiMocks.completeWorkspaceAuthAccountLogin,
+  createWorkspaceMcpServer: apiMocks.createWorkspaceMcpServer,
   createWorkspace: apiMocks.createWorkspace,
   createWorkspaceDirectory: apiMocks.createWorkspaceDirectory,
+  deleteWorkspaceMcpServer: apiMocks.deleteWorkspaceMcpServer,
   fetchApprovals: apiMocks.fetchApprovals,
   fetchWorkspaceArtifacts: apiMocks.fetchWorkspaceArtifacts,
   fetchWorkspaceInventory: apiMocks.fetchWorkspaceInventory,
+  fetchWorkspaceIntegrations: apiMocks.fetchWorkspaceIntegrations,
   fetchWorkspaceOverview: apiMocks.fetchWorkspaceOverview,
   fetchWorkspaceSearch: apiMocks.fetchWorkspaceSearch,
   fetchWorkspaceSettings: apiMocks.fetchWorkspaceSettings,
   fetchWorkspaces: apiMocks.fetchWorkspaces,
+  logoutWorkspaceAuthAccount: apiMocks.logoutWorkspaceAuthAccount,
   patchWorkspace: apiMocks.patchWorkspace,
+  selectWorkspaceMcpAccount: apiMocks.selectWorkspaceMcpAccount,
+  reconnectWorkspaceMcpServer: apiMocks.reconnectWorkspaceMcpServer,
+  refreshWorkspaceAuthAccount: apiMocks.refreshWorkspaceAuthAccount,
+  rejectWorkspaceMcpServer: apiMocks.rejectWorkspaceMcpServer,
+  restoreWorkspaceAuthAccount: apiMocks.restoreWorkspaceAuthAccount,
+  setWorkspaceMcpServerEnabled: apiMocks.setWorkspaceMcpServerEnabled,
+  startWorkspaceAuthAccountLogin: apiMocks.startWorkspaceAuthAccountLogin,
   subscribeNotificationsStream: apiMocks.subscribeNotificationsStream,
+  syncWorkspaceAuthDrafts: apiMocks.syncWorkspaceAuthDrafts,
+  testWorkspaceMcpServer: apiMocks.testWorkspaceMcpServer,
+  updateWorkspaceAuthAccount: apiMocks.updateWorkspaceAuthAccount,
+  updateWorkspaceMcpServer: apiMocks.updateWorkspaceMcpServer,
 }));
 
 vi.mock("../history", () => ({
@@ -42,17 +80,36 @@ describe("useWorkspace", () => {
   });
 
   beforeEach(() => {
+    apiMocks.createWorkspaceMcpServer.mockReset();
+    apiMocks.createWorkspaceAuthAccount.mockReset();
     apiMocks.createWorkspace.mockReset();
     apiMocks.createWorkspaceDirectory.mockReset();
+    apiMocks.approveWorkspaceMcpServer.mockReset();
+    apiMocks.archiveWorkspaceAuthAccount.mockReset();
+    apiMocks.completeWorkspaceAuthAccountLogin.mockReset();
+    apiMocks.deleteWorkspaceMcpServer.mockReset();
     apiMocks.fetchApprovals.mockReset();
     apiMocks.fetchWorkspaceArtifacts.mockReset();
     apiMocks.fetchWorkspaceInventory.mockReset();
+    apiMocks.fetchWorkspaceIntegrations.mockReset();
     apiMocks.fetchWorkspaceOverview.mockReset();
     apiMocks.fetchWorkspaceSearch.mockReset();
     apiMocks.fetchWorkspaceSettings.mockReset();
     apiMocks.fetchWorkspaces.mockReset();
+    apiMocks.logoutWorkspaceAuthAccount.mockReset();
     apiMocks.patchWorkspace.mockReset();
+    apiMocks.selectWorkspaceMcpAccount.mockReset();
+    apiMocks.reconnectWorkspaceMcpServer.mockReset();
+    apiMocks.refreshWorkspaceAuthAccount.mockReset();
+    apiMocks.rejectWorkspaceMcpServer.mockReset();
+    apiMocks.restoreWorkspaceAuthAccount.mockReset();
+    apiMocks.setWorkspaceMcpServerEnabled.mockReset();
+    apiMocks.startWorkspaceAuthAccountLogin.mockReset();
     apiMocks.subscribeNotificationsStream.mockClear();
+    apiMocks.syncWorkspaceAuthDrafts.mockReset();
+    apiMocks.testWorkspaceMcpServer.mockReset();
+    apiMocks.updateWorkspaceAuthAccount.mockReset();
+    apiMocks.updateWorkspaceMcpServer.mockReset();
 
     apiMocks.fetchWorkspaceOverview.mockResolvedValue({
       workspace: {
@@ -80,8 +137,321 @@ describe("useWorkspace", () => {
       tools: [],
       mcp_servers: [],
     });
+    apiMocks.fetchWorkspaceIntegrations.mockResolvedValue({
+      workspace: {
+        id: "workspace-1",
+        canonical_path: "/tmp/workspace",
+        display_name: "Workspace 1",
+      },
+      mcp_servers: [],
+      accounts: [],
+      counts: {},
+    });
     apiMocks.fetchWorkspaceArtifacts.mockResolvedValue([]);
     apiMocks.fetchWorkspaceSearch.mockResolvedValue(null);
+    apiMocks.syncWorkspaceAuthDrafts.mockResolvedValue({
+      created_drafts: 0,
+      created_bindings: 0,
+      updated_defaults: 0,
+      warnings: [],
+      integrations: {
+        workspace: {
+          id: "workspace-1",
+          canonical_path: "/tmp/workspace",
+          display_name: "Workspace 1",
+        },
+        mcp_servers: [],
+        accounts: [],
+        counts: {},
+      },
+    });
+    apiMocks.testWorkspaceMcpServer.mockResolvedValue({
+      alias: "demo",
+      status: "ok",
+      message: "ok",
+      tool_count: 0,
+      tool_names: [],
+    });
+    apiMocks.reconnectWorkspaceMcpServer.mockResolvedValue({
+      alias: "demo",
+      status: "ready",
+      message: "ready",
+      tool_count: 0,
+      tool_names: [],
+    });
+    apiMocks.createWorkspaceMcpServer.mockResolvedValue({
+      alias: "demo",
+      type: "remote",
+      enabled: true,
+      source: "workspace",
+      source_path: "/tmp/workspace/.loom/mcp.toml",
+      source_label: "Workspace config",
+      command: "",
+      url: "https://mcp.demo.example",
+      cwd: "",
+      timeout_seconds: 30,
+      oauth_enabled: true,
+      trust_state: "review_recommended",
+      trust_summary: "Workspace-defined remote server. Review provenance before relying on it.",
+      approval_required: true,
+      approval_state: "pending",
+      runtime_state: "pending_approval",
+      resource_id: "resource-mcp-demo",
+      auth_provider: "demo",
+      auth_state: {
+        state: "missing",
+        label: "Not connected",
+        reason: "",
+        storage: "none",
+        has_token: false,
+        expired: false,
+        expires_at: null,
+        token_type: null,
+        scopes: [],
+        profile_id: "",
+        account_label: "",
+        mode: "",
+      },
+      effective_account: null,
+      bound_profile_ids: [],
+      remediation: [],
+      flags: [],
+    });
+    apiMocks.updateWorkspaceMcpServer.mockResolvedValue({
+      alias: "demo",
+      type: "remote",
+      enabled: true,
+      source: "workspace",
+      source_path: "/tmp/workspace/.loom/mcp.toml",
+      source_label: "Workspace config",
+      command: "",
+      url: "https://mcp.demo.example",
+      cwd: "",
+      timeout_seconds: 30,
+      oauth_enabled: true,
+      trust_state: "review_recommended",
+      trust_summary: "Workspace-defined remote server. Review provenance before relying on it.",
+      approval_required: true,
+      approval_state: "pending",
+      runtime_state: "pending_approval",
+      resource_id: "resource-mcp-demo",
+      auth_provider: "demo",
+      auth_state: {
+        state: "missing",
+        label: "Not connected",
+        reason: "",
+        storage: "none",
+        has_token: false,
+        expired: false,
+        expires_at: null,
+        token_type: null,
+        scopes: [],
+        profile_id: "",
+        account_label: "",
+        mode: "",
+      },
+      effective_account: null,
+      bound_profile_ids: [],
+      remediation: [],
+      flags: [],
+    });
+    apiMocks.createWorkspaceAuthAccount.mockResolvedValue({
+      profile_id: "notion_personal",
+      provider: "notion",
+      account_label: "Notion Personal",
+      mode: "oauth2_pkce",
+      status: "draft",
+      source: "user",
+      source_path: "/tmp/.loom/auth.toml",
+      mcp_server: "notion",
+      token_ref: "keychain://loom/notion/notion_personal/tokens",
+      secret_ref: "",
+      writable_storage_kind: "keychain",
+      auth_state: {
+        state: "draft",
+        label: "Draft",
+        reason: "Complete this draft account before Loom can use it.",
+        storage: "profile",
+        has_token: false,
+        expired: false,
+        expires_at: null,
+        token_type: null,
+        scopes: [],
+        profile_id: "notion_personal",
+        account_label: "Notion Personal",
+        mode: "oauth2_pkce",
+      },
+      default_selectors: [],
+      bound_resource_refs: [],
+      used_by_mcp_servers: [],
+      effective_for_mcp_servers: [],
+      remediation: [],
+    });
+    apiMocks.updateWorkspaceAuthAccount.mockResolvedValue({
+      profile_id: "notion_personal",
+      provider: "notion",
+      account_label: "Notion Personal",
+      mode: "oauth2_pkce",
+      status: "draft",
+      source: "user",
+      source_path: "/tmp/.loom/auth.toml",
+      mcp_server: "notion",
+      token_ref: "keychain://loom/notion/notion_personal/tokens",
+      secret_ref: "",
+      writable_storage_kind: "keychain",
+      auth_state: {
+        state: "draft",
+        label: "Draft",
+        reason: "Complete this draft account before Loom can use it.",
+        storage: "profile",
+        has_token: false,
+        expired: false,
+        expires_at: null,
+        token_type: null,
+        scopes: [],
+        profile_id: "notion_personal",
+        account_label: "Notion Personal",
+        mode: "oauth2_pkce",
+      },
+      default_selectors: [],
+      bound_resource_refs: [],
+      used_by_mcp_servers: [],
+      effective_for_mcp_servers: [],
+      remediation: [],
+    });
+    apiMocks.archiveWorkspaceAuthAccount.mockResolvedValue({
+      profile_id: "notion_personal",
+      provider: "notion",
+      account_label: "Notion Personal",
+      mode: "oauth2_pkce",
+      status: "archived",
+      source: "user",
+      source_path: "/tmp/.loom/auth.toml",
+      mcp_server: "notion",
+      token_ref: "keychain://loom/notion/notion_personal/tokens",
+      secret_ref: "",
+      writable_storage_kind: "keychain",
+      auth_state: {
+        state: "archived",
+        label: "Archived",
+        reason: "This account is archived and will not be selected.",
+        storage: "profile",
+        has_token: false,
+        expired: false,
+        expires_at: null,
+        token_type: null,
+        scopes: [],
+        profile_id: "notion_personal",
+        account_label: "Notion Personal",
+        mode: "oauth2_pkce",
+      },
+      default_selectors: [],
+      bound_resource_refs: [],
+      used_by_mcp_servers: [],
+      effective_for_mcp_servers: [],
+      remediation: [],
+    });
+    apiMocks.restoreWorkspaceAuthAccount.mockResolvedValue({
+      profile_id: "notion_personal",
+      provider: "notion",
+      account_label: "Notion Personal",
+      mode: "oauth2_pkce",
+      status: "draft",
+      source: "user",
+      source_path: "/tmp/.loom/auth.toml",
+      mcp_server: "notion",
+      token_ref: "keychain://loom/notion/notion_personal/tokens",
+      secret_ref: "",
+      writable_storage_kind: "keychain",
+      auth_state: {
+        state: "draft",
+        label: "Draft",
+        reason: "Complete this draft account before Loom can use it.",
+        storage: "profile",
+        has_token: false,
+        expired: false,
+        expires_at: null,
+        token_type: null,
+        scopes: [],
+        profile_id: "notion_personal",
+        account_label: "Notion Personal",
+        mode: "oauth2_pkce",
+      },
+      default_selectors: [],
+      bound_resource_refs: [],
+      used_by_mcp_servers: [],
+      effective_for_mcp_servers: [],
+      remediation: [],
+    });
+    apiMocks.deleteWorkspaceMcpServer.mockResolvedValue({
+      alias: "demo",
+      status: "ok",
+      message: "deleted",
+      tool_count: 0,
+      tool_names: [],
+    });
+    apiMocks.setWorkspaceMcpServerEnabled.mockResolvedValue({
+      alias: "demo",
+      type: "remote",
+      enabled: false,
+      source: "workspace",
+      source_path: "/tmp/workspace/.loom/mcp.toml",
+      source_label: "Workspace config",
+      command: "",
+      url: "https://mcp.demo.example",
+      cwd: "",
+      timeout_seconds: 30,
+      oauth_enabled: true,
+      trust_state: "review_recommended",
+      trust_summary: "Workspace-defined remote server. Review provenance before relying on it.",
+      approval_required: true,
+      approval_state: "pending",
+      runtime_state: "disabled",
+      resource_id: "resource-mcp-demo",
+      auth_provider: "demo",
+      auth_state: {
+        state: "missing",
+        label: "Not connected",
+        reason: "",
+        storage: "none",
+        has_token: false,
+        expired: false,
+        expires_at: null,
+        token_type: null,
+        scopes: [],
+        profile_id: "",
+        account_label: "",
+        mode: "",
+      },
+      effective_account: null,
+      bound_profile_ids: [],
+      remediation: [],
+      flags: [],
+    });
+    apiMocks.selectWorkspaceMcpAccount.mockResolvedValue({
+      alias: "demo",
+      status: "ok",
+      message: "selected",
+      tool_count: 0,
+      tool_names: [],
+    });
+    apiMocks.startWorkspaceAuthAccountLogin.mockResolvedValue({
+      flow_id: "flow-1",
+      authorization_url: "https://example.com/oauth",
+      redirect_uri: "http://127.0.0.1:8765/oauth/callback",
+      callback_mode: "loopback",
+      expires_at_unix: 123,
+      browser_warning: "",
+    });
+    apiMocks.completeWorkspaceAuthAccountLogin.mockResolvedValue({
+      status: "completed",
+      message: "done",
+      account: null,
+      expires_at: null,
+      scopes: [],
+    });
+    apiMocks.refreshWorkspaceAuthAccount.mockResolvedValue({});
+    apiMocks.logoutWorkspaceAuthAccount.mockResolvedValue({});
   });
 
   it("coalesces notification-triggered refreshes into one workspace refresh burst", async () => {
@@ -872,6 +1242,61 @@ describe("useWorkspace", () => {
     expect(apiMocks.fetchWorkspaceSettings).not.toHaveBeenCalled();
   });
 
+  it("fetches integrations lazily only when the integrations tab becomes visible", async () => {
+    const { rerender } = renderHook(
+      ({ activeTab }: { activeTab: "threads" | "integrations" }) =>
+        useWorkspace({
+          selectedWorkspaceId: "workspace-1",
+          selectedConversationId: "",
+          selectedRunId: "",
+          setSelectedWorkspaceId: vi.fn(),
+          showArchivedWorkspaces: false,
+          setShowArchivedWorkspaces: vi.fn(),
+          createParentPath: "/tmp",
+          setCreateParentPath: vi.fn(),
+          workspaces: [{
+            id: "workspace-1",
+            canonical_path: "/tmp/workspace",
+            display_name: "Workspace 1",
+            metadata: {},
+            is_archived: false,
+            sort_order: 0,
+          }] as any,
+          setWorkspaces: vi.fn(),
+          runtime: null,
+          setError: vi.fn(),
+          setNotice: vi.fn(),
+          activeTab,
+          setActiveTab: vi.fn(),
+          setSelectedConversationId: vi.fn(),
+          setSelectedRunId: vi.fn(),
+        }),
+      {
+        initialProps: {
+          activeTab: "threads",
+        },
+      },
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(apiMocks.fetchWorkspaceIntegrations).not.toHaveBeenCalled();
+
+    rerender({ activeTab: "integrations" });
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(apiMocks.fetchWorkspaceIntegrations).toHaveBeenCalledWith("workspace-1");
+    expect(apiMocks.fetchWorkspaceInventory).not.toHaveBeenCalled();
+    expect(apiMocks.fetchWorkspaceSettings).not.toHaveBeenCalled();
+  });
+
   it("allows launcher flows to force-refresh workspace artifacts without reloading the full surface", async () => {
     const { result } = renderHook(() =>
       useWorkspace({
@@ -1288,5 +1713,184 @@ describe("useWorkspace", () => {
     expect(apiMocks.fetchApprovals).not.toHaveBeenCalled();
     expect(apiMocks.fetchWorkspaceInventory).not.toHaveBeenCalled();
     expect(apiMocks.fetchWorkspaceArtifacts).not.toHaveBeenCalled();
+  });
+
+  it("selects an existing account for an MCP server and refreshes integrations", async () => {
+    const setError = vi.fn();
+    const setNotice = vi.fn();
+    const { result } = renderHook(() =>
+      useWorkspace({
+        selectedWorkspaceId: "workspace-1",
+        selectedConversationId: "",
+        selectedRunId: "",
+        setSelectedWorkspaceId: vi.fn(),
+        showArchivedWorkspaces: false,
+        setShowArchivedWorkspaces: vi.fn(),
+        createParentPath: "/tmp",
+        setCreateParentPath: vi.fn(),
+        workspaces: [{
+          id: "workspace-1",
+          canonical_path: "/tmp/workspace",
+          display_name: "Workspace 1",
+          metadata: {},
+          is_archived: false,
+          sort_order: 0,
+        }] as any,
+        setWorkspaces: vi.fn(),
+        runtime: null,
+        setError,
+        setNotice,
+        activeTab: "integrations",
+        setActiveTab: vi.fn(),
+        setSelectedConversationId: vi.fn(),
+        setSelectedRunId: vi.fn(),
+      }),
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    apiMocks.fetchWorkspaceIntegrations.mockClear();
+
+    await act(async () => {
+      await result.current.handleSelectIntegrationAccountForServer(
+        "notion",
+        "notion_marketing",
+      );
+    });
+
+    expect(apiMocks.selectWorkspaceMcpAccount).toHaveBeenCalledWith(
+      "workspace-1",
+      "notion",
+      "notion_marketing",
+    );
+    expect(apiMocks.fetchWorkspaceIntegrations).toHaveBeenCalledWith("workspace-1");
+    expect(setNotice).toHaveBeenCalledWith("selected");
+    expect(setError).toHaveBeenCalledWith("");
+  });
+
+  it("creates an MCP server and refreshes integrations", async () => {
+    const setError = vi.fn();
+    const setNotice = vi.fn();
+    const { result } = renderHook(() =>
+      useWorkspace({
+        selectedWorkspaceId: "workspace-1",
+        selectedConversationId: "",
+        selectedRunId: "",
+        setSelectedWorkspaceId: vi.fn(),
+        showArchivedWorkspaces: false,
+        setShowArchivedWorkspaces: vi.fn(),
+        createParentPath: "/tmp",
+        setCreateParentPath: vi.fn(),
+        workspaces: [{
+          id: "workspace-1",
+          canonical_path: "/tmp/workspace",
+          display_name: "Workspace 1",
+          metadata: {},
+          is_archived: false,
+          sort_order: 0,
+        }] as any,
+        setWorkspaces: vi.fn(),
+        runtime: null,
+        setError,
+        setNotice,
+        activeTab: "integrations",
+        setActiveTab: vi.fn(),
+        setSelectedConversationId: vi.fn(),
+        setSelectedRunId: vi.fn(),
+      }),
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    apiMocks.fetchWorkspaceIntegrations.mockClear();
+
+    await act(async () => {
+      await result.current.handleCreateIntegrationServer({
+        alias: "demo",
+        type: "remote",
+        url: "https://mcp.demo.example",
+        oauth_enabled: true,
+        oauth_scopes: ["read"],
+      });
+    });
+
+    expect(apiMocks.createWorkspaceMcpServer).toHaveBeenCalledWith(
+      "workspace-1",
+      expect.objectContaining({
+        alias: "demo",
+        type: "remote",
+        url: "https://mcp.demo.example",
+      }),
+    );
+    expect(apiMocks.fetchWorkspaceIntegrations).toHaveBeenCalledWith("workspace-1");
+    expect(setNotice).toHaveBeenCalledWith("Added MCP server demo.");
+    expect(setError).toHaveBeenCalledWith("");
+  });
+
+  it("creates an auth account and refreshes integrations", async () => {
+    const setError = vi.fn();
+    const setNotice = vi.fn();
+    const { result } = renderHook(() =>
+      useWorkspace({
+        selectedWorkspaceId: "workspace-1",
+        selectedConversationId: "",
+        selectedRunId: "",
+        setSelectedWorkspaceId: vi.fn(),
+        showArchivedWorkspaces: false,
+        setShowArchivedWorkspaces: vi.fn(),
+        createParentPath: "/tmp",
+        setCreateParentPath: vi.fn(),
+        workspaces: [{
+          id: "workspace-1",
+          canonical_path: "/tmp/workspace",
+          display_name: "Workspace 1",
+          metadata: {},
+          is_archived: false,
+          sort_order: 0,
+        }] as any,
+        setWorkspaces: vi.fn(),
+        runtime: null,
+        setError,
+        setNotice,
+        activeTab: "integrations",
+        setActiveTab: vi.fn(),
+        setSelectedConversationId: vi.fn(),
+        setSelectedRunId: vi.fn(),
+      }),
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    apiMocks.fetchWorkspaceIntegrations.mockClear();
+
+    await act(async () => {
+      await result.current.handleCreateIntegrationAccount({
+        profile_id: "notion_personal",
+        provider: "notion",
+        mode: "oauth2_pkce",
+        account_label: "Notion Personal",
+        mcp_server: "notion",
+      });
+    });
+
+    expect(apiMocks.createWorkspaceAuthAccount).toHaveBeenCalledWith(
+      "workspace-1",
+      expect.objectContaining({
+        profile_id: "notion_personal",
+        provider: "notion",
+      }),
+    );
+    expect(apiMocks.fetchWorkspaceIntegrations).toHaveBeenCalledWith("workspace-1");
+    expect(setNotice).toHaveBeenCalledWith("Added account Notion Personal.");
+    expect(setError).toHaveBeenCalledWith("");
   });
 });

@@ -12,6 +12,50 @@ export interface RuntimeStatus {
   workspace_default_path: string;
 }
 
+export interface SetupProviderInfo {
+  display_name: string;
+  provider_key: string;
+  needs_api_key: boolean;
+  default_base_url: string;
+}
+
+export interface SetupStatus {
+  needs_setup: boolean;
+  config_path: string;
+  providers: SetupProviderInfo[];
+  role_presets: Record<string, string[]>;
+}
+
+export interface SetupDiscoverModelsRequest {
+  provider: string;
+  base_url: string;
+  api_key?: string;
+}
+
+export interface SetupDiscoverModelsResponse {
+  models: string[];
+}
+
+export interface SetupModelDraft {
+  name: string;
+  provider: string;
+  base_url?: string;
+  model: string;
+  api_key?: string;
+  roles: string[];
+  max_tokens?: number;
+  temperature?: number;
+}
+
+export interface SetupCompleteRequest {
+  models: SetupModelDraft[];
+}
+
+export interface SetupCompleteResponse {
+  status: string;
+  config_path: string;
+}
+
 export interface ActivitySummary {
   status: string;
   active: boolean;
@@ -142,6 +186,193 @@ export interface WorkspaceInventory {
   counts: Record<string, number>;
 }
 
+export interface IntegrationAuthState {
+  state: string;
+  label: string;
+  reason: string;
+  storage: string;
+  has_token: boolean;
+  expired: boolean;
+  expires_at: number | null;
+  token_type: string | null;
+  scopes: string[];
+  profile_id: string;
+  account_label: string;
+  mode: string;
+}
+
+export interface IntegrationEffectiveAccount {
+  profile_id: string;
+  provider: string;
+  account_label: string;
+  mode: string;
+  status: string;
+  source: string;
+  source_path: string;
+  routing_reason: string;
+  auth_state: IntegrationAuthState;
+}
+
+export interface MCPServerManagementInfo {
+  alias: string;
+  type: string;
+  enabled: boolean;
+  source: string;
+  source_path: string;
+  source_label: string;
+  command: string;
+  args: string[];
+  url: string;
+  fallback_sse_url: string;
+  cwd: string;
+  timeout_seconds: number;
+  oauth_enabled: boolean;
+  oauth_scopes: string[];
+  allow_insecure_http: boolean;
+  allow_private_network: boolean;
+  trust_state: string;
+  trust_summary: string;
+  approval_required: boolean;
+  approval_state: string;
+  runtime_state: string;
+  resource_id: string;
+  auth_provider: string;
+  auth_state: IntegrationAuthState;
+  effective_account: IntegrationEffectiveAccount | null;
+  bound_profile_ids: string[];
+  remediation: string[];
+  flags: string[];
+}
+
+export interface AccountInfo {
+  profile_id: string;
+  provider: string;
+  account_label: string;
+  mode: string;
+  status: string;
+  source: string;
+  source_path: string;
+  mcp_server: string;
+  token_ref: string;
+  secret_ref: string;
+  writable_storage_kind: string;
+  auth_state: IntegrationAuthState;
+  default_selectors: string[];
+  bound_resource_refs: string[];
+  used_by_mcp_servers: string[];
+  effective_for_mcp_servers: string[];
+  remediation: string[];
+}
+
+export interface AccountCreateRequest {
+  profile_id: string;
+  provider: string;
+  mode: string;
+  account_label?: string;
+  mcp_server?: string;
+  secret_ref?: string;
+  token_ref?: string;
+  scopes?: string[];
+  env?: Record<string, string>;
+  command?: string;
+  auth_check?: string[];
+  metadata?: Record<string, string>;
+  status?: string;
+}
+
+export interface AccountUpdateRequest {
+  account_label?: string;
+  mcp_server?: string;
+  clear_mcp_server?: boolean;
+  secret_ref?: string;
+  token_ref?: string;
+  scopes?: string[];
+  env?: Record<string, string>;
+  command?: string;
+  auth_check?: string[];
+  metadata?: Record<string, string>;
+}
+
+export interface WorkspaceIntegrations {
+  workspace: WorkspaceSummary;
+  mcp_servers: MCPServerManagementInfo[];
+  accounts: AccountInfo[];
+  counts: Record<string, number>;
+}
+
+export interface MCPServerActionResult {
+  alias: string;
+  status: string;
+  message: string;
+  tool_count: number;
+  tool_names: string[];
+}
+
+export interface MCPServerCreateRequest {
+  alias: string;
+  type: string;
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  url?: string;
+  fallback_sse_url?: string;
+  headers?: Record<string, string>;
+  oauth_enabled?: boolean;
+  oauth_scopes?: string[];
+  allow_insecure_http?: boolean;
+  allow_private_network?: boolean;
+  cwd?: string;
+  timeout_seconds?: number;
+  enabled?: boolean;
+}
+
+export interface MCPServerUpdateRequest {
+  type?: string;
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  url?: string;
+  fallback_sse_url?: string;
+  headers?: Record<string, string>;
+  oauth_enabled?: boolean;
+  oauth_scopes?: string[];
+  allow_insecure_http?: boolean;
+  allow_private_network?: boolean;
+  cwd?: string;
+  timeout_seconds?: number;
+  enabled?: boolean;
+}
+
+export interface IntegrationOAuthStart {
+  flow_id: string;
+  authorization_url: string;
+  redirect_uri: string;
+  callback_mode: string;
+  expires_at_unix: number;
+  browser_warning: string;
+}
+
+export interface IntegrationOAuthCompleteRequest {
+  flow_id: string;
+  callback_input?: string;
+}
+
+export interface IntegrationOAuthCompleteResult {
+  status: string;
+  message: string;
+  account: AccountInfo | null;
+  expires_at: number | null;
+  scopes: string[];
+}
+
+export interface AuthDraftSyncResult {
+  created_drafts: number;
+  created_bindings: number;
+  updated_defaults: number;
+  warnings: string[];
+  integrations: WorkspaceIntegrations;
+}
+
 export interface WorkspaceFileEntry {
   path: string;
   name: string;
@@ -214,6 +445,7 @@ export interface WorkspaceSearchResponse {
   artifacts: WorkspaceSearchItem[];
   files: WorkspaceSearchItem[];
   processes: WorkspaceSearchItem[];
+  accounts: WorkspaceSearchItem[];
   mcp_servers: WorkspaceSearchItem[];
   tools: WorkspaceSearchItem[];
 }
@@ -592,7 +824,27 @@ async function requestJson<T>(
       signal: controller.signal,
     });
     if (!response.ok) {
-      throw new Error(`${response.status} ${response.statusText}`);
+      let detail = "";
+      try {
+        const responseText = await response.text();
+        if (responseText) {
+          try {
+            const parsed = JSON.parse(responseText) as { detail?: unknown; message?: unknown };
+            if (typeof parsed.detail === "string" && parsed.detail.trim()) {
+              detail = parsed.detail.trim();
+            } else if (typeof parsed.message === "string" && parsed.message.trim()) {
+              detail = parsed.message.trim();
+            } else {
+              detail = responseText.trim();
+            }
+          } catch {
+            detail = responseText.trim();
+          }
+        }
+      } catch {
+        // Ignore response-body parsing failures and fall back to HTTP status.
+      }
+      throw new Error(detail || `${response.status} ${response.statusText}`);
     }
     return (await response.json()) as T;
   } catch (error) {
@@ -649,6 +901,34 @@ export function fetchRuntimeStatus(): Promise<RuntimeStatus> {
   return requestJson<RuntimeStatus>("/runtime");
 }
 
+export function fetchSetupStatus(): Promise<SetupStatus> {
+  return requestJson<SetupStatus>("/setup/status");
+}
+
+export function discoverSetupModels(
+  payload: SetupDiscoverModelsRequest,
+): Promise<SetupDiscoverModelsResponse> {
+  return requestJson<SetupDiscoverModelsResponse>("/setup/discover-models", {
+    method: "POST",
+    body: JSON.stringify(payload),
+    headers: {
+      "content-type": "application/json",
+    },
+  });
+}
+
+export function completeInitialSetup(
+  payload: SetupCompleteRequest,
+): Promise<SetupCompleteResponse> {
+  return requestJson<SetupCompleteResponse>("/setup/complete", {
+    method: "POST",
+    body: JSON.stringify(payload),
+    headers: {
+      "content-type": "application/json",
+    },
+  });
+}
+
 export function fetchActivitySummary(): Promise<ActivitySummary> {
   return requestJson<ActivitySummary>("/activity");
 }
@@ -703,6 +983,242 @@ export function fetchWorkspaceInventory(
 ): Promise<WorkspaceInventory> {
   return requestJson<WorkspaceInventory>(
     `/workspaces/${encodeURIComponent(workspaceId)}/inventory`,
+  );
+}
+
+export function fetchWorkspaceIntegrations(
+  workspaceId: string,
+): Promise<WorkspaceIntegrations> {
+  return requestJson<WorkspaceIntegrations>(
+    `/workspaces/${encodeURIComponent(workspaceId)}/integrations`,
+  );
+}
+
+export function createWorkspaceMcpServer(
+  workspaceId: string,
+  payload: MCPServerCreateRequest,
+): Promise<MCPServerManagementInfo> {
+  return requestJson<MCPServerManagementInfo>(
+    `/workspaces/${encodeURIComponent(workspaceId)}/mcp`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
+  );
+}
+
+export function updateWorkspaceMcpServer(
+  workspaceId: string,
+  alias: string,
+  payload: MCPServerUpdateRequest,
+): Promise<MCPServerManagementInfo> {
+  return requestJson<MCPServerManagementInfo>(
+    `/workspaces/${encodeURIComponent(workspaceId)}/mcp/${encodeURIComponent(alias)}`,
+    {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    },
+  );
+}
+
+export function deleteWorkspaceMcpServer(
+  workspaceId: string,
+  alias: string,
+): Promise<MCPServerActionResult> {
+  return requestJson<MCPServerActionResult>(
+    `/workspaces/${encodeURIComponent(workspaceId)}/mcp/${encodeURIComponent(alias)}`,
+    {
+      method: "DELETE",
+    },
+  );
+}
+
+export function approveWorkspaceMcpServer(
+  workspaceId: string,
+  alias: string,
+): Promise<MCPServerManagementInfo> {
+  return requestJson<MCPServerManagementInfo>(
+    `/workspaces/${encodeURIComponent(workspaceId)}/mcp/${encodeURIComponent(alias)}/approve`,
+    {
+      method: "POST",
+    },
+  );
+}
+
+export function rejectWorkspaceMcpServer(
+  workspaceId: string,
+  alias: string,
+): Promise<MCPServerManagementInfo> {
+  return requestJson<MCPServerManagementInfo>(
+    `/workspaces/${encodeURIComponent(workspaceId)}/mcp/${encodeURIComponent(alias)}/reject`,
+    {
+      method: "POST",
+    },
+  );
+}
+
+export function testWorkspaceMcpServer(
+  workspaceId: string,
+  alias: string,
+): Promise<MCPServerActionResult> {
+  return requestJson<MCPServerActionResult>(
+    `/workspaces/${encodeURIComponent(workspaceId)}/mcp/${encodeURIComponent(alias)}/test`,
+    {
+      method: "POST",
+    },
+  );
+}
+
+export function reconnectWorkspaceMcpServer(
+  workspaceId: string,
+  alias: string,
+): Promise<MCPServerActionResult> {
+  return requestJson<MCPServerActionResult>(
+    `/workspaces/${encodeURIComponent(workspaceId)}/mcp/${encodeURIComponent(alias)}/reconnect`,
+    {
+      method: "POST",
+    },
+  );
+}
+
+export function setWorkspaceMcpServerEnabled(
+  workspaceId: string,
+  alias: string,
+  enabled: boolean,
+): Promise<MCPServerManagementInfo> {
+  return requestJson<MCPServerManagementInfo>(
+    `/workspaces/${encodeURIComponent(workspaceId)}/mcp/${encodeURIComponent(alias)}/${enabled ? "enable" : "disable"}`,
+    {
+      method: "POST",
+    },
+  );
+}
+
+export function selectWorkspaceMcpAccount(
+  workspaceId: string,
+  alias: string,
+  profileId: string,
+): Promise<MCPServerActionResult> {
+  return requestJson<MCPServerActionResult>(
+    `/workspaces/${encodeURIComponent(workspaceId)}/mcp/${encodeURIComponent(alias)}/accounts/${encodeURIComponent(profileId)}/select`,
+    {
+      method: "POST",
+    },
+  );
+}
+
+export function syncWorkspaceAuthDrafts(
+  workspaceId: string,
+): Promise<AuthDraftSyncResult> {
+  return requestJson<AuthDraftSyncResult>(
+    `/workspaces/${encodeURIComponent(workspaceId)}/auth/accounts/sync-drafts`,
+    {
+      method: "POST",
+    },
+  );
+}
+
+export function createWorkspaceAuthAccount(
+  workspaceId: string,
+  payload: AccountCreateRequest,
+): Promise<AccountInfo> {
+  return requestJson<AccountInfo>(
+    `/workspaces/${encodeURIComponent(workspaceId)}/auth/accounts`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
+  );
+}
+
+export function updateWorkspaceAuthAccount(
+  workspaceId: string,
+  profileId: string,
+  payload: AccountUpdateRequest,
+): Promise<AccountInfo> {
+  return requestJson<AccountInfo>(
+    `/workspaces/${encodeURIComponent(workspaceId)}/auth/accounts/${encodeURIComponent(profileId)}`,
+    {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    },
+  );
+}
+
+export function archiveWorkspaceAuthAccount(
+  workspaceId: string,
+  profileId: string,
+): Promise<AccountInfo> {
+  return requestJson<AccountInfo>(
+    `/workspaces/${encodeURIComponent(workspaceId)}/auth/accounts/${encodeURIComponent(profileId)}/archive`,
+    {
+      method: "POST",
+    },
+  );
+}
+
+export function restoreWorkspaceAuthAccount(
+  workspaceId: string,
+  profileId: string,
+): Promise<AccountInfo> {
+  return requestJson<AccountInfo>(
+    `/workspaces/${encodeURIComponent(workspaceId)}/auth/accounts/${encodeURIComponent(profileId)}/restore`,
+    {
+      method: "POST",
+    },
+  );
+}
+
+export function startWorkspaceAuthAccountLogin(
+  workspaceId: string,
+  profileId: string,
+): Promise<IntegrationOAuthStart> {
+  return requestJson<IntegrationOAuthStart>(
+    `/workspaces/${encodeURIComponent(workspaceId)}/auth/accounts/${encodeURIComponent(profileId)}/login/start`,
+    {
+      method: "POST",
+    },
+  );
+}
+
+export function completeWorkspaceAuthAccountLogin(
+  workspaceId: string,
+  profileId: string,
+  body: IntegrationOAuthCompleteRequest,
+): Promise<IntegrationOAuthCompleteResult> {
+  return requestJson<IntegrationOAuthCompleteResult>(
+    `/workspaces/${encodeURIComponent(workspaceId)}/auth/accounts/${encodeURIComponent(profileId)}/login/complete`,
+    {
+      method: "POST",
+      body: JSON.stringify(body),
+      headers: {
+        "content-type": "application/json",
+      },
+    },
+  );
+}
+
+export function refreshWorkspaceAuthAccount(
+  workspaceId: string,
+  profileId: string,
+): Promise<AccountInfo> {
+  return requestJson<AccountInfo>(
+    `/workspaces/${encodeURIComponent(workspaceId)}/auth/accounts/${encodeURIComponent(profileId)}/refresh`,
+    {
+      method: "POST",
+    },
+  );
+}
+
+export function logoutWorkspaceAuthAccount(
+  workspaceId: string,
+  profileId: string,
+): Promise<AccountInfo> {
+  return requestJson<AccountInfo>(
+    `/workspaces/${encodeURIComponent(workspaceId)}/auth/accounts/${encodeURIComponent(profileId)}/logout`,
+    {
+      method: "POST",
+    },
   );
 }
 

@@ -23,6 +23,8 @@ import OverviewTab from "./OverviewTab";
 import ThreadsTab from "./ThreadsTab";
 import RunsTab from "./RunsTab";
 import FilesTab from "./FilesTab";
+import IntegrationsTab from "./IntegrationsTab";
+import DesktopSetupWizard from "./DesktopSetupWizard";
 import SettingsPanel from "./SettingsPanel";
 import WorkspaceModal from "./WorkspaceModal";
 import { cn } from "@/lib/utils";
@@ -102,6 +104,7 @@ export default function AppShell() {
     notice,
     overview,
     runtime,
+    setupStatus,
     selectedWorkspaceId,
     selectedWorkspaceSummary,
     showNewWorkspace,
@@ -114,12 +117,15 @@ export default function AppShell() {
     notice: state.notice,
     overview: state.overview,
     runtime: state.runtime,
+    setupStatus: state.setupStatus,
     selectedWorkspaceId: state.selectedWorkspaceId,
     selectedWorkspaceSummary: state.selectedWorkspaceSummary,
     showNewWorkspace: state.showNewWorkspace,
     workspaces: state.workspaces,
   }), shallowEqual);
   const {
+    completeInitialSetup,
+    discoverSetupModels,
     focusCommandBar,
     retryConnection,
     setActiveTab,
@@ -273,6 +279,16 @@ export default function AppShell() {
     );
   }
 
+  if (setupStatus?.needs_setup) {
+    return (
+      <DesktopSetupWizard
+        status={setupStatus}
+        onDiscoverModels={discoverSetupModels}
+        onCompleteSetup={completeInitialSetup}
+      />
+    );
+  }
+
   return (
     <div className="grid grid-cols-[256px_1fr] h-screen overflow-hidden bg-[#09090b] text-zinc-100">
       <Sidebar />
@@ -380,6 +396,7 @@ export default function AppShell() {
           {activeTab === "threads" && <ThreadsTab />}
           {activeTab === "runs" && <RunsTab />}
           {activeTab === "files" && <FilesTab />}
+          {activeTab === "integrations" && <IntegrationsTab />}
           {activeTab === "settings" && <SettingsPanel />}
         </div>
       </main>

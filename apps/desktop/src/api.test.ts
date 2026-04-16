@@ -262,3 +262,24 @@ describe("request timeouts", () => {
     );
   });
 });
+
+describe("request errors", () => {
+  it("surfaces API detail messages instead of only HTTP status text", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(
+      JSON.stringify({
+        detail: "Loom found an expired legacy MCP token for 'notion'. Create and connect a Loom account instead.",
+      }),
+      {
+        status: 400,
+        statusText: "Bad Request",
+        headers: {
+          "content-type": "application/json",
+        },
+      },
+    )));
+
+    await expect(fetchRuntimeStatus()).rejects.toThrow(
+      "Loom found an expired legacy MCP token for 'notion'. Create and connect a Loom account instead.",
+    );
+  });
+});

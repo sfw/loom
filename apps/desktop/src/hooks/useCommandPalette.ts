@@ -80,6 +80,10 @@ export function useCommandPalette(deps: {
   setActiveTab: React.Dispatch<React.SetStateAction<ViewTab>>;
   setError: React.Dispatch<React.SetStateAction<string>>;
   setNotice: React.Dispatch<React.SetStateAction<string>>;
+  setIntegrationIntent: React.Dispatch<React.SetStateAction<{
+    kind: "add_local_server" | "add_remote_server" | "create_account" | "focus_issues";
+    requestedAt: number;
+  } | null>>;
   focusSearch: () => void;
   focusConversationComposer: () => void;
   focusRunComposer: () => void;
@@ -105,6 +109,7 @@ export function useCommandPalette(deps: {
     setActiveTab,
     setError,
     setNotice,
+    setIntegrationIntent,
     focusSearch,
     focusConversationComposer,
     focusRunComposer,
@@ -300,6 +305,76 @@ export function useCommandPalette(deps: {
     if (!normalized) {
       return;
     }
+    if (
+      normalized === "integrations"
+      || normalized === "open integrations"
+      || normalized === "show integrations"
+    ) {
+      if (!selectedWorkspaceId) {
+        setError("Select a workspace to inspect integrations.");
+        return;
+      }
+      startTransition(() => {
+        setActiveTab("integrations");
+      });
+      return;
+    }
+    if (
+      normalized === "add server"
+      || normalized === "add local server"
+      || normalized === "add remote server"
+    ) {
+      if (!selectedWorkspaceId) {
+        setError("Select a workspace before adding an integration.");
+        return;
+      }
+      startTransition(() => {
+        setActiveTab("integrations");
+      });
+      setIntegrationIntent({
+        kind: normalized === "add local server"
+          ? "add_local_server"
+          : "add_remote_server",
+        requestedAt: Date.now(),
+      });
+      return;
+    }
+    if (
+      normalized === "connect account"
+      || normalized === "reconnect account"
+      || normalized === "switch account"
+    ) {
+      if (!selectedWorkspaceId) {
+        setError("Select a workspace before connecting an account.");
+        return;
+      }
+      startTransition(() => {
+        setActiveTab("integrations");
+      });
+      setIntegrationIntent({
+        kind: "create_account",
+        requestedAt: Date.now(),
+      });
+      return;
+    }
+    if (
+      normalized === "broken integrations"
+      || normalized === "show broken integrations"
+      || normalized === "integration issues"
+    ) {
+      if (!selectedWorkspaceId) {
+        setError("Select a workspace to review integration issues.");
+        return;
+      }
+      startTransition(() => {
+        setActiveTab("integrations");
+      });
+      setIntegrationIntent({
+        kind: "focus_issues",
+        requestedAt: Date.now(),
+      });
+      return;
+    }
     if (normalized === "new conversation" || normalized === "new thread" || normalized === "thread") {
       startTransition(() => {
         setSelectedRunId("");
@@ -376,7 +451,7 @@ export function useCommandPalette(deps: {
       return;
     }
     setError(
-      "Unknown command. Try new thread, new run, starter thread, starter run, latest thread, latest run, or search <term>.",
+      "Unknown command. Try integrations, add local server, add remote server, connect account, broken integrations, new thread, new run, starter thread, starter run, latest thread, latest run, or search <term>.",
     );
   }
 

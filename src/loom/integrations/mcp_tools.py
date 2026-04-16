@@ -718,7 +718,7 @@ class _MCPRemoteHTTPClient:
         if env_overrides:
             base_env.update(env_overrides)
         headers = _resolve_env_map(self.server.headers, base_env=base_env)
-        auth_header = bearer_auth_header_for_alias(self.alias)
+        auth_header = bearer_auth_header_for_alias(self.alias, server=self.server)
         had_authorization = any(str(key).lower() == "authorization" for key in headers)
         if auth_header:
             if self.server.oauth.enabled:
@@ -1311,6 +1311,14 @@ class MCPConnectionManager:
                     raise RuntimeError(f"MCP server {alias!r} is disabled")
                 if (
                     server.type == MCP_SERVER_TYPE_REMOTE
+                    and not self._remote_approval_ready(alias, server)
+                ):
+                    approval_state = str(server.approval_state or "").strip().lower()
+                    if approval_state == "rejected":
+                        raise RuntimeError(f"MCP server {alias!r} was rejected by trust policy")
+                    raise RuntimeError(f"MCP server {alias!r} requires approval")
+                if (
+                    server.type == MCP_SERVER_TYPE_REMOTE
                     and not self._remote_oauth_ready(alias, server)
                 ):
                     raise RuntimeError(f"MCP server {alias!r} requires OAuth login")
@@ -1351,6 +1359,10 @@ class MCPConnectionManager:
                     status = "error"
                     if "disabled" in lowered:
                         status = "disabled"
+                    elif "requires approval" in lowered:
+                        status = "pending_approval"
+                    elif "rejected by trust policy" in lowered:
+                        status = "rejected"
                     elif "requires oauth login" in lowered:
                         status = "needs_auth"
                     elif "circuit " in lowered:
@@ -1391,7 +1403,7 @@ class MCPConnectionManager:
     def _remote_oauth_ready(self, alias: str, server: MCPServerConfig) -> bool:
         if not server.oauth.enabled:
             return True
-        readiness = ensure_mcp_oauth_ready(alias)
+        readiness = ensure_mcp_oauth_ready(alias, server=server)
         if not readiness.ready:
             self._set_state(
                 alias=alias,
@@ -1401,6 +1413,31 @@ class MCPConnectionManager:
             )
             return False
         return True
+
+    def _remote_approval_ready(self, alias: str, server: MCPServerConfig) -> bool:
+        if not bool(getattr(server, "approval_required", False)):
+            return True
+        approval_state = str(getattr(server, "approval_state", "") or "").strip().lower()
+        if approval_state == "approved":
+            return True
+        if approval_state == "rejected":
+            self._set_state(
+                alias=alias,
+                server=server,
+                status="rejected",
+                last_error="This workspace-defined remote server was explicitly rejected.",
+            )
+            return False
+        self._set_state(
+            alias=alias,
+            server=server,
+            status="pending_approval",
+            last_error=(
+                "This workspace-defined remote server needs approval "
+                "before Loom can connect."
+            ),
+        )
+        return False
 
     def list_tools(
         self,
@@ -1798,6 +1835,22 @@ def runtime_reconnect_alias(
     return reconnect_fn(alias=alias, timeout_seconds=timeout_seconds)
 
 
+def runtime_list_tools_alias(
+    registry: ToolRegistry,
+    *,
+    alias: str,
+    timeout_seconds: int | None = None,
+) -> list[dict[str, Any]]:
+    """List tools for one configured MCP alias through the runtime transport."""
+    list_tools_fn = getattr(_runtime_synchronizer(registry), "list_tools_alias", None)
+    if not callable(list_tools_fn):
+        raise RuntimeError("MCP runtime does not support tool listing action.")
+    tools = list_tools_fn(alias=alias, timeout_seconds=timeout_seconds)
+    if not isinstance(tools, list):
+        return []
+    return [item for item in tools if isinstance(item, dict)]
+
+
 def runtime_debug_snapshot(registry: ToolRegistry) -> dict[str, Any]:
     """Return manager diagnostics for support/debug tooling."""
     debug_fn = getattr(_runtime_synchronizer(registry), "debug_snapshot", None)
@@ -2000,6 +2053,23 @@ class _MCPRegistrySynchronizer:
             if server is None:
                 raise RuntimeError(f"MCP server {alias!r} is not configured")
         return self._connection_manager.reconnect(
+            alias=alias,
+            server=server,
+            timeout_seconds=timeout_seconds,
+        )
+
+    def list_tools_alias(
+        self,
+        *,
+        alias: str,
+        timeout_seconds: int | None = None,
+    ) -> list[dict[str, Any]]:
+        with self._lock:
+            self._connection_manager.update_config(self._mcp_config)
+            server = self._mcp_config.servers.get(alias)
+            if server is None:
+                raise RuntimeError(f"MCP server {alias!r} is not configured")
+        return self._connection_manager.list_tools(
             alias=alias,
             server=server,
             timeout_seconds=timeout_seconds,

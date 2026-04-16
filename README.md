@@ -34,7 +34,7 @@ Loom is local-ready and supports local models natively, so you get privacy, cont
 
 ## Ways to Work
 
-**Desktop app** (macOS, workspace-first) -- Open a local workspace and manage Loom through a native shell backed by `loomd`. The desktop app gives you workspace overview, threads, runs, approval inbox, file browsing/editing, search, and runtime/settings panels in one place.
+**Desktop app** (macOS, workspace-first) -- Open a local workspace and manage Loom through a native shell backed by `loomd`. The desktop app gives you workspace overview, threads, runs, an integrations workspace for MCP servers and accounts, approval inbox, file browsing/editing, search, and runtime/settings panels in one place.
 
 **Interactive TUI** (`uv run loom`) -- Work with a model in a rich terminal UI. You talk, the model responds and uses tools, you see what it's doing in real time. Streaming text, inline diffs, per-tool-call approval, session persistence, conversation recall, and slash commands for control.
 
@@ -286,9 +286,9 @@ uv run loom mcp auth login <alias>
 ```
 
 Use `--manual-token --access-token ...` only as a headless fallback.
-MCP OAuth alias tokens are stored separately in `~/.loom/mcp_oauth_tokens.json`.
-This store is intentionally separate from `/auth` profile token refs in
-`~/.loom/auth.toml`.
+New MCP OAuth writes use Loom secret refs and keychain-backed account storage.
+Loom still reads `~/.loom/mcp_oauth_tokens.json` during migration for legacy
+alias-token compatibility, but that file is no longer the preferred authority.
 `delegate_task` (used by `/run`) defaults to a 14400s timeout. Configure this in
 `loom.toml` under `[execution].delegate_task_timeout_seconds`; env override
 `LOOM_DELEGATE_TIMEOUT_SECONDS` still applies when set.

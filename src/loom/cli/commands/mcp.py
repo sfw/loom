@@ -7,14 +7,25 @@ import sys
 import time
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import click
 
-from loom.auth.resources import cleanup_deleted_resource, resource_delete_impact
+from loom.auth.config import AuthProfile
+from loom.auth.oauth_profiles import oauth_state_for_profile
+from loom.auth.resources import (
+    active_bindings_for_resource,
+    cleanup_deleted_resource,
+    default_workspace_auth_resources_path,
+    load_workspace_auth_resources,
+    resolve_resource,
+    resource_delete_impact,
+)
 from loom.cli.commands.mcp_auth import attach_mcp_auth_commands
 from loom.cli.context import (
     _close_runtime_mcp_registry,
     _mcp_manager,
+    _merged_auth_config,
     _open_runtime_mcp_registry,
     _serialize_mcp_view,
 )
@@ -166,6 +177,11 @@ def mcp_show(ctx: click.Context, alias: str, as_json: bool) -> None:
     click.echo(f"Source path: {view.source_path or '-'}")
     click.echo(f"Type: {view.server.type}")
     click.echo(f"Enabled: {view.server.enabled}")
+    if view.server.approval_required:
+        click.echo(
+            "Approval: "
+            f"{str(view.server.approval_state or 'pending').replace('_', ' ')}"
+        )
     if view.server.type == "remote":
         click.echo(f"URL: {view.server.url or '-'}")
         click.echo(f"Fallback SSE URL: {view.server.fallback_sse_url or '-'}")
@@ -174,7 +190,7 @@ def mcp_show(ctx: click.Context, alias: str, as_json: bool) -> None:
             f"{'enabled' if view.server.oauth.enabled else 'disabled'}"
         )
         if view.server.oauth.enabled:
-            oauth_state = oauth_state_for_alias(view.alias)
+            oauth_state = oauth_state_for_alias(view.alias, server=view.server)
             click.echo(f"OAuth state: {oauth_state.get('state', 'unknown')}")
         click.echo(
             "OAuth scopes: "
@@ -237,7 +253,7 @@ def mcp_status(ctx: click.Context, as_json: bool) -> None:
     for view in views:
         runtime = state_by_alias.get(view.alias)
         oauth_state = (
-            oauth_state_for_alias(view.alias)
+            oauth_state_for_alias(view.alias, server=view.server)
             if view.server.oauth.enabled
             else {
                 "state": "disabled",
@@ -254,6 +270,8 @@ def mcp_status(ctx: click.Context, as_json: bool) -> None:
                 "type": view.server.type,
                 "enabled": view.server.enabled,
                 "source": view.source,
+                "approval_required": bool(view.server.approval_required),
+                "approval_state": str(view.server.approval_state or "not_required"),
                 "runtime": {
                     "status": runtime.status if runtime is not None else (
                         "disabled" if not view.server.enabled else "configured"
@@ -311,9 +329,527 @@ def mcp_status(ctx: click.Context, as_json: bool) -> None:
             click.echo(f"    next: {runtime['remediation']}")
         if runtime.get("pid"):
             click.echo(f"    pid: {runtime['pid']}")
+        approval_required = bool(item.get("approval_required"))
+        approval_state = str(item.get("approval_state", "not_required"))
+        if approval_required:
+            click.echo(f"    approval: {approval_state}")
         oauth_state = str(oauth.get("state", "disabled"))
         if oauth_state != "disabled":
             click.echo(f"    oauth: {oauth_state}")
+
+
+@mcp.command(name="approve")
+@click.argument("alias")
+@click.pass_context
+def mcp_approve(ctx: click.Context, alias: str) -> None:
+    """Approve a workspace-defined remote MCP server."""
+    manager = _mcp_manager(ctx)
+    try:
+        clean_alias = ensure_valid_alias(alias)
+        path = manager.set_server_approval(clean_alias, status="approved")
+    except MCPConfigManagerError as e:
+        click.echo(f"Approve failed: {e}", err=True)
+        sys.exit(1)
+    click.echo(f"Approved MCP server '{clean_alias}' in {path}")
+
+
+@mcp.command(name="reject")
+@click.argument("alias")
+@click.pass_context
+def mcp_reject(ctx: click.Context, alias: str) -> None:
+    """Reject a workspace-defined remote MCP server."""
+    manager = _mcp_manager(ctx)
+    try:
+        clean_alias = ensure_valid_alias(alias)
+        path = manager.set_server_approval(clean_alias, status="rejected")
+    except MCPConfigManagerError as e:
+        click.echo(f"Reject failed: {e}", err=True)
+        sys.exit(1)
+    click.echo(f"Rejected MCP server '{clean_alias}' in {path}")
+
+
+def _integration_auth_state_label(state: str) -> str:
+    labels = {
+        "ready": "Connected",
+        "configured": "Configured",
+        "missing": "Needs connection",
+        "expired": "Expired",
+        "invalid": "Invalid",
+        "draft": "Draft",
+        "archived": "Archived",
+        "not_required": "No account required",
+        "unsupported": "Unsupported",
+    }
+    return labels.get(str(state or "").strip().lower(), "Attention")
+
+
+def _server_source_details(
+    *,
+    source: str,
+    source_path: Path | None,
+    server_type: str,
+) -> tuple[str, str]:
+    source_name = str(source or "").strip().lower()
+    if source_name in {"user", "explicit"}:
+        return "trusted", "Managed from your personal Loom configuration."
+    if source_name == "workspace":
+        if str(server_type or "").strip().lower() == "remote":
+            return (
+                "review_recommended",
+                "Workspace-defined remote server. Review provenance before relying on it.",
+            )
+        return (
+            "workspace_managed",
+            "Workspace-defined server. Confirm it matches this repo's intent.",
+        )
+    if source_name == "legacy":
+        return (
+            "legacy",
+            "Loaded from legacy loom.toml. Migrate to layered mcp.toml for clearer ownership.",
+        )
+    return "unknown", "Source metadata is incomplete."
+
+
+def _profile_auth_state(profile: AuthProfile) -> dict[str, object]:
+    status = str(getattr(profile, "status", "ready") or "ready").strip().lower() or "ready"
+    mode = str(getattr(profile, "mode", "") or "").strip().lower()
+
+    if status == "archived":
+        return {
+            "state": "archived",
+            "label": _integration_auth_state_label("archived"),
+            "reason": "This account is archived and will not be selected.",
+            "storage": "profile",
+        }
+    if status == "draft":
+        return {
+            "state": "draft",
+            "label": _integration_auth_state_label("draft"),
+            "reason": "Complete this draft account before Loom can use it.",
+            "storage": "profile",
+        }
+
+    if mode in {"oauth2_pkce", "oauth2_device"}:
+        oauth_state = oauth_state_for_profile(profile)
+        return {
+            "state": oauth_state.state,
+            "label": _integration_auth_state_label(oauth_state.state),
+            "reason": oauth_state.reason,
+            "storage": "profile_token_ref",
+            "has_token": oauth_state.has_token,
+            "expired": oauth_state.expired,
+        }
+
+    if mode == "api_key":
+        has_secret = bool(str(getattr(profile, "secret_ref", "") or "").strip())
+        state = "configured" if has_secret else "missing"
+        return {
+            "state": state,
+            "label": _integration_auth_state_label(state),
+            "reason": "" if has_secret else "secret_ref is missing.",
+            "storage": "profile_secret_ref",
+            "has_token": has_secret,
+            "expired": False,
+        }
+
+    if mode == "env_passthrough":
+        ready = bool(getattr(profile, "env", {}) or {})
+        state = "configured" if ready else "missing"
+        return {
+            "state": state,
+            "label": _integration_auth_state_label(state),
+            "reason": "" if ready else "No env passthrough keys are configured.",
+            "storage": "profile_env",
+            "has_token": ready,
+            "expired": False,
+        }
+
+    if mode == "cli_passthrough":
+        ready = bool(str(getattr(profile, "command", "") or "").strip())
+        state = "configured" if ready else "missing"
+        return {
+            "state": state,
+            "label": _integration_auth_state_label(state),
+            "reason": "" if ready else "No auth command is configured.",
+            "storage": "profile_command",
+            "has_token": ready,
+            "expired": False,
+        }
+
+    return {
+        "state": "unsupported",
+        "label": _integration_auth_state_label("unsupported"),
+        "reason": f"Unsupported auth mode {profile.mode!r}.",
+        "storage": "profile",
+        "has_token": False,
+        "expired": False,
+    }
+
+
+def _legacy_mcp_auth_state(*, alias: str, server) -> dict[str, object]:
+    if not server.oauth.enabled:
+        return {
+            "state": "not_required",
+            "label": _integration_auth_state_label("not_required"),
+            "reason": "",
+            "storage": "none",
+            "has_token": False,
+            "expired": False,
+        }
+    oauth_state = oauth_state_for_alias(alias, server=server)
+    state = str(oauth_state.get("state", "") or "missing")
+    return {
+        "state": state,
+        "label": _integration_auth_state_label(state),
+        "reason": str(oauth_state.get("last_failure_reason", "") or ""),
+        "storage": "legacy_alias_store",
+        "has_token": bool(oauth_state.get("has_token", False)),
+        "expired": bool(oauth_state.get("expired", False)),
+    }
+
+
+def _build_integration_selection_state(
+    *,
+    merged_auth,
+    resource_store,
+) -> tuple[
+    dict[str, AuthProfile],
+    dict[str, AuthProfile],
+]:
+    active_resources_by_id = {
+        resource_id: resource
+        for resource_id, resource in resource_store.resources.items()
+        if str(getattr(resource, "status", "")).strip().lower() == "active"
+    }
+    active_resource_refs = {
+        resource.resource_ref: resource.resource_id
+        for resource in active_resources_by_id.values()
+    }
+
+    selections: dict[str, str] = {}
+    selections.update(merged_auth.config.defaults)
+    selections.update(merged_auth.workspace_defaults)
+    selections.update(merged_auth.config.resource_defaults)
+    selections.update(resource_store.workspace_defaults)
+
+    selected_by_selector: dict[str, AuthProfile] = {}
+    selected_by_provider: dict[str, AuthProfile] = {}
+
+    def _profile_status(profile: AuthProfile) -> str:
+        return str(getattr(profile, "status", "ready") or "ready").strip().lower()
+
+    def _is_resource_selector(selector: str) -> bool:
+        clean = str(selector or "").strip()
+        if not clean:
+            return False
+        if clean in active_resources_by_id or clean in active_resource_refs:
+            return True
+        resolved = resolve_resource(
+            resource_store,
+            resource_id=clean,
+            resource_ref=clean,
+        )
+        return resolved is not None
+
+    def _select_profile(
+        profile: AuthProfile,
+        *,
+        selector: str | None = None,
+        propagate_provider: bool = True,
+    ) -> None:
+        if selector:
+            selected_by_selector[selector] = profile
+        if propagate_provider:
+            selected_by_provider[profile.provider] = profile
+            selected_by_selector[profile.provider] = profile
+        selected_by_selector[profile.profile_id] = profile
+
+    for selector, profile_id in selections.items():
+        profile = merged_auth.config.profiles.get(profile_id)
+        if profile is None or str(selector or "").startswith("mcp."):
+            continue
+        selected_by_selector[selector] = profile
+        if selector != profile.provider and not _is_resource_selector(selector):
+            continue
+        _select_profile(
+            profile,
+            selector=selector,
+            propagate_provider=(selector == profile.provider),
+        )
+
+    profiles_by_provider: dict[str, list[AuthProfile]] = {}
+    for profile in merged_auth.config.profiles.values():
+        if _profile_status(profile) in {"draft", "archived"}:
+            continue
+        profiles_by_provider.setdefault(profile.provider, []).append(profile)
+    for provider, provider_profiles in profiles_by_provider.items():
+        if provider in selected_by_provider or len(provider_profiles) != 1:
+            continue
+        _select_profile(provider_profiles[0], selector=provider)
+
+    selected_by_mcp_alias: dict[str, AuthProfile] = {}
+    conflicted_aliases: set[str] = set()
+    for profile in selected_by_provider.values():
+        alias = str(getattr(profile, "mcp_server", "") or "").strip()
+        if not alias or alias in conflicted_aliases:
+            continue
+        existing = selected_by_mcp_alias.get(alias)
+        if existing is not None and existing.profile_id != profile.profile_id:
+            conflicted_aliases.add(alias)
+            selected_by_mcp_alias.pop(alias, None)
+            continue
+        selected_by_mcp_alias[alias] = profile
+
+    return selected_by_selector, selected_by_mcp_alias
+
+
+def _effective_profile_for_mcp_alias(
+    *,
+    alias: str,
+    resource,
+    merged_auth,
+    resource_store,
+    selected_by_selector: dict[str, AuthProfile],
+    selected_by_mcp_alias: dict[str, AuthProfile],
+) -> tuple[AuthProfile | None, str]:
+    profile = selected_by_mcp_alias.get(alias)
+    if profile is not None:
+        if resource is None or any(
+            binding.profile_id == profile.profile_id
+            for binding in active_bindings_for_resource(resource_store, resource.resource_id)
+        ):
+            return profile, "selected_default"
+
+    selectors: list[str] = [alias]
+    if resource is not None:
+        selectors = [resource.resource_id, resource.resource_ref, alias]
+    for selector in selectors:
+        candidate = selected_by_selector.get(selector)
+        if candidate is None:
+            continue
+        candidate_alias = str(getattr(candidate, "mcp_server", "") or "").strip()
+        if candidate_alias and candidate_alias != alias:
+            continue
+        if resource is not None and not any(
+            binding.profile_id == candidate.profile_id
+            for binding in active_bindings_for_resource(resource_store, resource.resource_id)
+        ):
+            continue
+        return candidate, "selected_resource_default"
+
+    if resource is not None:
+        bound_profiles = [
+            merged_auth.config.profiles.get(binding.profile_id)
+            for binding in active_bindings_for_resource(resource_store, resource.resource_id)
+        ]
+        usable_bound_profiles = [
+            profile
+            for profile in bound_profiles
+            if profile is not None
+            and str(getattr(profile, "status", "ready") or "ready").strip().lower()
+            != "archived"
+        ]
+        if len(usable_bound_profiles) == 1:
+            return usable_bound_profiles[0], "only_bound_account"
+        if len(usable_bound_profiles) > 1:
+            return None, "multiple_bound_accounts"
+
+    return None, "no_effective_account"
+
+
+def _build_mcp_explain_payload(ctx: click.Context, alias: str) -> dict[str, Any]:
+    manager = _mcp_manager(ctx)
+    view = manager.get_view(alias)
+    if view is None:
+        raise MCPConfigManagerError(f"MCP server not found: {alias}")
+
+    trust_state, trust_summary = _server_source_details(
+        source=view.source,
+        source_path=view.source_path,
+        server_type=view.server.type,
+    )
+    resource_store = load_workspace_auth_resources(
+        default_workspace_auth_resources_path(ctx.obj.get("workspace")),
+    )
+    resource = resolve_resource(
+        resource_store,
+        source="mcp",
+        provider=view.alias,
+        mcp_server=view.alias,
+    )
+    bound_profile_ids = sorted({
+        binding.profile_id
+        for binding in active_bindings_for_resource(
+            resource_store,
+            resource.resource_id,
+        )
+    }) if resource is not None else []
+
+    merged_auth = _merged_auth_config(ctx)
+    selected_by_selector, selected_by_mcp_alias = _build_integration_selection_state(
+        merged_auth=merged_auth,
+        resource_store=resource_store,
+    )
+    effective_profile, routing_reason = _effective_profile_for_mcp_alias(
+        alias=view.alias,
+        resource=resource,
+        merged_auth=merged_auth,
+        resource_store=resource_store,
+        selected_by_selector=selected_by_selector,
+        selected_by_mcp_alias=selected_by_mcp_alias,
+    )
+
+    if effective_profile is not None:
+        auth_state = _profile_auth_state(effective_profile)
+        effective_account: dict[str, object] | None = {
+            "profile_id": effective_profile.profile_id,
+            "provider": effective_profile.provider,
+            "account_label": effective_profile.account_label,
+            "mode": effective_profile.mode,
+            "status": effective_profile.status,
+            "routing_reason": routing_reason,
+        }
+    else:
+        auth_state = _legacy_mcp_auth_state(alias=view.alias, server=view.server)
+        effective_account = None
+
+    approval_required = bool(getattr(view.server, "approval_required", False))
+    approval_state = str(getattr(view.server, "approval_state", "") or "not_required")
+    auth_state_name = str(auth_state.get("state", "") or "missing").strip().lower()
+
+    if not view.server.enabled:
+        runtime_state = "disabled"
+        why = "This server is disabled in config, so Loom will not activate it."
+    elif approval_required and approval_state != "approved":
+        runtime_state = "rejected" if approval_state == "rejected" else "pending_approval"
+        if approval_state == "rejected":
+            why = "This workspace-defined remote server was rejected by trust policy."
+        else:
+            why = "This workspace-defined remote server needs approval before Loom will use it."
+    elif auth_state_name in {"ready", "configured", "not_required"}:
+        runtime_state = "ready"
+        why = "Loom has a usable effective account for this server."
+    elif auth_state_name == "expired":
+        runtime_state = "needs_refresh"
+        why = "The effective account is expired and needs refresh before use."
+    elif auth_state_name == "draft":
+        runtime_state = "draft"
+        why = "The selected account is still a draft and is not ready yet."
+    else:
+        runtime_state = "needs_auth"
+        why = "Loom does not have a usable effective account for this server yet."
+
+    next_actions: list[str] = []
+    if not view.server.enabled:
+        next_actions.append("Enable this server before Loom can use it.")
+    elif approval_required and approval_state != "approved":
+        if approval_state == "rejected":
+            next_actions.append(
+                "Re-approve this server only after re-checking its provenance."
+            )
+        else:
+            next_actions.append(f"Run `loom mcp approve {view.alias}` to trust this server.")
+    elif trust_state == "review_recommended":
+        next_actions.append("Review this workspace-defined remote server before relying on it.")
+
+    if (
+        effective_profile is None
+        and view.server.oauth.enabled
+        and (
+            auth_state.get("storage") != "legacy_alias_store"
+            or not bool(auth_state.get("has_token", False))
+        )
+    ):
+        if routing_reason == "multiple_bound_accounts":
+            next_actions.append("Choose which account should be the default for this server.")
+        else:
+            next_actions.append(f"Run `loom mcp auth login {view.alias}` to connect an account.")
+    elif auth_state_name == "expired":
+        next_actions.append(f"Run `loom mcp auth refresh {view.alias}` to refresh credentials.")
+
+    if (
+        auth_state.get("storage") == "legacy_alias_store"
+        and bool(auth_state.get("has_token", False))
+    ):
+        next_actions.append("Migrate this legacy MCP token into a Loom account.")
+
+    next_actions = list(dict.fromkeys(next_actions))
+
+    return {
+        "alias": view.alias,
+        "source": view.source,
+        "source_path": str(view.source_path) if view.source_path else "",
+        "server_type": view.server.type,
+        "enabled": bool(view.server.enabled),
+        "trust_state": trust_state,
+        "trust_summary": trust_summary,
+        "approval_required": approval_required,
+        "approval_state": approval_state,
+        "runtime_state": runtime_state,
+        "why": why,
+        "resource_id": resource.resource_id if resource is not None else "",
+        "bound_profile_ids": bound_profile_ids,
+        "effective_account": effective_account,
+        "routing_reason": routing_reason,
+        "auth_state": auth_state,
+        "next_actions": next_actions,
+    }
+
+
+@mcp.command(name="explain")
+@click.argument("alias")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit JSON.")
+@click.pass_context
+def mcp_explain(ctx: click.Context, alias: str, as_json: bool) -> None:
+    """Explain source, trust, effective account, and next action for one MCP server."""
+    try:
+        clean_alias = ensure_valid_alias(alias)
+        payload = _build_mcp_explain_payload(ctx, clean_alias)
+    except MCPConfigManagerError as e:
+        click.echo(str(e), err=True)
+        sys.exit(1)
+
+    if as_json:
+        click.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+
+    click.echo(f"Alias: {payload['alias']}")
+    click.echo(f"Runtime: {str(payload['runtime_state']).replace('_', ' ')}")
+    click.echo(f"Why: {payload['why']}")
+    click.echo(f"Source: {payload['source']}")
+    click.echo(f"Source path: {payload['source_path'] or '-'}")
+    click.echo(f"Trust: {payload['trust_state']}")
+    click.echo(f"Trust summary: {payload['trust_summary']}")
+    if payload["approval_required"]:
+        click.echo(
+            "Approval: "
+            f"{str(payload['approval_state']).replace('_', ' ')}"
+        )
+    account = payload["effective_account"]
+    if isinstance(account, dict):
+        click.echo(
+            "Effective account: "
+            f"{account.get('account_label') or account.get('profile_id')} "
+            f"({account.get('profile_id')}, via {account.get('routing_reason')})"
+        )
+    else:
+        click.echo("Effective account: none selected")
+    click.echo(
+        "Auth state: "
+        f"{payload['auth_state'].get('label', 'Attention')}"
+    )
+    if payload["auth_state"].get("reason"):
+        click.echo(f"Auth detail: {payload['auth_state']['reason']}")
+    if payload["bound_profile_ids"]:
+        click.echo(
+            "Bound accounts: "
+            f"{', '.join(str(item) for item in payload['bound_profile_ids'])}"
+        )
+    next_actions = payload["next_actions"]
+    if next_actions:
+        click.echo("Next actions:")
+        for item in next_actions:
+            click.echo(f"  - {item}")
 
 
 def _serialize_runtime_state(state) -> dict[str, object]:

@@ -2054,7 +2054,15 @@ class LoomApp(App):
         self._chat_history_source = ""
         self._chat_history_oldest_seq = None
         self._chat_history_oldest_turn = None
-        self._chat_trimmed_total = 0
+        self._chat_render_window_start = 0
+        self._chat_follow_latest = True
+        self._chat_hidden_older_count = 0
+        self._chat_hidden_newer_count = 0
+        self._chat_transcript_mode = False
+        self._chat_transcript_show_thinking = False
+        self._chat_search_query = ""
+        self._chat_search_match_positions = []
+        self._chat_search_match_current = -1
 
     def _active_session_id(self) -> str:
         return chat_session.active_session_id(self._session)
@@ -2074,30 +2082,26 @@ class LoomApp(App):
     def _coerce_bool(value: object, *, default: bool = False) -> bool:
         return chat_session.coerce_bool(value, default=default)
 
-    def _apply_chat_render_cap(self) -> bool:
-        """Trim replay buffer to configured cap. Returns True if trimmed."""
+    def _apply_chat_render_cap(self, *, mode: str = "append") -> bool:
+        """Update the visible transcript window. Returns True if rerender is needed."""
         (
-            trimmed,
-            replay_events,
-            trim_total,
-            oldest_seq,
-            oldest_turn,
-        ) = chat_history.apply_chat_render_cap(
-            replay_events=self._chat_replay_events,
+            rerender,
+            render_window_start,
+            follow_latest,
+            hidden_older,
+            hidden_newer,
+        ) = chat_history.update_chat_render_window(
+            total_rows=len(self._chat_replay_events),
             max_rows=self._chat_resume_max_rendered_rows(),
-            trim_total=self._chat_trimmed_total,
-            history_source=self._chat_history_source,
-            oldest_seq=self._chat_history_oldest_seq,
-            oldest_turn=self._chat_history_oldest_turn,
-            active_session_id=self._active_session_id(),
-            event_cursor_turn=self._chat_event_cursor_turn,
-            logger=logger,
+            current_start=getattr(self, "_chat_render_window_start", 0),
+            follow_latest=getattr(self, "_chat_follow_latest", True),
+            mode=mode,
         )
-        self._chat_replay_events = replay_events
-        self._chat_trimmed_total = trim_total
-        self._chat_history_oldest_seq = oldest_seq
-        self._chat_history_oldest_turn = oldest_turn
-        return trimmed
+        self._chat_render_window_start = render_window_start
+        self._chat_follow_latest = follow_latest
+        self._chat_hidden_older_count = hidden_older
+        self._chat_hidden_newer_count = hidden_newer
+        return rerender
 
     def _render_chat_event(self, *args, **kwargs):
         return chat_history.render_chat_event(self, *args, **kwargs)
@@ -2113,6 +2117,24 @@ class LoomApp(App):
 
     async def _load_older_chat_history(self, *args, **kwargs):
         return await chat_history.load_older_chat_history(self, *args, **kwargs)
+
+    def _set_chat_transcript_mode(self, *args, **kwargs):
+        return chat_history.set_chat_transcript_mode(self, *args, **kwargs)
+
+    def _set_chat_transcript_show_thinking(self, *args, **kwargs):
+        return chat_history.set_chat_transcript_show_thinking(self, *args, **kwargs)
+
+    def _clear_chat_search(self, *args, **kwargs):
+        return chat_history.clear_chat_search(self, *args, **kwargs)
+
+    def _search_chat_history(self, *args, **kwargs):
+        return chat_history.search_chat_history(self, *args, **kwargs)
+
+    def _step_chat_history_search(self, *args, **kwargs):
+        return chat_history.step_chat_history_search(self, *args, **kwargs)
+
+    def _jump_chat_history_latest(self, *args, **kwargs):
+        return chat_history.jump_chat_history_latest(self, *args, **kwargs)
 
     async def _new_session(self, *args, **kwargs):
         return await chat_history.new_session(self, *args, **kwargs)

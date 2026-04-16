@@ -13,6 +13,7 @@ describe("useInbox", () => {
     const setSelectedWorkspaceId = vi.fn();
     const setSelectedConversationId = vi.fn();
     const setSelectedRunId = vi.fn();
+    const setWorkspaceSearchQuery = vi.fn();
     const setActiveTab = vi.fn();
 
     const { result } = renderHook(() =>
@@ -23,6 +24,7 @@ describe("useInbox", () => {
         setSelectedWorkspaceId,
         setSelectedConversationId,
         setSelectedRunId,
+        setWorkspaceSearchQuery,
         setActiveTab,
         setRunProcess: vi.fn(),
         setError: vi.fn(),
@@ -53,6 +55,7 @@ describe("useInbox", () => {
     const setSelectedWorkspaceId = vi.fn();
     const setSelectedConversationId = vi.fn();
     const setSelectedRunId = vi.fn();
+    const setWorkspaceSearchQuery = vi.fn();
     const setActiveTab = vi.fn();
 
     const { result } = renderHook(() =>
@@ -63,6 +66,7 @@ describe("useInbox", () => {
         setSelectedWorkspaceId,
         setSelectedConversationId,
         setSelectedRunId,
+        setWorkspaceSearchQuery,
         setActiveTab,
         setRunProcess: vi.fn(),
         setError: vi.fn(),
@@ -93,6 +97,7 @@ describe("useInbox", () => {
     const setSelectedWorkspaceId = vi.fn();
     const setSelectedConversationId = vi.fn();
     const setSelectedRunId = vi.fn();
+    const setWorkspaceSearchQuery = vi.fn();
     const setActiveTab = vi.fn();
     const queueWorkspaceFileOpen = vi.fn();
     const setNotice = vi.fn();
@@ -105,6 +110,7 @@ describe("useInbox", () => {
         setSelectedWorkspaceId,
         setSelectedConversationId,
         setSelectedRunId,
+        setWorkspaceSearchQuery,
         setActiveTab,
         setRunProcess: vi.fn(),
         setError: vi.fn(),
@@ -134,6 +140,52 @@ describe("useInbox", () => {
     expect(setNotice).toHaveBeenCalledWith("Opened context for artifact reports/auth-report.md.");
   });
 
+  it("opens integrations for account search results", () => {
+    const setSelectedWorkspaceId = vi.fn();
+    const setSelectedConversationId = vi.fn();
+    const setSelectedRunId = vi.fn();
+    const setWorkspaceSearchQuery = vi.fn();
+    const setActiveTab = vi.fn();
+    const setNotice = vi.fn();
+
+    const { result } = renderHook(() =>
+      useInbox({
+        selectedWorkspaceId: "workspace-1",
+        selectedConversationId: "conversation-stale",
+        selectedRunId: "run-stale",
+        setSelectedWorkspaceId,
+        setSelectedConversationId,
+        setSelectedRunId,
+        setWorkspaceSearchQuery,
+        setActiveTab,
+        setRunProcess: vi.fn(),
+        setError: vi.fn(),
+        setNotice,
+        removeApprovalItem: vi.fn(),
+        refreshConversation: vi.fn(async () => {}),
+        refreshRun: vi.fn(async () => {}),
+        queueWorkspaceFileOpen: vi.fn(),
+        focusRunComposer: vi.fn(),
+      }),
+    );
+
+    act(() => {
+      result.current.handleSearchResultSelection({
+        kind: "account",
+        workspace_id: "workspace-2",
+        item_id: "auth_search_profile",
+        title: "Auth Search Account",
+      });
+    });
+
+    expect(setSelectedWorkspaceId).toHaveBeenCalledWith("workspace-2");
+    expect(setSelectedConversationId).toHaveBeenCalledWith("");
+    expect(setSelectedRunId).toHaveBeenCalledWith("");
+    expect(setWorkspaceSearchQuery).toHaveBeenCalledWith("Auth Search Account");
+    expect(setActiveTab).toHaveBeenCalledWith("integrations");
+    expect(setNotice).toHaveBeenCalledWith("Opened integrations for account Auth Search Account.");
+  });
+
   it("removes the approval locally and only refreshes the active detail pane", async () => {
     vi.mocked(replyApproval).mockResolvedValue({ ok: true } as any);
 
@@ -150,6 +202,7 @@ describe("useInbox", () => {
         setSelectedWorkspaceId: vi.fn(),
         setSelectedConversationId: vi.fn(),
         setSelectedRunId: vi.fn(),
+        setWorkspaceSearchQuery: vi.fn(),
         setActiveTab: vi.fn(),
         setRunProcess: vi.fn(),
         setError: vi.fn(),
@@ -210,6 +263,7 @@ describe("useInbox", () => {
         setSelectedWorkspaceId: vi.fn(),
         setSelectedConversationId: vi.fn(),
         setSelectedRunId: vi.fn(),
+        setWorkspaceSearchQuery: vi.fn(),
         setActiveTab: vi.fn(),
         setRunProcess: vi.fn(),
         setError,

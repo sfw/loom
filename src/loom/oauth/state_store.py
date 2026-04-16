@@ -197,6 +197,18 @@ class OAuthStateStore:
                 wait_for = min(entry.expires_at, deadline) - now
                 self._condition.wait(timeout=max(0.05, wait_for))
 
+    def callback_received(self, *, state: str) -> bool:
+        clean_state = str(state or "").strip()
+        if not clean_state:
+            return False
+        now = time.monotonic()
+        with self._lock:
+            self._cleanup_locked(now)
+            entry = self._pending.get(clean_state)
+            if entry is None:
+                return False
+            return entry.callback_payload is not None
+
     def get_pending(self, *, state: str) -> OAuthPendingState:
         clean_state = str(state or "").strip()
         if not clean_state:

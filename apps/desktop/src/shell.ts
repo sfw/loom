@@ -21,10 +21,10 @@ export type PaletteEntry = {
 
 export const RECENT_PALETTE_STORAGE_KEY = "loom.desktop.palette.recents.v1";
 
-const RESULT_GROUPS: Array<{
-  key: keyof Pick<
-    WorkspaceSearchResponse,
-    "workspaces" | "conversations" | "runs" | "approvals" | "artifacts" | "files" | "processes" | "mcp_servers" | "tools"
+  const RESULT_GROUPS: Array<{
+    key: keyof Pick<
+      WorkspaceSearchResponse,
+    "workspaces" | "conversations" | "runs" | "approvals" | "artifacts" | "files" | "processes" | "accounts" | "mcp_servers" | "tools"
   >;
   label: string;
 }> = [
@@ -35,11 +35,47 @@ const RESULT_GROUPS: Array<{
   { key: "artifacts", label: "Artifacts" },
   { key: "files", label: "Files" },
   { key: "processes", label: "Processes" },
+  { key: "accounts", label: "Accounts" },
   { key: "mcp_servers", label: "MCP Servers" },
   { key: "tools", label: "Tools" },
 ];
 
 export const BASE_COMMAND_OPTIONS: CommandOption[] = [
+  {
+    id: "open-integrations",
+    label: "Open integrations",
+    command: "integrations",
+    description: "Open MCP servers, accounts, and trust state for this workspace.",
+    keywords: ["integrations", "mcp", "auth", "accounts", "servers"],
+  },
+  {
+    id: "add-local-server",
+    label: "Add local server",
+    command: "add local server",
+    description: "Jump to integrations and start adding a local MCP server.",
+    keywords: ["integrations", "mcp", "server", "local", "stdio", "add"],
+  },
+  {
+    id: "add-remote-server",
+    label: "Add remote server",
+    command: "add remote server",
+    description: "Jump to integrations and start adding a remote MCP server.",
+    keywords: ["integrations", "mcp", "server", "remote", "oauth", "add"],
+  },
+  {
+    id: "connect-account",
+    label: "Connect account",
+    command: "connect account",
+    description: "Open integrations to connect or switch an account for a server.",
+    keywords: ["integrations", "auth", "account", "oauth", "connect"],
+  },
+  {
+    id: "broken-integrations",
+    label: "Show broken integrations",
+    command: "broken integrations",
+    description: "Open integrations and review items that need attention.",
+    keywords: ["integrations", "broken", "issues", "repair", "attention"],
+  },
   {
     id: "new-conversation",
     label: "New thread",
@@ -92,6 +128,7 @@ export const BASE_COMMAND_OPTIONS: CommandOption[] = [
 ];
 
 const PINNED_COMMAND_IDS = new Set([
+  "open-integrations",
   "new-conversation",
   "new-run",
   "latest-conversation",

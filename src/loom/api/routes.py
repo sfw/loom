@@ -13,7 +13,7 @@ import time
 import uuid
 from collections import Counter
 from copy import deepcopy
-from dataclasses import asdict
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -22,6 +22,7 @@ from urllib.parse import urlparse
 from fastapi import APIRouter, HTTPException, Request
 from sse_starlette.sse import EventSourceResponse
 
+import loom.setup as setup_mod
 from loom import __version__
 from loom.api.engine import (
     Engine,
@@ -29,10 +30,14 @@ from loom.api.engine import (
     TelemetryPersistDisabledError,
 )
 from loom.api.schemas import (
+    AccountCreateRequest,
+    AccountInfoResponse,
+    AccountUpdateRequest,
     ActivitySummaryResponse,
     ApprovalFeedItemResponse,
     ApprovalReplyRequest,
     ApprovalRequest,
+    AuthDraftSyncResponse,
     ConversationApprovalDecisionRequest,
     ConversationCreateRequest,
     ConversationInjectRequest,
@@ -41,7 +46,16 @@ from loom.api.schemas import (
     ConversationSummaryResponse,
     FeedbackRequest,
     HealthResponse,
+    IntegrationAuthStateResponse,
+    IntegrationEffectiveAccountResponse,
+    IntegrationOAuthCompleteRequest,
+    IntegrationOAuthCompleteResponse,
+    IntegrationOAuthStartResponse,
+    MCPServerActionResponse,
+    MCPServerCreateRequest,
     MCPServerInfoResponse,
+    MCPServerManagementResponse,
+    MCPServerUpdateRequest,
     ModelCapabilitiesResponse,
     ModelInfo,
     PlanResponse,
@@ -53,6 +67,12 @@ from loom.api.schemas import (
     RunSummaryResponse,
     RuntimeStatusResponse,
     SettingsPatchRequest,
+    SetupCompleteRequest,
+    SetupCompleteResponse,
+    SetupDiscoverModelsRequest,
+    SetupDiscoverModelsResponse,
+    SetupProviderResponse,
+    SetupStatusResponse,
     SubtaskSummaryResponse,
     TaskCreateRequest,
     TaskCreateResponse,
@@ -69,6 +89,7 @@ from loom.api.schemas import (
     WorkspaceFileEntryResponse,
     WorkspaceFilePreviewResponse,
     WorkspaceFilePreviewTableResponse,
+    WorkspaceIntegrationsResponse,
     WorkspaceInventoryResponse,
     WorkspaceOverviewResponse,
     WorkspacePatchRequest,
@@ -77,12 +98,47 @@ from loom.api.schemas import (
     WorkspaceSettingsPatchRequest,
     WorkspaceSummaryResponse,
 )
+from loom.auth.config import (
+    AuthConfigError,
+    AuthProfile,
+    load_merged_auth_config,
+    resolve_auth_write_path,
+    upsert_auth_profile,
+)
+from loom.auth.oauth_profiles import (
+    OAuthProfileError,
+    logout_oauth_profile,
+    oauth_state_for_profile,
+    refresh_oauth_profile,
+    store_oauth_profile_token_payload,
+)
+from loom.auth.resources import (
+    active_bindings_for_resource,
+    bind_resource_to_profile,
+    default_workspace_auth_resources_path,
+    load_workspace_auth_resources,
+    resolve_resource,
+    set_workspace_resource_default,
+    sync_missing_drafts,
+)
 from loom.auth.runtime import (
     AuthResolutionError,
     UnresolvedAuthResourcesError,
     build_run_auth_context,
     coerce_auth_requirements,
+    oauth_provider_config_for_profile,
     serialize_auth_requirements,
+)
+from loom.config import (
+    MCP_DEFAULT_TIMEOUT_SECONDS,
+    MCP_SERVER_TYPE_LOCAL,
+    MCP_SERVER_TYPE_REMOTE,
+    ConfigError,
+    MCPOAuthConfig,
+    MCPServerConfig,
+    normalize_mcp_server_type,
+    normalize_mcp_timeout_seconds,
+    validate_mcp_remote_url,
 )
 from loom.config_runtime import (
     ConfigPersistConflictError,
@@ -120,6 +176,21 @@ from loom.events.types import (
     TOKEN_STREAMED,
 )
 from loom.events.verbosity import should_deliver_operator
+from loom.integrations.mcp.oauth import oauth_state_for_alias, refresh_mcp_oauth_token
+from loom.integrations.mcp_tools import (
+    runtime_connect_alias,
+    runtime_disconnect_alias,
+    runtime_list_tools_alias,
+    runtime_reconnect_alias,
+)
+from loom.mcp.config import (
+    MCPConfigManager,
+    MCPConfigManagerError,
+    apply_mcp_overrides,
+    default_workspace_mcp_path,
+    ensure_valid_alias,
+)
+from loom.oauth.engine import OAuthEngine, OAuthEngineError, OAuthProviderConfig
 from loom.processes.run_workspace import provision_scoped_run_workspace
 from loom.processes.schema import ProcessLoader
 from loom.read_scope import build_attached_read_scope, iter_context_workspace_paths
@@ -141,6 +212,20 @@ router = APIRouter()
 
 _STREAM_QUEUE_MAXSIZE = 256
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _PendingIntegrationOAuthFlow:
+    flow_id: str
+    workspace_id: str
+    profile_id: str
+    provider: OAuthProviderConfig
+
+
+@dataclass
+class _IntegrationOAuthRuntime:
+    engine: OAuthEngine
+    flows: dict[str, _PendingIntegrationOAuthFlow]
 
 
 def _latency_fields(**fields: object) -> dict[str, object]:
@@ -301,6 +386,18 @@ def _plan_from_json_dict(plan_data: dict[str, Any]) -> Plan:
 def _get_engine(request: Request) -> Engine:
     """Get the engine from the app state."""
     return request.app.state.engine
+
+
+def _get_integration_oauth_runtime(request: Request) -> _IntegrationOAuthRuntime:
+    runtime = getattr(request.app.state, "integration_oauth_runtime", None)
+    if isinstance(runtime, _IntegrationOAuthRuntime):
+        return runtime
+    runtime = _IntegrationOAuthRuntime(
+        engine=OAuthEngine(),
+        flows={},
+    )
+    request.app.state.integration_oauth_runtime = runtime
+    return runtime
 
 
 def _normalize_host(raw_host: str) -> str:
@@ -2146,6 +2243,79 @@ async def _build_workspace_search_response(
         if len(process_items) >= limit:
             break
 
+    integrations_payload = await _workspace_integrations_payload(
+        engine=engine,
+        workspace=workspace,
+    )
+    account_items: list[WorkspaceSearchItemResponse] = []
+    for account in integrations_payload.accounts:
+        title = str(account.account_label or account.profile_id or "").strip()
+        subtitle = " · ".join(
+            item
+            for item in [str(account.provider or "").strip(), str(account.mode or "").strip()]
+            if item
+        )
+        snippet = _trim_snippet(
+            " · ".join(
+                item
+                for item in [
+                    (
+                        f"Linked to {account.mcp_server}"
+                        if str(account.mcp_server or "").strip()
+                        else ""
+                    ),
+                    str(account.auth_state.label or "").strip(),
+                    str(account.auth_state.reason or "").strip(),
+                    " ".join(account.remediation),
+                ]
+                if item
+            ),
+        )
+        if not _text_matches_query(
+            clean_query,
+            title,
+            account.profile_id,
+            account.provider,
+            account.mode,
+            account.status,
+            account.mcp_server,
+            account.auth_state.label,
+            account.auth_state.reason,
+            " ".join(account.used_by_mcp_servers),
+            " ".join(account.effective_for_mcp_servers),
+            " ".join(account.default_selectors),
+            " ".join(account.remediation),
+        ):
+            continue
+        account_items.append(
+            make_search_item(
+                kind="account",
+                item_id=account.profile_id,
+                title=title,
+                subtitle=subtitle or account.profile_id,
+                snippet=snippet,
+                badges=[
+                    badge
+                    for badge in [
+                        str(account.status or ""),
+                        (
+                            f"linked:{account.mcp_server}"
+                            if str(account.mcp_server or "").strip()
+                            else ""
+                        ),
+                    ]
+                    if badge
+                ],
+                metadata={
+                    "profile_id": account.profile_id,
+                    "provider": account.provider,
+                    "mcp_server": account.mcp_server,
+                },
+            ),
+        )
+        if len(account_items) >= limit:
+            break
+
     mcp_items: list[WorkspaceSearchItemResponse] = []
     for alias, server in sorted(engine.config.mcp.servers.items()):
         title = str(alias or "")
@@ -2218,6 +2388,7 @@ async def _build_workspace_search_response(
             artifact_items,
             file_items,
             process_items,
+            account_items,
             mcp_items,
             tool_items,
         ]
@@ -2233,6 +2404,7 @@ async def _build_workspace_search_response(
         artifacts=artifact_items,
         files=file_items,
         processes=process_items,
+        accounts=account_items,
         mcp_servers=mcp_items,
         tools=tool_items,
     )
@@ -2347,6 +2519,7 @@ async def _build_global_search_response(
     artifacts = combined("artifacts")
     files = combined("files")
     processes = combined("processes")
+    accounts = combined("accounts")
     mcp_servers = combined("mcp_servers")
     tools = combined("tools")
     workspace_items.sort(key=lambda item: _search_item_sort_key(item, clean_query))
@@ -2362,6 +2535,7 @@ async def _build_global_search_response(
             artifacts,
             files,
             processes,
+            accounts,
             mcp_servers,
             tools,
         ]
@@ -2377,6 +2551,7 @@ async def _build_global_search_response(
         artifacts=artifacts,
         files=files,
         processes=processes,
+        accounts=accounts,
         mcp_servers=mcp_servers,
         tools=tools,
     )
@@ -3116,6 +3291,28 @@ def _resolve_cowork_model(engine: Engine, model_name: str):
     return engine.model_router.select(role="executor")
 
 
+def _build_cowork_auth_context(
+    engine: Engine,
+    session: dict[str, Any],
+):
+    workspace_text = str(session.get("workspace_path", "") or "").strip()
+    workspace_path = (
+        Path(workspace_text).expanduser()
+        if workspace_text
+        else None
+    )
+    available_mcp_aliases = {
+        str(alias).strip()
+        for alias in getattr(engine.config.mcp, "servers", {}).keys()
+        if str(alias).strip()
+    }
+    return build_run_auth_context(
+        workspace=workspace_path,
+        metadata={},
+        available_mcp_aliases=available_mcp_aliases,
+    )
+
+
 def _build_api_cowork_session(engine: Engine, session: dict[str, Any]) -> CoworkSession:
     model = _resolve_cowork_model(engine, _conversation_model_name(session))
     config = engine.config
@@ -3123,6 +3320,7 @@ def _build_api_cowork_session(engine: Engine, session: dict[str, Any]) -> Cowork
     scratch_dir = Path(str(config.workspace.scratch_dir or "")).expanduser()
     session_cls = _cowork_session_cls()
     conversation_id = str(session.get("id", "") or "")
+    auth_context = _build_cowork_auth_context(engine, session)
 
     async def approval_callback(tool_name: str, args: dict) -> CoworkApprovalDecision:
         request = engine.begin_conversation_approval(
@@ -3178,6 +3376,7 @@ def _build_api_cowork_session(engine: Engine, session: dict[str, Any]) -> Cowork
     return session_cls(
         model=model,
         tools=engine.tool_registry,
+        auth_context=auth_context,
         workspace=Path(str(session.get("workspace_path", "") or "")).expanduser(),
         scratch_dir=scratch_dir,
         system_prompt=(
@@ -4493,6 +4692,53 @@ async def get_runtime_status(request: Request):
     return RuntimeStatusResponse(**engine.runtime_status_snapshot())
 
 
+@router.get("/setup/status", response_model=SetupStatusResponse)
+async def get_setup_status(request: Request):
+    """Return first-run setup guidance for the desktop shell."""
+    engine = _get_engine(request)
+    config_path = engine.config_runtime_store.source_path() or setup_mod.CONFIG_PATH
+    configured_models = engine.model_router.list_providers()
+    needs_setup = setup_mod.needs_setup() or not configured_models
+    return SetupStatusResponse(
+        needs_setup=needs_setup,
+        config_path=str(config_path),
+        providers=_setup_provider_rows(),
+        role_presets={
+            name: list(roles)
+            for name, roles in setup_mod.ROLE_PRESETS.items()
+        },
+    )
+
+
+@router.post("/setup/discover-models", response_model=SetupDiscoverModelsResponse)
+async def discover_setup_models(body: SetupDiscoverModelsRequest):
+    """Probe a provider endpoint for available models."""
+    models = setup_mod.discover_models(
+        body.provider,
+        body.base_url,
+        body.api_key,
+    )
+    return SetupDiscoverModelsResponse(models=models)
+
+
+@router.post("/setup/complete", response_model=SetupCompleteResponse)
+async def complete_setup(request: Request, body: SetupCompleteRequest):
+    """Write the initial loom.toml and reload the running API config."""
+    engine = _get_engine(request)
+    models = _validate_setup_models(body.models)
+    toml_content = setup_mod._generate_toml(models)
+    setup_mod.CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    setup_mod.CONFIG_PATH.write_text(toml_content, encoding="utf-8")
+    (setup_mod.CONFIG_DIR / "scratch").mkdir(parents=True, exist_ok=True)
+    (setup_mod.CONFIG_DIR / "logs").mkdir(parents=True, exist_ok=True)
+    (setup_mod.CONFIG_DIR / "processes").mkdir(parents=True, exist_ok=True)
+    engine.reload_config_from_source(setup_mod.CONFIG_PATH)
+    return SetupCompleteResponse(
+        status="ok",
+        config_path=str(setup_mod.CONFIG_PATH),
+    )
+
+
 @router.get("/activity", response_model=ActivitySummaryResponse)
 async def get_activity_summary(request: Request):
     """Return a global snapshot of active desktop-visible backend work."""
@@ -4635,6 +4881,1027 @@ async def get_workspace_overview(request: Request, workspace_id: str):
         )
 
 
+def _setup_provider_rows() -> list[SetupProviderResponse]:
+    return [
+        SetupProviderResponse(
+            display_name=display_name,
+            provider_key=provider_key,
+            needs_api_key=needs_api_key,
+            default_base_url=default_base_url,
+        )
+        for display_name, provider_key, needs_api_key, default_base_url in setup_mod.PROVIDERS
+    ]
+
+
+def _validate_setup_models(models: list[Any]) -> list[dict[str, Any]]:
+    if not models:
+        raise HTTPException(status_code=400, detail="At least one model is required.")
+
+    provider_requirements = {
+        provider_key: needs_api_key
+        for _display_name, provider_key, needs_api_key, _default_base_url in setup_mod.PROVIDERS
+    }
+    normalized: list[dict[str, Any]] = []
+    seen_names: set[str] = set()
+    for raw_model in models:
+        name = str(getattr(raw_model, "name", "") or "").strip()
+        provider = str(getattr(raw_model, "provider", "") or "").strip()
+        base_url = str(getattr(raw_model, "base_url", "") or "").strip()
+        model_name = str(getattr(raw_model, "model", "") or "").strip()
+        api_key = str(getattr(raw_model, "api_key", "") or "")
+        roles = [
+            str(role).strip()
+            for role in getattr(raw_model, "roles", []) or []
+            if str(role).strip()
+        ]
+        if not name:
+            raise HTTPException(status_code=400, detail="Model name is required.")
+        if name in seen_names:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Duplicate model name: {name}",
+            )
+        seen_names.add(name)
+        if provider not in provider_requirements:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported provider: {provider}",
+            )
+        if not model_name:
+            raise HTTPException(status_code=400, detail=f"Model is required for {name}.")
+        if not roles:
+            raise HTTPException(status_code=400, detail=f"Roles are required for {name}.")
+        if provider_requirements[provider] and not api_key.strip():
+            raise HTTPException(
+                status_code=400,
+                detail=f"API key is required for provider {provider}.",
+            )
+        normalized.append(
+            {
+                "name": name,
+                "provider": provider,
+                "base_url": base_url,
+                "model": model_name,
+                "api_key": api_key,
+                "roles": roles,
+                "max_tokens": int(getattr(raw_model, "max_tokens", 8192) or 8192),
+                "temperature": float(getattr(raw_model, "temperature", 0.1) or 0.1),
+            },
+        )
+    return normalized
+
+
+def _integration_auth_state_label(state: str) -> str:
+    labels = {
+        "ready": "Connected",
+        "configured": "Configured",
+        "missing": "Needs connection",
+        "expired": "Expired",
+        "invalid": "Invalid",
+        "draft": "Draft",
+        "archived": "Archived",
+        "not_required": "No account required",
+        "unsupported": "Unsupported",
+    }
+    return labels.get(str(state or "").strip().lower(), "Attention")
+
+
+def _profile_source_details(
+    *,
+    profile_id: str,
+    explicit_profile_ids: tuple[str, ...],
+    explicit_path: Path | None,
+    user_path: Path,
+) -> tuple[str, str]:
+    if profile_id in explicit_profile_ids:
+        return "explicit", str(explicit_path or "")
+    return "user", str(user_path)
+
+
+def _server_source_details(
+    *,
+    source: str,
+    source_path: Path | None,
+    server_type: str,
+) -> tuple[str, str, str, str]:
+    source_name = str(source or "").strip().lower()
+    source_path_text = str(source_path or "")
+    source_labels = {
+        "explicit": "Explicit config",
+        "workspace": "Workspace config",
+        "user": "User config",
+        "legacy": "Legacy config",
+    }
+    source_label = source_labels.get(source_name, source_name or "config")
+    if source_name in {"user", "explicit"}:
+        return (
+            source_label,
+            source_path_text,
+            "trusted",
+            "Managed from your personal Loom configuration.",
+        )
+    if source_name == "workspace":
+        if str(server_type or "").strip().lower() == "remote":
+            return (
+                source_label,
+                source_path_text,
+                "review_recommended",
+                "Workspace-defined remote server. Review provenance before relying on it.",
+            )
+        return (
+            source_label,
+            source_path_text,
+            "workspace_managed",
+            "Workspace-defined server. Confirm it matches this repo's intent.",
+        )
+    if source_name == "legacy":
+        return (
+            source_label,
+            source_path_text,
+            "legacy",
+            "Loaded from legacy loom.toml. Migrate to layered mcp.toml for clearer ownership.",
+        )
+    return source_label, source_path_text, "unknown", "Source metadata is incomplete."
+
+
+def _profile_auth_state(profile: AuthProfile) -> IntegrationAuthStateResponse:
+    status = str(getattr(profile, "status", "ready") or "ready").strip().lower() or "ready"
+    mode = str(getattr(profile, "mode", "") or "").strip().lower()
+
+    if status == "archived":
+        return IntegrationAuthStateResponse(
+            state="archived",
+            label=_integration_auth_state_label("archived"),
+            reason="This account is archived and will not be selected.",
+            storage="profile",
+            profile_id=profile.profile_id,
+            account_label=profile.account_label,
+            mode=profile.mode,
+        )
+    if status == "draft":
+        return IntegrationAuthStateResponse(
+            state="draft",
+            label=_integration_auth_state_label("draft"),
+            reason="Complete this draft account before Loom can use it.",
+            storage="profile",
+            profile_id=profile.profile_id,
+            account_label=profile.account_label,
+            mode=profile.mode,
+        )
+
+    if mode in {"oauth2_pkce", "oauth2_device"}:
+        oauth_state = oauth_state_for_profile(profile)
+        return IntegrationAuthStateResponse(
+            state=oauth_state.state,
+            label=_integration_auth_state_label(oauth_state.state),
+            reason=oauth_state.reason,
+            storage="profile_token_ref",
+            has_token=oauth_state.has_token,
+            expired=oauth_state.expired,
+            expires_at=oauth_state.expires_at,
+            token_type=oauth_state.token_type,
+            scopes=list(oauth_state.scopes),
+            profile_id=profile.profile_id,
+            account_label=profile.account_label,
+            mode=profile.mode,
+        )
+
+    if mode == "api_key":
+        has_secret = bool(str(getattr(profile, "secret_ref", "") or "").strip())
+        state = "configured" if has_secret else "missing"
+        return IntegrationAuthStateResponse(
+            state=state,
+            label=_integration_auth_state_label(state),
+            reason="" if has_secret else "secret_ref is missing.",
+            storage="profile_secret_ref",
+            has_token=has_secret,
+            profile_id=profile.profile_id,
+            account_label=profile.account_label,
+            mode=profile.mode,
+        )
+
+    if mode == "env_passthrough":
+        ready = bool(getattr(profile, "env", {}) or {})
+        state = "configured" if ready else "missing"
+        return IntegrationAuthStateResponse(
+            state=state,
+            label=_integration_auth_state_label(state),
+            reason="" if ready else "No env passthrough keys are configured.",
+            storage="profile_env",
+            has_token=ready,
+            profile_id=profile.profile_id,
+            account_label=profile.account_label,
+            mode=profile.mode,
+        )
+
+    if mode == "cli_passthrough":
+        ready = bool(str(getattr(profile, "command", "") or "").strip())
+        state = "configured" if ready else "missing"
+        return IntegrationAuthStateResponse(
+            state=state,
+            label=_integration_auth_state_label(state),
+            reason="" if ready else "No auth command is configured.",
+            storage="profile_command",
+            has_token=ready,
+            profile_id=profile.profile_id,
+            account_label=profile.account_label,
+            mode=profile.mode,
+        )
+
+    return IntegrationAuthStateResponse(
+        state="unsupported",
+        label=_integration_auth_state_label("unsupported"),
+        reason=f"Unsupported auth mode {profile.mode!r}.",
+        storage="profile",
+        profile_id=profile.profile_id,
+        account_label=profile.account_label,
+        mode=profile.mode,
+    )
+
+
+def _writable_storage_kind_for_profile(profile: AuthProfile) -> str:
+    token_ref = str(getattr(profile, "token_ref", "") or "").strip().lower()
+    secret_ref = str(getattr(profile, "secret_ref", "") or "").strip().lower()
+    for ref in (token_ref, secret_ref):
+        if ref.startswith("keychain://"):
+            return "keychain"
+        if ref.startswith("env://") or ref.startswith("${"):
+            return "env"
+    return "none"
+
+
+def _legacy_mcp_auth_state(
+    *,
+    alias: str,
+    server,
+    oauth_enabled: bool,
+) -> IntegrationAuthStateResponse:
+    if not oauth_enabled:
+        return IntegrationAuthStateResponse(
+            state="not_required",
+            label=_integration_auth_state_label("not_required"),
+            storage="none",
+        )
+    oauth_state = oauth_state_for_alias(alias, server=server)
+    return IntegrationAuthStateResponse(
+        state=str(oauth_state.get("state", "") or "missing"),
+        label=_integration_auth_state_label(str(oauth_state.get("state", "") or "missing")),
+        reason=str(oauth_state.get("last_failure_reason", "") or ""),
+        storage="legacy_alias_store",
+        has_token=bool(oauth_state.get("has_token", False)),
+        expired=bool(oauth_state.get("expired", False)),
+        expires_at=oauth_state.get("expires_at"),
+        token_type=oauth_state.get("token_type"),
+        scopes=[
+            str(scope).strip()
+            for scope in list(oauth_state.get("scopes", []) or [])
+            if str(scope).strip()
+        ],
+    )
+
+
+def _build_integration_selection_state(
+    *,
+    merged_auth,
+    resource_store,
+) -> tuple[
+    dict[str, AuthProfile],
+    dict[str, AuthProfile],
+    dict[str, AuthProfile],
+    dict[str, list[str]],
+]:
+    active_resources_by_id = {
+        resource_id: resource
+        for resource_id, resource in resource_store.resources.items()
+        if str(getattr(resource, "status", "")).strip().lower() == "active"
+    }
+    active_resource_refs = {
+        resource.resource_ref: resource.resource_id
+        for resource in active_resources_by_id.values()
+    }
+
+    selections: dict[str, str] = {}
+    selections.update(merged_auth.config.defaults)
+    selections.update(merged_auth.workspace_defaults)
+    selections.update(merged_auth.config.resource_defaults)
+    selections.update(resource_store.workspace_defaults)
+
+    selected_by_selector: dict[str, AuthProfile] = {}
+    selected_by_provider: dict[str, AuthProfile] = {}
+    default_selectors_by_profile: dict[str, list[str]] = {}
+
+    def _profile_status(profile: AuthProfile) -> str:
+        return str(getattr(profile, "status", "ready") or "ready").strip().lower()
+
+    def _is_resource_selector(selector: str) -> bool:
+        clean = str(selector or "").strip()
+        if not clean:
+            return False
+        if clean in active_resources_by_id or clean in active_resource_refs:
+            return True
+        resolved = resolve_resource(
+            resource_store,
+            resource_id=clean,
+            resource_ref=clean,
+        )
+        return resolved is not None
+
+    def _select_profile(
+        profile: AuthProfile,
+        *,
+        selector: str | None = None,
+        propagate_provider: bool = True,
+    ) -> None:
+        if selector:
+            selected_by_selector[selector] = profile
+        if propagate_provider:
+            selected_by_provider[profile.provider] = profile
+            selected_by_selector[profile.provider] = profile
+        selected_by_selector[profile.profile_id] = profile
+
+    for selector, profile_id in selections.items():
+        profile = merged_auth.config.profiles.get(profile_id)
+        if profile is None or str(selector or "").startswith("mcp."):
+            continue
+        selected_by_selector[selector] = profile
+        if selector != profile.provider and not _is_resource_selector(selector):
+            continue
+        _select_profile(
+            profile,
+            selector=selector,
+            propagate_provider=(selector == profile.provider),
+        )
+        default_selectors_by_profile.setdefault(profile.profile_id, []).append(selector)
+
+    profiles_by_provider: dict[str, list[AuthProfile]] = {}
+    for profile in merged_auth.config.profiles.values():
+        if _profile_status(profile) in {"draft", "archived"}:
+            continue
+        profiles_by_provider.setdefault(profile.provider, []).append(profile)
+    for provider, provider_profiles in profiles_by_provider.items():
+        if provider in selected_by_provider or len(provider_profiles) != 1:
+            continue
+        _select_profile(provider_profiles[0], selector=provider)
+
+    selected_by_mcp_alias: dict[str, AuthProfile] = {}
+    conflicted_aliases: set[str] = set()
+    for profile in selected_by_provider.values():
+        alias = str(getattr(profile, "mcp_server", "") or "").strip()
+        if not alias or alias in conflicted_aliases:
+            continue
+        existing = selected_by_mcp_alias.get(alias)
+        if existing is not None and existing.profile_id != profile.profile_id:
+            conflicted_aliases.add(alias)
+            selected_by_mcp_alias.pop(alias, None)
+            continue
+        selected_by_mcp_alias[alias] = profile
+
+    for selectors in default_selectors_by_profile.values():
+        selectors.sort()
+
+    return (
+        selected_by_selector,
+        selected_by_provider,
+        selected_by_mcp_alias,
+        default_selectors_by_profile,
+    )
+
+
+def _effective_profile_for_mcp_alias(
+    *,
+    alias: str,
+    resource,
+    merged_auth,
+    resource_store,
+    selected_by_selector: dict[str, AuthProfile],
+    selected_by_mcp_alias: dict[str, AuthProfile],
+) -> tuple[AuthProfile | None, str]:
+    profile = selected_by_mcp_alias.get(alias)
+    if profile is not None:
+        if resource is None or any(
+            binding.profile_id == profile.profile_id
+            for binding in active_bindings_for_resource(resource_store, resource.resource_id)
+        ):
+            return profile, "selected_default"
+
+    selectors: list[str] = [alias]
+    if resource is not None:
+        selectors = [resource.resource_id, resource.resource_ref, alias]
+    for selector in selectors:
+        candidate = selected_by_selector.get(selector)
+        if candidate is None:
+            continue
+        candidate_alias = str(getattr(candidate, "mcp_server", "") or "").strip()
+        if candidate_alias and candidate_alias != alias:
+            continue
+        if resource is not None and not any(
+            binding.profile_id == candidate.profile_id
+            for binding in active_bindings_for_resource(resource_store, resource.resource_id)
+        ):
+            continue
+        return candidate, "selected_resource_default"
+
+    if resource is not None:
+        bound_profiles = [
+            merged_auth.config.profiles.get(binding.profile_id)
+            for binding in active_bindings_for_resource(resource_store, resource.resource_id)
+        ]
+        usable_bound_profiles = [
+            profile
+            for profile in bound_profiles
+            if profile is not None
+            and str(getattr(profile, "status", "ready") or "ready").strip().lower() != "archived"
+        ]
+        if len(usable_bound_profiles) == 1:
+            return usable_bound_profiles[0], "only_bound_account"
+        if len(usable_bound_profiles) > 1:
+            return None, "multiple_bound_accounts"
+
+    return None, "no_effective_account"
+
+
+def _integration_account_remediation(
+    *,
+    auth_state: IntegrationAuthStateResponse,
+    is_effective: bool,
+) -> list[str]:
+    state = str(auth_state.state or "").strip().lower()
+    if state == "draft":
+        return ["Complete this draft account before using it."]
+    if state == "missing":
+        return ["Connect or configure credentials for this account."]
+    if state == "expired":
+        return ["Reconnect or refresh this account."]
+    if state == "archived":
+        return ["Restore or replace this archived account."]
+    if state == "invalid":
+        return ["Repair this account's stored credentials."]
+    if is_effective and auth_state.storage == "legacy_alias_store":
+        return ["Migrate this legacy MCP token into a Loom account."]
+    return []
+
+
+def _build_workspace_integrations_response(
+    *,
+    engine: Engine,
+    workspace: dict[str, Any],
+    summary: WorkspaceSummaryResponse,
+) -> WorkspaceIntegrationsResponse:
+    workspace_path = Path(str(workspace.get("canonical_path", "") or "").strip()).expanduser()
+    legacy_config_path = engine.config_runtime_store.source_path()
+    mcp_manager = MCPConfigManager(
+        config=engine.config,
+        workspace=workspace_path,
+        legacy_config_path=legacy_config_path,
+    )
+    mcp_views = mcp_manager.list_views()
+
+    try:
+        merged_auth = load_merged_auth_config(workspace=workspace_path)
+    except AuthConfigError:
+        merged_auth = load_merged_auth_config()
+    resource_store = load_workspace_auth_resources(
+        default_workspace_auth_resources_path(workspace_path)
+    )
+
+    (
+        selected_by_selector,
+        _selected_by_provider,
+        selected_by_mcp_alias,
+        default_selectors_by_profile,
+    ) = _build_integration_selection_state(
+        merged_auth=merged_auth,
+        resource_store=resource_store,
+    )
+
+    mcp_rows: list[MCPServerManagementResponse] = []
+    effective_server_aliases_by_profile: dict[str, list[str]] = {}
+    bound_resource_refs_by_profile: dict[str, list[str]] = {}
+
+    for view in mcp_views:
+        source_label, source_path_text, trust_state, trust_summary = _server_source_details(
+            source=view.source,
+            source_path=view.source_path,
+            server_type=view.server.type,
+        )
+        resource = resolve_resource(
+            resource_store,
+            source="mcp",
+            provider=view.alias,
+            mcp_server=view.alias,
+        )
+        bound_profile_ids = [
+            binding.profile_id
+            for binding in active_bindings_for_resource(resource_store, resource.resource_id)
+        ] if resource is not None else []
+        for profile_id in bound_profile_ids:
+            bound_resource_refs_by_profile.setdefault(profile_id, []).append(
+                resource.resource_ref if resource is not None else f"mcp:{view.alias}"
+            )
+
+        effective_profile, routing_reason = _effective_profile_for_mcp_alias(
+            alias=view.alias,
+            resource=resource,
+            merged_auth=merged_auth,
+            resource_store=resource_store,
+            selected_by_selector=selected_by_selector,
+            selected_by_mcp_alias=selected_by_mcp_alias,
+        )
+
+        effective_account: IntegrationEffectiveAccountResponse | None = None
+        flags: list[str] = []
+        if view.source == "workspace" and view.server.type == "remote":
+            flags.append("workspace_remote")
+        if view.source == "legacy":
+            flags.append("legacy_config")
+
+        if effective_profile is not None:
+            auth_state = _profile_auth_state(effective_profile)
+            profile_source, profile_source_path = _profile_source_details(
+                profile_id=effective_profile.profile_id,
+                explicit_profile_ids=merged_auth.explicit_profile_ids,
+                explicit_path=merged_auth.explicit_path,
+                user_path=merged_auth.user_path,
+            )
+            effective_account = IntegrationEffectiveAccountResponse(
+                profile_id=effective_profile.profile_id,
+                provider=effective_profile.provider,
+                account_label=effective_profile.account_label,
+                mode=effective_profile.mode,
+                status=effective_profile.status,
+                source=profile_source,
+                source_path=profile_source_path,
+                routing_reason=routing_reason,
+                auth_state=auth_state,
+            )
+            effective_server_aliases_by_profile.setdefault(
+                effective_profile.profile_id,
+                [],
+            ).append(view.alias)
+        else:
+            auth_state = _legacy_mcp_auth_state(
+                alias=view.alias,
+                server=view.server,
+                oauth_enabled=bool(view.server.oauth.enabled),
+            )
+            if auth_state.storage == "legacy_alias_store" and auth_state.has_token:
+                flags.append("legacy_auth_storage")
+
+        runtime_state = "disabled"
+        approval_required = bool(getattr(view.server, "approval_required", False))
+        approval_state = str(getattr(view.server, "approval_state", "") or "not_required")
+        if view.server.enabled:
+            approval_state_name = approval_state.strip().lower()
+            if approval_required and approval_state_name != "approved":
+                runtime_state = (
+                    "rejected" if approval_state_name == "rejected" else "pending_approval"
+                )
+            else:
+                auth_state_name = str(auth_state.state or "").strip().lower()
+                if auth_state_name in {"ready", "configured", "not_required"}:
+                    runtime_state = "ready"
+                elif auth_state_name == "expired":
+                    runtime_state = "needs_refresh"
+                elif auth_state_name == "draft":
+                    runtime_state = "draft"
+                else:
+                    runtime_state = "needs_auth"
+
+        remediation: list[str] = []
+        if not view.server.enabled:
+            remediation.append("Enable this server before Loom can use it.")
+        elif approval_required:
+            if approval_state == "rejected":
+                remediation.append(
+                    "This server was rejected. Approve it again only after re-checking provenance."
+                )
+            elif approval_state != "approved":
+                remediation.append(
+                    "Approve this workspace-defined remote server before connecting an account."
+                )
+        elif trust_state == "review_recommended":
+            remediation.append("Review this workspace-defined remote server before relying on it.")
+        if (
+            effective_profile is None
+            and view.server.oauth.enabled
+            and (
+                auth_state.storage != "legacy_alias_store"
+                or not auth_state.has_token
+            )
+        ):
+            if routing_reason == "multiple_bound_accounts":
+                remediation.append("Choose which account should be the default for this server.")
+            else:
+                remediation.append("Connect an account for this server.")
+        remediation.extend(_integration_account_remediation(
+            auth_state=auth_state,
+            is_effective=(
+                effective_profile is not None
+                or auth_state.storage == "legacy_alias_store"
+            ),
+        ))
+        if auth_state.storage == "legacy_alias_store" and auth_state.has_token:
+            remediation.append("Migrate this legacy MCP token into a Loom account.")
+        remediation = list(dict.fromkeys(item for item in remediation if item))
+
+        mcp_rows.append(MCPServerManagementResponse(
+            alias=view.alias,
+            type=view.server.type,
+            enabled=bool(view.server.enabled),
+            source=view.source,
+            source_path=source_path_text,
+            source_label=source_label,
+            command=str(view.server.command or ""),
+            args=[
+                str(item).strip()
+                for item in list(getattr(view.server, "args", []) or [])
+                if str(item).strip()
+            ],
+            url=str(view.server.url or view.server.fallback_sse_url or ""),
+            fallback_sse_url=str(view.server.fallback_sse_url or ""),
+            cwd=str(view.server.cwd or ""),
+            timeout_seconds=int(view.server.timeout_seconds or 0),
+            oauth_enabled=bool(view.server.oauth.enabled),
+            oauth_scopes=[
+                str(scope).strip()
+                for scope in list(getattr(view.server.oauth, "scopes", []) or [])
+                if str(scope).strip()
+            ],
+            allow_insecure_http=bool(view.server.allow_insecure_http),
+            allow_private_network=bool(view.server.allow_private_network),
+            trust_state=trust_state,
+            trust_summary=trust_summary,
+            approval_required=approval_required,
+            approval_state=approval_state,
+            runtime_state=runtime_state,
+            resource_id=resource.resource_id if resource is not None else "",
+            auth_provider=(
+                str(resource.provider or "").strip()
+                if resource is not None
+                else (
+                    str(effective_profile.provider or "").strip()
+                    if effective_profile is not None
+                    else str(view.alias or "")
+                )
+            ),
+            auth_state=auth_state,
+            effective_account=effective_account,
+            bound_profile_ids=sorted(set(bound_profile_ids)),
+            remediation=remediation,
+            flags=flags,
+        ))
+
+    account_rows: list[AccountInfoResponse] = []
+    for profile_id, profile in sorted(merged_auth.config.profiles.items()):
+        profile_source, profile_source_path = _profile_source_details(
+            profile_id=profile_id,
+            explicit_profile_ids=merged_auth.explicit_profile_ids,
+            explicit_path=merged_auth.explicit_path,
+            user_path=merged_auth.user_path,
+        )
+        auth_state = _profile_auth_state(profile)
+        bound_refs = sorted(set(bound_resource_refs_by_profile.get(profile_id, [])))
+        used_by_mcp_servers = sorted({
+            ref.split(":", 1)[1]
+            for ref in bound_refs
+            if ref.startswith("mcp:")
+        })
+        effective_for_mcp_servers = sorted(
+            set(effective_server_aliases_by_profile.get(profile_id, []))
+        )
+        remediation = _integration_account_remediation(
+            auth_state=auth_state,
+            is_effective=bool(effective_for_mcp_servers),
+        )
+
+        account_rows.append(AccountInfoResponse(
+            profile_id=profile.profile_id,
+            provider=profile.provider,
+            account_label=profile.account_label,
+            mode=profile.mode,
+            status=profile.status,
+            source=profile_source,
+            source_path=profile_source_path,
+            mcp_server=profile.mcp_server,
+            token_ref=profile.token_ref,
+            secret_ref=profile.secret_ref,
+            writable_storage_kind=_writable_storage_kind_for_profile(profile),
+            auth_state=auth_state,
+            default_selectors=default_selectors_by_profile.get(profile_id, []),
+            bound_resource_refs=bound_refs,
+            used_by_mcp_servers=used_by_mcp_servers,
+            effective_for_mcp_servers=effective_for_mcp_servers,
+            remediation=remediation,
+        ))
+
+    connected_server_count = sum(
+        1 for item in mcp_rows if item.runtime_state == "ready"
+    )
+    attention_server_count = sum(
+        1
+        for item in mcp_rows
+        if item.runtime_state in {
+            "needs_auth",
+            "needs_refresh",
+            "draft",
+            "pending_approval",
+            "rejected",
+        }
+    )
+    pending_approval_count = sum(
+        1 for item in mcp_rows if item.runtime_state == "pending_approval"
+    )
+    legacy_auth_server_count = sum(
+        1 for item in mcp_rows if item.auth_state.storage == "legacy_alias_store"
+    )
+    draft_account_count = sum(
+        1 for item in account_rows if str(item.status or "").strip().lower() == "draft"
+    )
+
+    return WorkspaceIntegrationsResponse(
+        workspace=summary,
+        mcp_servers=mcp_rows,
+        accounts=account_rows,
+        counts={
+            "mcp_servers": len(mcp_rows),
+            "accounts": len(account_rows),
+            "connected_mcp_servers": connected_server_count,
+            "attention_mcp_servers": attention_server_count,
+            "pending_approval_mcp_servers": pending_approval_count,
+            "legacy_auth_mcp_servers": legacy_auth_server_count,
+            "draft_accounts": draft_account_count,
+        },
+    )
+
+
+def _workspace_mcp_manager(
+    *,
+    engine: Engine,
+    workspace: dict[str, Any],
+) -> MCPConfigManager:
+    workspace_path = Path(str(workspace.get("canonical_path", "") or "").strip()).expanduser()
+    return MCPConfigManager(
+        config=engine.config,
+        workspace=workspace_path,
+        legacy_config_path=engine.config_runtime_store.source_path(),
+    )
+
+
+def _clean_str_list(values: object) -> list[str]:
+    if not isinstance(values, list | tuple):
+        return []
+    return [str(value).strip() for value in values if str(value).strip()]
+
+
+def _clean_str_map(values: object) -> dict[str, str]:
+    if not isinstance(values, dict):
+        return {}
+    cleaned: dict[str, str] = {}
+    for raw_key, raw_value in values.items():
+        key = str(raw_key).strip()
+        if not key:
+            continue
+        cleaned[key] = str(raw_value)
+    return cleaned
+
+
+def _build_mcp_server_config(request: MCPServerCreateRequest) -> MCPServerConfig:
+    server_type = normalize_mcp_server_type(request.type)
+    timeout_seconds = normalize_mcp_timeout_seconds(
+        request.timeout_seconds,
+        default=MCP_DEFAULT_TIMEOUT_SECONDS,
+    )
+    enabled = bool(request.enabled)
+
+    if server_type == MCP_SERVER_TYPE_LOCAL:
+        command = str(request.command or "").strip()
+        if not command:
+            raise MCPConfigManagerError("Local MCP server requires a non-empty command.")
+        return MCPServerConfig(
+            type=server_type,
+            command=command,
+            args=_clean_str_list(request.args),
+            env=_clean_str_map(request.env),
+            cwd=str(request.cwd or "").strip(),
+            timeout_seconds=timeout_seconds,
+            enabled=enabled,
+        )
+
+    if server_type != MCP_SERVER_TYPE_REMOTE:
+        raise MCPConfigManagerError(f"Unsupported MCP server type: {request.type!r}")
+
+    allow_insecure_http = bool(request.allow_insecure_http)
+    allow_private_network = bool(request.allow_private_network)
+    try:
+        url = validate_mcp_remote_url(
+            str(request.url or "").strip(),
+            allow_insecure_http=allow_insecure_http,
+            allow_private_network=allow_private_network,
+        )
+    except ConfigError as e:
+        raise MCPConfigManagerError(str(e)) from e
+
+    return MCPServerConfig(
+        type=server_type,
+        url=url,
+        fallback_sse_url=str(request.fallback_sse_url or "").strip(),
+        headers=_clean_str_map(request.headers),
+        oauth=MCPOAuthConfig(
+            enabled=bool(request.oauth_enabled),
+            scopes=_clean_str_list(request.oauth_scopes),
+        ),
+        allow_insecure_http=allow_insecure_http,
+        allow_private_network=allow_private_network,
+        timeout_seconds=timeout_seconds,
+        enabled=enabled,
+    )
+
+
+def _apply_mcp_server_update(
+    current: MCPServerConfig,
+    request: MCPServerUpdateRequest,
+) -> MCPServerConfig:
+    server_type = (
+        normalize_mcp_server_type(request.type)
+        if request.type is not None
+        else str(current.type or MCP_SERVER_TYPE_LOCAL)
+    )
+    enabled = bool(current.enabled if request.enabled is None else request.enabled)
+    timeout_seconds = normalize_mcp_timeout_seconds(
+        current.timeout_seconds if request.timeout_seconds is None else request.timeout_seconds,
+        default=MCP_DEFAULT_TIMEOUT_SECONDS,
+    )
+
+    if server_type == MCP_SERVER_TYPE_LOCAL:
+        command = (
+            str(current.command or "").strip()
+            if request.command is None
+            else str(request.command or "").strip()
+        )
+        if not command:
+            raise MCPConfigManagerError("Local MCP server requires a non-empty command.")
+        args = list(current.args)
+        if request.args is not None:
+            args = _clean_str_list(request.args)
+        env = dict(current.env)
+        if request.env is not None:
+            env = _clean_str_map(request.env)
+        cwd = str(current.cwd or "").strip()
+        if request.cwd is not None:
+            cwd = str(request.cwd or "").strip()
+        return MCPServerConfig(
+            type=server_type,
+            command=command,
+            args=args,
+            env=env,
+            cwd=cwd,
+            timeout_seconds=timeout_seconds,
+            enabled=enabled,
+        )
+
+    if server_type != MCP_SERVER_TYPE_REMOTE:
+        raise MCPConfigManagerError(f"Unsupported MCP server type: {request.type!r}")
+
+    allow_insecure_http = bool(
+        current.allow_insecure_http
+        if request.allow_insecure_http is None
+        else request.allow_insecure_http
+    )
+    allow_private_network = bool(
+        current.allow_private_network
+        if request.allow_private_network is None
+        else request.allow_private_network
+    )
+    url_candidate = str(current.url or "").strip()
+    if request.url is not None:
+        url_candidate = str(request.url or "").strip()
+    try:
+        url = validate_mcp_remote_url(
+            url_candidate,
+            allow_insecure_http=allow_insecure_http,
+            allow_private_network=allow_private_network,
+        )
+    except ConfigError as e:
+        raise MCPConfigManagerError(str(e)) from e
+
+    fallback_sse_url = str(current.fallback_sse_url or "").strip()
+    if request.fallback_sse_url is not None:
+        fallback_sse_url = str(request.fallback_sse_url or "").strip()
+    headers = dict(current.headers)
+    if request.headers is not None:
+        headers = _clean_str_map(request.headers)
+    oauth_enabled = current.oauth.enabled
+    if request.oauth_enabled is not None:
+        oauth_enabled = bool(request.oauth_enabled)
+    oauth_scopes = list(current.oauth.scopes)
+    if request.oauth_scopes is not None:
+        oauth_scopes = _clean_str_list(request.oauth_scopes)
+
+    return MCPServerConfig(
+        type=server_type,
+        url=url,
+        fallback_sse_url=fallback_sse_url,
+        headers=headers,
+        oauth=MCPOAuthConfig(
+            enabled=oauth_enabled,
+            scopes=oauth_scopes,
+        ),
+        allow_insecure_http=allow_insecure_http,
+        allow_private_network=allow_private_network,
+        timeout_seconds=timeout_seconds,
+        enabled=enabled,
+    )
+
+
+def _find_workspace_mcp_row(
+    *,
+    payload: WorkspaceIntegrationsResponse,
+    alias: str,
+) -> MCPServerManagementResponse | None:
+    clean_alias = str(alias or "").strip()
+    return next((item for item in payload.mcp_servers if item.alias == clean_alias), None)
+
+
+def _find_workspace_account_row(
+    *,
+    payload: WorkspaceIntegrationsResponse,
+    profile_id: str,
+) -> AccountInfoResponse | None:
+    clean_profile_id = str(profile_id or "").strip()
+    return next(
+        (item for item in payload.accounts if item.profile_id == clean_profile_id),
+        None,
+    )
+
+
+def _workspace_auth_write_path(merged_auth) -> Path:
+    return resolve_auth_write_path(
+        explicit_path=merged_auth.explicit_path,
+        user_path=merged_auth.user_path,
+    )
+
+
+def _default_account_status_for_restore(profile: AuthProfile) -> str:
+    mode = str(getattr(profile, "mode", "") or "").strip().lower()
+    if mode in {"oauth2_pkce", "oauth2_device"}:
+        return "ready" if str(getattr(profile, "token_ref", "") or "").strip() else "draft"
+    if mode == "api_key":
+        has_secret = bool(str(getattr(profile, "secret_ref", "") or "").strip())
+        has_env = bool(getattr(profile, "env", {}) or {})
+        return "ready" if (has_secret or has_env) else "draft"
+    if mode == "env_passthrough":
+        return "ready" if bool(getattr(profile, "env", {}) or {}) else "draft"
+    if mode == "cli_passthrough":
+        return "ready" if str(getattr(profile, "command", "") or "").strip() else "draft"
+    return "draft"
+
+
+def _build_workspace_mcp_runtime_registry(
+    *,
+    engine: Engine,
+    workspace: dict[str, Any],
+):
+    from loom.tools import create_default_registry
+
+    workspace_path = Path(str(workspace.get("canonical_path", "") or "").strip()).expanduser()
+    effective_config = apply_mcp_overrides(
+        engine.config,
+        workspace=workspace_path,
+        legacy_config_path=engine.config_runtime_store.source_path(),
+    )
+    return create_default_registry(effective_config, mcp_startup_mode="sync")
+
+
+def _close_runtime_registry(registry) -> None:
+    synchronizer = getattr(registry, "_mcp_synchronizer", None)
+    close_fn = getattr(synchronizer, "close", None)
+    if callable(close_fn):
+        try:
+            close_fn()
+        except Exception:
+            pass
+
+
+def _persist_profile_if_draft(
+    *,
+    profile: AuthProfile,
+    merged_auth,
+) -> None:
+    if str(getattr(profile, "status", "ready") or "ready").strip().lower() != "draft":
+        return
+    target = (
+        merged_auth.explicit_path
+        if profile.profile_id in set(getattr(merged_auth, "explicit_profile_ids", ()))
+        and merged_auth.explicit_path is not None
+        else merged_auth.user_path
+    )
+    upsert_auth_profile(
+        target,
+        replace(profile, status="ready"),
+        must_exist=True,
+    )
+
+
 @router.get(
     "/workspaces/{workspace_id}/inventory",
     response_model=WorkspaceInventoryResponse,
@@ -4693,6 +5960,1124 @@ async def get_workspace_inventory(request: Request, workspace_id: str):
             "mcp_servers": len(mcp_rows),
             "tools": len(tool_rows),
         },
+    )
+
+
+@router.get(
+    "/workspaces/{workspace_id}/integrations",
+    response_model=WorkspaceIntegrationsResponse,
+)
+async def get_workspace_integrations(request: Request, workspace_id: str):
+    """Return management-grade MCP/account state for desktop integrations surfaces."""
+    engine = _get_engine(request)
+    workspace = await _require_workspace(engine, workspace_id)
+    summary = await _build_workspace_summary(engine, workspace)
+    return await asyncio.to_thread(
+        _build_workspace_integrations_response,
+        engine=engine,
+        workspace=workspace,
+        summary=summary,
+    )
+
+
+async def _workspace_integrations_payload(
+    *,
+    engine: Engine,
+    workspace: dict[str, Any],
+) -> WorkspaceIntegrationsResponse:
+    summary = await _build_workspace_summary(engine, workspace)
+    return await asyncio.to_thread(
+        _build_workspace_integrations_response,
+        engine=engine,
+        workspace=workspace,
+        summary=summary,
+    )
+
+
+@router.post(
+    "/workspaces/{workspace_id}/mcp",
+    response_model=MCPServerManagementResponse,
+)
+async def create_workspace_mcp_server(
+    request: Request,
+    workspace_id: str,
+    body: MCPServerCreateRequest,
+):
+    """Create one MCP server in the workspace/user writable config layer."""
+    engine = _get_engine(request)
+    workspace = await _require_workspace(engine, workspace_id)
+    workspace_path = Path(str(workspace.get("canonical_path", "") or "").strip()).expanduser()
+    manager = MCPConfigManager(
+        config=engine.config,
+        workspace=workspace_path,
+        explicit_path=default_workspace_mcp_path(workspace_path),
+        legacy_config_path=engine.config_runtime_store.source_path(),
+    )
+    clean_alias = ensure_valid_alias(body.alias)
+    server = _build_mcp_server_config(body)
+    try:
+        await asyncio.to_thread(manager.add_server, clean_alias, server)
+    except MCPConfigManagerError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    payload = await _workspace_integrations_payload(engine=engine, workspace=workspace)
+    row = _find_workspace_mcp_row(payload=payload, alias=clean_alias)
+    if row is None:
+        raise HTTPException(status_code=500, detail="Created MCP server could not be loaded.")
+    return row
+
+
+@router.get(
+    "/workspaces/{workspace_id}/mcp",
+    response_model=list[MCPServerManagementResponse],
+)
+async def list_workspace_mcp_servers(request: Request, workspace_id: str):
+    """Return management-grade MCP rows for one workspace."""
+    engine = _get_engine(request)
+    workspace = await _require_workspace(engine, workspace_id)
+    payload = await _workspace_integrations_payload(engine=engine, workspace=workspace)
+    return payload.mcp_servers
+
+
+@router.get(
+    "/workspaces/{workspace_id}/mcp/{alias}",
+    response_model=MCPServerManagementResponse,
+)
+async def get_workspace_mcp_server(
+    request: Request,
+    workspace_id: str,
+    alias: str,
+):
+    """Return one management-grade MCP row for a workspace alias."""
+    engine = _get_engine(request)
+    workspace = await _require_workspace(engine, workspace_id)
+    payload = await _workspace_integrations_payload(engine=engine, workspace=workspace)
+    row = _find_workspace_mcp_row(payload=payload, alias=ensure_valid_alias(alias))
+    if row is None:
+        raise HTTPException(status_code=404, detail="MCP server not found.")
+    return row
+
+
+@router.patch(
+    "/workspaces/{workspace_id}/mcp/{alias}",
+    response_model=MCPServerManagementResponse,
+)
+async def update_workspace_mcp_server(
+    request: Request,
+    workspace_id: str,
+    alias: str,
+    body: MCPServerUpdateRequest,
+):
+    """Update one MCP server in-place."""
+    engine = _get_engine(request)
+    workspace = await _require_workspace(engine, workspace_id)
+    manager = _workspace_mcp_manager(engine=engine, workspace=workspace)
+    clean_alias = ensure_valid_alias(alias)
+    try:
+        await asyncio.to_thread(
+            manager.edit_server,
+            clean_alias,
+            lambda current: _apply_mcp_server_update(current, body),
+        )
+    except MCPConfigManagerError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    payload = await _workspace_integrations_payload(engine=engine, workspace=workspace)
+    row = _find_workspace_mcp_row(payload=payload, alias=clean_alias)
+    if row is None:
+        raise HTTPException(status_code=500, detail="Updated MCP server could not be loaded.")
+    return row
+
+
+@router.delete(
+    "/workspaces/{workspace_id}/mcp/{alias}",
+    response_model=MCPServerActionResponse,
+)
+async def delete_workspace_mcp_server(
+    request: Request,
+    workspace_id: str,
+    alias: str,
+):
+    """Delete one writable MCP server."""
+    engine = _get_engine(request)
+    workspace = await _require_workspace(engine, workspace_id)
+    manager = _workspace_mcp_manager(engine=engine, workspace=workspace)
+    clean_alias = ensure_valid_alias(alias)
+    try:
+        await asyncio.to_thread(manager.remove_server, clean_alias)
+    except MCPConfigManagerError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return MCPServerActionResponse(
+        alias=clean_alias,
+        status="ok",
+        message=f"Deleted MCP server {clean_alias}.",
+    )
+
+
+async def _set_workspace_mcp_server_enabled(
+    *,
+    request: Request,
+    workspace_id: str,
+    alias: str,
+    enabled: bool,
+) -> MCPServerManagementResponse:
+    engine = _get_engine(request)
+    workspace = await _require_workspace(engine, workspace_id)
+    manager = _workspace_mcp_manager(engine=engine, workspace=workspace)
+    clean_alias = ensure_valid_alias(alias)
+    try:
+        await asyncio.to_thread(
+            manager.edit_server,
+            clean_alias,
+            lambda current: replace(current, enabled=enabled),
+        )
+    except MCPConfigManagerError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    payload = await _workspace_integrations_payload(engine=engine, workspace=workspace)
+    row = _find_workspace_mcp_row(payload=payload, alias=clean_alias)
+    if row is None:
+        raise HTTPException(status_code=500, detail="Updated MCP server could not be loaded.")
+    return row
+
+
+@router.post(
+    "/workspaces/{workspace_id}/mcp/{alias}/enable",
+    response_model=MCPServerManagementResponse,
+)
+async def enable_workspace_mcp_server(
+    request: Request,
+    workspace_id: str,
+    alias: str,
+):
+    """Enable one MCP server."""
+    return await _set_workspace_mcp_server_enabled(
+        request=request,
+        workspace_id=workspace_id,
+        alias=alias,
+        enabled=True,
+    )
+
+
+@router.post(
+    "/workspaces/{workspace_id}/mcp/{alias}/disable",
+    response_model=MCPServerManagementResponse,
+)
+async def disable_workspace_mcp_server(
+    request: Request,
+    workspace_id: str,
+    alias: str,
+):
+    """Disable one MCP server."""
+    return await _set_workspace_mcp_server_enabled(
+        request=request,
+        workspace_id=workspace_id,
+        alias=alias,
+        enabled=False,
+    )
+
+
+@router.post(
+    "/workspaces/{workspace_id}/mcp/{alias}/test",
+    response_model=MCPServerActionResponse,
+)
+async def test_workspace_mcp_server(
+    request: Request,
+    workspace_id: str,
+    alias: str,
+):
+    """Probe one workspace MCP server and report discovered tools."""
+    engine = _get_engine(request)
+    workspace = await _require_workspace(engine, workspace_id)
+    manager = _workspace_mcp_manager(engine=engine, workspace=workspace)
+    clean_alias = ensure_valid_alias(alias)
+    try:
+        view = manager.get_view(clean_alias)
+    except MCPConfigManagerError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    if view is None:
+        raise HTTPException(status_code=404, detail="MCP server not found.")
+
+    if view.server.type == MCP_SERVER_TYPE_REMOTE:
+        registry = _build_workspace_mcp_runtime_registry(engine=engine, workspace=workspace)
+        try:
+            state = await asyncio.to_thread(runtime_connect_alias, registry, alias=clean_alias)
+            tools = await asyncio.to_thread(runtime_list_tools_alias, registry, alias=clean_alias)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        finally:
+            _close_runtime_registry(registry)
+        status = str(getattr(state, "status", "") or "ok")
+        message = (
+            f"Verified remote MCP server {view.alias} and discovered "
+            f"{len(tools)} tool{'s' if len(tools) != 1 else ''}."
+        )
+    else:
+        try:
+            _view, tools = await asyncio.to_thread(manager.probe_server, clean_alias)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        status = "ok"
+        message = (
+            f"Discovered {len(tools)} tool{'s' if len(tools) != 1 else ''} "
+            f"for {view.alias}."
+        )
+    tool_names = sorted(
+        {
+            str(item.get("name", "") or "").strip()
+            for item in tools
+            if isinstance(item, dict)
+            and str(item.get("name", "") or "").strip()
+        }
+    )
+    return MCPServerActionResponse(
+        alias=view.alias,
+        status=status,
+        message=message,
+        tool_count=len(tools),
+        tool_names=tool_names,
+    )
+
+
+async def _runtime_mcp_action(
+    *,
+    request: Request,
+    workspace_id: str,
+    alias: str,
+    action_name: str,
+) -> MCPServerActionResponse:
+    engine = _get_engine(request)
+    workspace = await _require_workspace(engine, workspace_id)
+    clean_alias = ensure_valid_alias(alias)
+    workspace_path = Path(str(workspace.get("canonical_path", "") or "").strip()).expanduser()
+    manager = MCPConfigManager(
+        config=engine.config,
+        workspace=workspace_path,
+        legacy_config_path=engine.config_runtime_store.source_path(),
+    )
+    view = manager.get_view(clean_alias)
+    if view is None:
+        raise HTTPException(status_code=404, detail="MCP server not found.")
+
+    message_prefix = ""
+    if action_name == "reconnect" and bool(view.server.oauth.enabled):
+        oauth_state = oauth_state_for_alias(clean_alias, server=view.server)
+        auth_state = str(oauth_state.get("state", "") or "").strip().lower()
+        if bool(oauth_state.get("has_token", False)) and auth_state == "expired":
+            refreshed = await asyncio.to_thread(
+                refresh_mcp_oauth_token,
+                clean_alias,
+                server=view.server,
+                force=True,
+            )
+            if refreshed.status == "failed":
+                reason = str(refreshed.reason or "").strip() or "Refresh failed."
+                lowered = reason.lower()
+                if (
+                    "refresh token is missing" in lowered
+                    or "refresh metadata missing" in lowered
+                ):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"Loom found an expired legacy MCP token for '{clean_alias}', "
+                            f"but it cannot refresh it automatically ({reason}). "
+                            "Create and connect a Loom account instead."
+                        ),
+                    )
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Legacy MCP token refresh failed for '{clean_alias}': {reason}",
+                )
+            if refreshed.refreshed:
+                message_prefix = "Refreshed legacy OAuth token and "
+
+    registry = _build_workspace_mcp_runtime_registry(engine=engine, workspace=workspace)
+    try:
+        if action_name == "connect":
+            state = await asyncio.to_thread(runtime_connect_alias, registry, alias=clean_alias)
+        elif action_name == "disconnect":
+            state = await asyncio.to_thread(
+                runtime_disconnect_alias,
+                registry,
+                alias=clean_alias,
+            )
+        else:
+            state = await asyncio.to_thread(runtime_reconnect_alias, registry, alias=clean_alias)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    finally:
+        _close_runtime_registry(registry)
+    message = f"{message_prefix}{action_name.capitalize()}ed MCP server {clean_alias}."
+    if getattr(state, "last_error", ""):
+        message = str(getattr(state, "last_error", "") or "").strip() or message
+    return MCPServerActionResponse(
+        alias=clean_alias,
+        status=str(getattr(state, "status", "") or ""),
+        message=message,
+    )
+
+
+@router.post(
+    "/workspaces/{workspace_id}/mcp/{alias}/connect",
+    response_model=MCPServerActionResponse,
+)
+async def connect_workspace_mcp_server(
+    request: Request,
+    workspace_id: str,
+    alias: str,
+):
+    """Connect one workspace MCP alias."""
+    return await _runtime_mcp_action(
+        request=request,
+        workspace_id=workspace_id,
+        alias=alias,
+        action_name="connect",
+    )
+
+
+@router.post(
+    "/workspaces/{workspace_id}/mcp/{alias}/disconnect",
+    response_model=MCPServerActionResponse,
+)
+async def disconnect_workspace_mcp_server(
+    request: Request,
+    workspace_id: str,
+    alias: str,
+):
+    """Disconnect one workspace MCP alias."""
+    return await _runtime_mcp_action(
+        request=request,
+        workspace_id=workspace_id,
+        alias=alias,
+        action_name="disconnect",
+    )
+
+
+@router.post(
+    "/workspaces/{workspace_id}/mcp/{alias}/reconnect",
+    response_model=MCPServerActionResponse,
+)
+async def reconnect_workspace_mcp_server(
+    request: Request,
+    workspace_id: str,
+    alias: str,
+):
+    """Reconnect one workspace MCP alias."""
+    return await _runtime_mcp_action(
+        request=request,
+        workspace_id=workspace_id,
+        alias=alias,
+        action_name="reconnect",
+    )
+
+
+@router.post(
+    "/workspaces/{workspace_id}/mcp/{alias}/accounts/{profile_id}/select",
+    response_model=MCPServerActionResponse,
+)
+async def select_workspace_mcp_account(
+    request: Request,
+    workspace_id: str,
+    alias: str,
+    profile_id: str,
+):
+    """Bind and select one Loom account for a workspace MCP server."""
+    engine = _get_engine(request)
+    workspace = await _require_workspace(engine, workspace_id)
+    clean_alias = ensure_valid_alias(alias)
+    payload = await _workspace_integrations_payload(engine=engine, workspace=workspace)
+    row = _find_workspace_mcp_row(payload=payload, alias=clean_alias)
+    if row is None:
+        raise HTTPException(status_code=404, detail="MCP server not found.")
+    if not row.oauth_enabled:
+        raise HTTPException(
+            status_code=400,
+            detail="This MCP server does not currently need account selection.",
+        )
+    if row.approval_required and row.approval_state != "approved":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Approve this workspace-defined remote server before selecting "
+                "an account."
+            ),
+        )
+
+    _, profile = await _workspace_auth_profile(
+        engine=engine,
+        workspace=workspace,
+        profile_id=profile_id,
+    )
+    compatible_profile_ids = {
+        str(item.profile_id)
+        for item in payload.accounts
+        if (
+            clean_alias in item.used_by_mcp_servers
+            or clean_alias in item.effective_for_mcp_servers
+            or str(item.mcp_server or "").strip() == clean_alias
+            or str(item.provider or "").strip() == str(row.auth_provider or "").strip()
+        )
+    }
+    if profile.profile_id not in compatible_profile_ids:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Account {profile.profile_id!r} is not compatible with MCP "
+                f"server {clean_alias!r}."
+            ),
+        )
+
+    workspace_path = Path(str(workspace.get("canonical_path", "") or "").strip()).expanduser()
+    resources_path = default_workspace_auth_resources_path(workspace_path)
+    resource_store = await asyncio.to_thread(load_workspace_auth_resources, resources_path)
+    resource = resolve_resource(
+        resource_store,
+        source="mcp",
+        provider=clean_alias,
+        mcp_server=clean_alias,
+    )
+    if resource is None:
+        manager = _workspace_mcp_manager(engine=engine, workspace=workspace)
+        await asyncio.to_thread(
+            sync_missing_drafts,
+            workspace=workspace_path,
+            mcp_manager=manager,
+            tool_registry=engine.tool_registry,
+        )
+        resource_store = await asyncio.to_thread(
+            load_workspace_auth_resources,
+            resources_path,
+        )
+        resource = resolve_resource(
+            resource_store,
+            source="mcp",
+            provider=clean_alias,
+            mcp_server=clean_alias,
+        )
+    if resource is None:
+        raise HTTPException(
+            status_code=409,
+            detail="No auth resource is registered for this MCP server yet.",
+        )
+
+    try:
+        if not any(
+            binding.profile_id == profile.profile_id
+            for binding in active_bindings_for_resource(resource_store, resource.resource_id)
+        ):
+            await asyncio.to_thread(
+                bind_resource_to_profile,
+                resources_path,
+                resource_id=resource.resource_id,
+                profile_id=profile.profile_id,
+                generated_from=f"api:mcp-select:{clean_alias}",
+                priority=0,
+            )
+        await asyncio.to_thread(
+            set_workspace_resource_default,
+            resources_path,
+            resource_id=resource.resource_id,
+            profile_id=profile.profile_id,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    account_label = str(profile.account_label or "").strip() or profile.profile_id
+    return MCPServerActionResponse(
+        alias=clean_alias,
+        status="ok",
+        message=f"Using account {account_label} for MCP server {clean_alias}.",
+    )
+
+
+@router.get(
+    "/workspaces/{workspace_id}/auth/accounts",
+    response_model=list[AccountInfoResponse],
+)
+async def list_workspace_auth_accounts(request: Request, workspace_id: str):
+    """Return management-grade auth account rows for one workspace."""
+    engine = _get_engine(request)
+    workspace = await _require_workspace(engine, workspace_id)
+    payload = await _workspace_integrations_payload(engine=engine, workspace=workspace)
+    return payload.accounts
+
+
+@router.post(
+    "/workspaces/{workspace_id}/auth/accounts",
+    response_model=AccountInfoResponse,
+)
+async def create_workspace_auth_account(
+    request: Request,
+    workspace_id: str,
+    body: AccountCreateRequest,
+):
+    """Create one auth account/profile."""
+    engine = _get_engine(request)
+    workspace = await _require_workspace(engine, workspace_id)
+    workspace_path = Path(str(workspace.get("canonical_path", "") or "").strip()).expanduser()
+    merged_auth = await asyncio.to_thread(load_merged_auth_config, workspace=workspace_path)
+
+    profile_id = str(body.profile_id or "").strip()
+    provider = str(body.provider or "").strip()
+    mode = str(body.mode or "").strip().lower()
+    if not profile_id:
+        raise HTTPException(status_code=400, detail="profile_id is required.")
+    if not provider:
+        raise HTTPException(status_code=400, detail="provider is required.")
+    if not mode:
+        raise HTTPException(status_code=400, detail="mode is required.")
+
+    mcp_server = str(body.mcp_server or "").strip()
+    if mcp_server:
+        try:
+            mcp_server = ensure_valid_alias(mcp_server)
+        except MCPConfigManagerError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+
+    status = str(body.status or "draft").strip().lower() or "draft"
+    token_ref = str(body.token_ref or "").strip()
+    if not token_ref and mode in {"oauth2_pkce", "oauth2_device"}:
+        token_ref = f"keychain://loom/{provider}/{profile_id}/tokens"
+
+    profile = AuthProfile(
+        profile_id=profile_id,
+        provider=provider,
+        mode=mode,
+        account_label=str(body.account_label or "").strip(),
+        mcp_server=mcp_server,
+        secret_ref=str(body.secret_ref or "").strip(),
+        token_ref=token_ref,
+        scopes=[
+            str(scope).strip()
+            for scope in list(body.scopes or [])
+            if str(scope).strip()
+        ],
+        env={
+            str(key).strip(): str(value)
+            for key, value in dict(body.env or {}).items()
+            if str(key).strip()
+        },
+        command=str(body.command or "").strip(),
+        auth_check=[
+            str(item).strip()
+            for item in list(body.auth_check or [])
+            if str(item).strip()
+        ],
+        metadata={
+            str(key).strip(): str(value)
+            for key, value in dict(body.metadata or {}).items()
+            if str(key).strip()
+        },
+        status=status,
+    )
+    write_path = _workspace_auth_write_path(merged_auth)
+    try:
+        await asyncio.to_thread(
+            upsert_auth_profile,
+            write_path,
+            profile,
+            must_exist=False,
+        )
+    except AuthConfigError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    payload = await _workspace_integrations_payload(engine=engine, workspace=workspace)
+    row = _find_workspace_account_row(payload=payload, profile_id=profile_id)
+    if row is None:
+        raise HTTPException(status_code=500, detail="Created auth account could not be loaded.")
+    return row
+
+
+@router.get(
+    "/workspaces/{workspace_id}/auth/accounts/{profile_id}",
+    response_model=AccountInfoResponse,
+)
+async def get_workspace_auth_account(
+    request: Request,
+    workspace_id: str,
+    profile_id: str,
+):
+    """Return one management-grade auth account row."""
+    engine = _get_engine(request)
+    workspace = await _require_workspace(engine, workspace_id)
+    payload = await _workspace_integrations_payload(engine=engine, workspace=workspace)
+    row = _find_workspace_account_row(payload=payload, profile_id=profile_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Auth account not found.")
+    return row
+
+
+@router.patch(
+    "/workspaces/{workspace_id}/auth/accounts/{profile_id}",
+    response_model=AccountInfoResponse,
+)
+async def update_workspace_auth_account(
+    request: Request,
+    workspace_id: str,
+    profile_id: str,
+    body: AccountUpdateRequest,
+):
+    """Update one auth account/profile."""
+    engine = _get_engine(request)
+    workspace = await _require_workspace(engine, workspace_id)
+    merged_auth, profile = await _workspace_auth_profile(
+        engine=engine,
+        workspace=workspace,
+        profile_id=profile_id,
+    )
+    next_mcp_server = str(profile.mcp_server or "").strip()
+    if body.clear_mcp_server:
+        next_mcp_server = ""
+    elif body.mcp_server is not None:
+        next_mcp_server = str(body.mcp_server or "").strip()
+    if next_mcp_server:
+        try:
+            next_mcp_server = ensure_valid_alias(next_mcp_server)
+        except MCPConfigManagerError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+
+    updated = replace(
+        profile,
+        account_label=(
+            profile.account_label
+            if body.account_label is None
+            else str(body.account_label or "").strip()
+        ),
+        mcp_server=next_mcp_server,
+        secret_ref=(
+            profile.secret_ref
+            if body.secret_ref is None
+            else str(body.secret_ref or "").strip()
+        ),
+        token_ref=(
+            profile.token_ref
+            if body.token_ref is None
+            else str(body.token_ref or "").strip()
+        ),
+        scopes=(
+            list(profile.scopes)
+            if body.scopes is None
+            else [
+                str(scope).strip()
+                for scope in list(body.scopes or [])
+                if str(scope).strip()
+            ]
+        ),
+        env=(
+            dict(profile.env)
+            if body.env is None
+            else {
+                str(key).strip(): str(value)
+                for key, value in dict(body.env or {}).items()
+                if str(key).strip()
+            }
+        ),
+        command=(
+            profile.command
+            if body.command is None
+            else str(body.command or "").strip()
+        ),
+        auth_check=(
+            list(profile.auth_check)
+            if body.auth_check is None
+            else [
+                str(item).strip()
+                for item in list(body.auth_check or [])
+                if str(item).strip()
+            ]
+        ),
+        metadata=(
+            dict(profile.metadata)
+            if body.metadata is None
+            else {
+                str(key).strip(): str(value)
+                for key, value in dict(body.metadata or {}).items()
+                if str(key).strip()
+            }
+        ),
+    )
+    write_path = _workspace_auth_write_path(merged_auth)
+    try:
+        await asyncio.to_thread(
+            upsert_auth_profile,
+            write_path,
+            updated,
+            must_exist=True,
+        )
+    except AuthConfigError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    payload = await _workspace_integrations_payload(engine=engine, workspace=workspace)
+    row = _find_workspace_account_row(payload=payload, profile_id=profile_id)
+    if row is None:
+        raise HTTPException(status_code=500, detail="Updated auth account could not be loaded.")
+    return row
+
+
+async def _set_workspace_auth_account_status(
+    *,
+    request: Request,
+    workspace_id: str,
+    profile_id: str,
+    status: str,
+) -> AccountInfoResponse:
+    engine = _get_engine(request)
+    workspace = await _require_workspace(engine, workspace_id)
+    merged_auth, profile = await _workspace_auth_profile(
+        engine=engine,
+        workspace=workspace,
+        profile_id=profile_id,
+    )
+    next_status = str(status or "").strip().lower()
+    if next_status == "restore":
+        next_status = _default_account_status_for_restore(profile)
+    updated = replace(profile, status=next_status)
+    write_path = _workspace_auth_write_path(merged_auth)
+    try:
+        await asyncio.to_thread(
+            upsert_auth_profile,
+            write_path,
+            updated,
+            must_exist=True,
+        )
+    except AuthConfigError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    payload = await _workspace_integrations_payload(engine=engine, workspace=workspace)
+    row = _find_workspace_account_row(payload=payload, profile_id=profile_id)
+    if row is None:
+        raise HTTPException(status_code=500, detail="Updated auth account could not be loaded.")
+    return row
+
+
+@router.post(
+    "/workspaces/{workspace_id}/auth/accounts/{profile_id}/archive",
+    response_model=AccountInfoResponse,
+)
+async def archive_workspace_auth_account(
+    request: Request,
+    workspace_id: str,
+    profile_id: str,
+):
+    """Archive one auth account/profile."""
+    return await _set_workspace_auth_account_status(
+        request=request,
+        workspace_id=workspace_id,
+        profile_id=profile_id,
+        status="archived",
+    )
+
+
+@router.post(
+    "/workspaces/{workspace_id}/auth/accounts/{profile_id}/restore",
+    response_model=AccountInfoResponse,
+)
+async def restore_workspace_auth_account(
+    request: Request,
+    workspace_id: str,
+    profile_id: str,
+):
+    """Restore one auth account/profile to ready/draft state."""
+    return await _set_workspace_auth_account_status(
+        request=request,
+        workspace_id=workspace_id,
+        profile_id=profile_id,
+        status="restore",
+    )
+
+
+@router.post(
+    "/workspaces/{workspace_id}/auth/accounts/sync-drafts",
+    response_model=AuthDraftSyncResponse,
+)
+async def sync_workspace_auth_drafts(
+    request: Request,
+    workspace_id: str,
+):
+    """Discover missing resources and create draft accounts/bindings."""
+    engine = _get_engine(request)
+    workspace = await _require_workspace(engine, workspace_id)
+    workspace_path = Path(str(workspace.get("canonical_path", "") or "").strip()).expanduser()
+    manager = _workspace_mcp_manager(engine=engine, workspace=workspace)
+    result = await asyncio.to_thread(
+        sync_missing_drafts,
+        workspace=workspace_path,
+        mcp_manager=manager,
+        tool_registry=engine.tool_registry,
+    )
+    payload = await _workspace_integrations_payload(engine=engine, workspace=workspace)
+    return AuthDraftSyncResponse(
+        created_drafts=result.created_drafts,
+        created_bindings=result.created_bindings,
+        updated_defaults=result.updated_defaults,
+        warnings=list(result.warnings),
+        integrations=payload,
+    )
+
+
+async def _workspace_auth_profile(
+    *,
+    engine: Engine,
+    workspace: dict[str, Any],
+    profile_id: str,
+) -> tuple[Any, AuthProfile]:
+    workspace_path = Path(str(workspace.get("canonical_path", "") or "").strip()).expanduser()
+    merged_auth = await asyncio.to_thread(load_merged_auth_config, workspace=workspace_path)
+    profile = merged_auth.config.profiles.get(str(profile_id or "").strip())
+    if profile is None:
+        raise HTTPException(status_code=404, detail="Auth account not found.")
+    return merged_auth, profile
+
+
+@router.post(
+    "/workspaces/{workspace_id}/auth/accounts/{profile_id}/login/start",
+    response_model=IntegrationOAuthStartResponse,
+)
+async def start_workspace_auth_account_login(
+    request: Request,
+    workspace_id: str,
+    profile_id: str,
+):
+    """Start a browser OAuth flow for one workspace account."""
+    if not _request_is_local(request):
+        raise HTTPException(
+            status_code=403,
+            detail="Desktop OAuth login can only be started from a local client.",
+        )
+    engine = _get_engine(request)
+    workspace = await _require_workspace(engine, workspace_id)
+    _merged_auth, profile = await _workspace_auth_profile(
+        engine=engine,
+        workspace=workspace,
+        profile_id=profile_id,
+    )
+    provider = oauth_provider_config_for_profile(profile)
+    if provider is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Profile {profile.profile_id!r} is missing OAuth metadata. "
+                "Required: oauth_authorization_endpoint, oauth_token_endpoint, oauth_client_id."
+            ),
+        )
+    runtime = _get_integration_oauth_runtime(request)
+    try:
+        started = await asyncio.to_thread(
+            runtime.engine.start_auth,
+            provider=provider,
+            preferred_port=8765,
+            open_browser=False,
+            allow_manual_fallback=True,
+        )
+    except OAuthEngineError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    runtime.flows[started.state] = _PendingIntegrationOAuthFlow(
+        flow_id=started.state,
+        workspace_id=workspace_id,
+        profile_id=profile.profile_id,
+        provider=provider,
+    )
+    return IntegrationOAuthStartResponse(
+        flow_id=started.state,
+        authorization_url=started.authorization_url,
+        redirect_uri=started.redirect_uri,
+        callback_mode=started.callback_mode,
+        expires_at_unix=started.expires_at_unix,
+        browser_warning=started.browser_error,
+    )
+
+
+@router.post(
+    "/workspaces/{workspace_id}/auth/accounts/{profile_id}/login/complete",
+    response_model=IntegrationOAuthCompleteResponse,
+)
+async def complete_workspace_auth_account_login(
+    request: Request,
+    workspace_id: str,
+    profile_id: str,
+    body: IntegrationOAuthCompleteRequest,
+):
+    """Complete a previously started browser OAuth flow for one workspace account."""
+    engine = _get_engine(request)
+    workspace = await _require_workspace(engine, workspace_id)
+    runtime = _get_integration_oauth_runtime(request)
+    flow = runtime.flows.get(str(body.flow_id or "").strip())
+    if flow is None or flow.workspace_id != workspace_id or flow.profile_id != profile_id:
+        raise HTTPException(status_code=404, detail="OAuth login flow not found.")
+    merged_auth, profile = await _workspace_auth_profile(
+        engine=engine,
+        workspace=workspace,
+        profile_id=profile_id,
+    )
+    callback_input = str(body.callback_input or "").strip()
+    try:
+        if callback_input:
+            await asyncio.to_thread(
+                runtime.engine.submit_callback_input,
+                state=flow.flow_id,
+                raw_input=callback_input,
+            )
+        elif not runtime.engine.callback_received(state=flow.flow_id):
+            return IntegrationOAuthCompleteResponse(
+                status="pending",
+                message="Waiting for OAuth callback.",
+            )
+        token_payload = await asyncio.to_thread(
+            runtime.engine.finish_auth,
+            provider=flow.provider,
+            state=flow.flow_id,
+            timeout_seconds=1,
+        )
+        stored = await asyncio.to_thread(
+            store_oauth_profile_token_payload,
+            profile,
+            token_payload=token_payload,
+            provider_scopes=flow.provider.scopes,
+            obtained_via="browser_pkce",
+        )
+        await asyncio.to_thread(
+            _persist_profile_if_draft,
+            profile=profile,
+            merged_auth=merged_auth,
+        )
+    except OAuthEngineError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except OAuthProfileError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    finally:
+        runtime.flows.pop(flow.flow_id, None)
+    payload = await _workspace_integrations_payload(engine=engine, workspace=workspace)
+    row = _find_workspace_account_row(payload=payload, profile_id=profile_id)
+    return IntegrationOAuthCompleteResponse(
+        status="completed",
+        message=f"Connected account {profile_id}.",
+        account=row,
+        expires_at=stored.expires_at,
+        scopes=list(stored.scopes),
+    )
+
+
+@router.post(
+    "/workspaces/{workspace_id}/auth/accounts/{profile_id}/refresh",
+    response_model=AccountInfoResponse,
+)
+async def refresh_workspace_auth_account(
+    request: Request,
+    workspace_id: str,
+    profile_id: str,
+):
+    """Refresh the stored OAuth token payload for one workspace account."""
+    engine = _get_engine(request)
+    workspace = await _require_workspace(engine, workspace_id)
+    merged_auth, profile = await _workspace_auth_profile(
+        engine=engine,
+        workspace=workspace,
+        profile_id=profile_id,
+    )
+    try:
+        await asyncio.to_thread(refresh_oauth_profile, profile)
+        await asyncio.to_thread(
+            _persist_profile_if_draft,
+            profile=profile,
+            merged_auth=merged_auth,
+        )
+    except OAuthProfileError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    payload = await _workspace_integrations_payload(engine=engine, workspace=workspace)
+    row = _find_workspace_account_row(payload=payload, profile_id=profile_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Auth account not found.")
+    return row
+
+
+@router.post(
+    "/workspaces/{workspace_id}/auth/accounts/{profile_id}/logout",
+    response_model=AccountInfoResponse,
+)
+async def logout_workspace_auth_account(
+    request: Request,
+    workspace_id: str,
+    profile_id: str,
+):
+    """Clear the stored OAuth token payload for one workspace account."""
+    engine = _get_engine(request)
+    workspace = await _require_workspace(engine, workspace_id)
+    _merged_auth, profile = await _workspace_auth_profile(
+        engine=engine,
+        workspace=workspace,
+        profile_id=profile_id,
+    )
+    try:
+        await asyncio.to_thread(logout_oauth_profile, profile)
+    except OAuthProfileError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    payload = await _workspace_integrations_payload(engine=engine, workspace=workspace)
+    row = _find_workspace_account_row(payload=payload, profile_id=profile_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Auth account not found.")
+    return row
+
+
+async def _update_workspace_mcp_approval(
+    *,
+    request: Request,
+    workspace_id: str,
+    alias: str,
+    status: str,
+) -> MCPServerManagementResponse:
+    engine = _get_engine(request)
+    workspace = await _require_workspace(engine, workspace_id)
+    manager = _workspace_mcp_manager(engine=engine, workspace=workspace)
+    clean_alias = ensure_valid_alias(alias)
+    try:
+        await asyncio.to_thread(
+            manager.set_server_approval,
+            clean_alias,
+            status=status,
+        )
+    except MCPConfigManagerError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    payload = await _workspace_integrations_payload(engine=engine, workspace=workspace)
+    row = _find_workspace_mcp_row(payload=payload, alias=clean_alias)
+    if row is None:
+        raise HTTPException(status_code=404, detail="MCP server not found.")
+    return row
+
+
+@router.post(
+    "/workspaces/{workspace_id}/mcp/{alias}/approve",
+    response_model=MCPServerManagementResponse,
+)
+async def approve_workspace_mcp_server(
+    request: Request,
+    workspace_id: str,
+    alias: str,
+):
+    """Approve a workspace-defined remote MCP server."""
+    return await _update_workspace_mcp_approval(
+        request=request,
+        workspace_id=workspace_id,
+        alias=alias,
+        status="approved",
+    )
+
+
+@router.post(
+    "/workspaces/{workspace_id}/mcp/{alias}/reject",
+    response_model=MCPServerManagementResponse,
+)
+async def reject_workspace_mcp_server(
+    request: Request,
+    workspace_id: str,
+    alias: str,
+):
+    """Reject a workspace-defined remote MCP server."""
+    return await _update_workspace_mcp_approval(
+        request=request,
+        workspace_id=workspace_id,
+        alias=alias,
+        status="rejected",
     )
 
 
@@ -5374,6 +7759,13 @@ async def post_conversation_message(
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
+    except UnresolvedAuthResourcesError as exc:
+        raise HTTPException(status_code=400, detail=exc.to_payload())
+    except AuthResolutionError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Conversation auth preflight failed: {exc}",
+        )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 

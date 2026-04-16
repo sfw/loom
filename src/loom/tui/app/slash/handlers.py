@@ -936,14 +936,123 @@ async def handle_slash_command_core(self, text: str) -> bool:
         return True
 
     if token == "/history":
-        if arg and arg.lower() not in {"older", "more"}:
-            chat.add_info(self._render_slash_command_usage("/history", "[older]"))
+        if not arg:
+            loaded = await self._load_older_chat_history()
+            chat.add_info(
+                "Loaded older chat history."
+                if loaded
+                else "No older chat history available."
+            )
             return True
-        loaded = await self._load_older_chat_history()
-        if loaded:
-            chat.add_info("Loaded older chat history.")
-        else:
-            chat.add_info("No older chat history available.")
+
+        history_parts = arg.split(None, 1)
+        history_cmd = history_parts[0].lower()
+        history_rest = history_parts[1].strip() if len(history_parts) > 1 else ""
+
+        if history_cmd in {"older", "more"}:
+            loaded = await self._load_older_chat_history()
+            chat.add_info(
+                "Loaded older chat history."
+                if loaded
+                else "No older chat history available."
+            )
+            return True
+
+        if history_cmd == "latest":
+            self._jump_chat_history_latest()
+            chat.add_info("Jumped to the latest chat rows.")
+            return True
+
+        if history_cmd == "transcript":
+            if not history_rest:
+                state = "on" if bool(getattr(self, "_chat_transcript_mode", False)) else "off"
+                chat.add_info(f"Transcript mode is {state}.")
+                return True
+            state_token = history_rest.lower()
+            if state_token not in {"on", "off"}:
+                chat.add_info(
+                    self._render_slash_command_usage("/history transcript", "[on|off]")
+                )
+                return True
+            enabled = state_token == "on"
+            self._set_chat_transcript_mode(enabled)
+            chat.add_info(
+                "Transcript mode enabled."
+                if enabled
+                else "Transcript mode disabled."
+            )
+            return True
+
+        if history_cmd == "thinking":
+            if not history_rest:
+                state = (
+                    "shown"
+                    if bool(getattr(self, "_chat_transcript_show_thinking", False))
+                    else "hidden"
+                )
+                chat.add_info(f"Transcript thinking is {state}.")
+                return True
+            state_token = history_rest.lower()
+            if state_token not in {"show", "hide"}:
+                chat.add_info(
+                    self._render_slash_command_usage("/history thinking", "[show|hide]")
+                )
+                return True
+            enabled = state_token == "show"
+            self._set_chat_transcript_show_thinking(enabled)
+            chat.add_info(
+                "Transcript thinking shown."
+                if enabled
+                else "Transcript thinking hidden."
+            )
+            return True
+
+        if history_cmd == "search":
+            if not history_rest:
+                chat.add_info(
+                    self._render_slash_command_usage("/history search", "<query>")
+                )
+                return True
+            matches = self._search_chat_history(history_rest)
+            escaped_query = self._escape_markup(history_rest)
+            if matches:
+                chat.add_info(
+                    f"Found {matches} transcript match(es) for '{escaped_query}'."
+                )
+            else:
+                chat.add_info(
+                    f"No transcript matches for '{escaped_query}'."
+                )
+            return True
+
+        if history_cmd in {"next", "prev"}:
+            moved, current, total = self._step_chat_history_search(
+                1 if history_cmd == "next" else -1
+            )
+            if moved:
+                chat.add_info(f"Moved to transcript match {current}/{total}.")
+            else:
+                chat.add_info("No active transcript search.")
+            return True
+
+        if history_cmd == "clear-search":
+            cleared = self._clear_chat_search()
+            chat.add_info(
+                "Cleared transcript search."
+                if cleared
+                else "No active transcript search."
+            )
+            return True
+
+        chat.add_info(
+            self._render_slash_command_usage(
+                "/history",
+                (
+                    "[older|latest|transcript [on|off]|thinking [show|hide]|"
+                    "search <query>|next|prev|clear-search]"
+                ),
+            )
+        )
         return True
 
     if token == "/learned":

@@ -8,14 +8,18 @@ import {
 
 import {
   bootstrapDesktopRuntime,
+  completeInitialSetup as completeInitialSetupRequest,
+  discoverSetupModels as discoverSetupModelsRequest,
   fetchDesktopSidecarStatus,
   fetchModels,
   fetchRuntimeStatus,
   fetchSettings,
+  fetchSetupStatus,
   fetchWorkspaces,
-  patchSettings,
   type ModelInfo,
   type RuntimeStatus,
+  type SetupCompleteRequest,
+  type SetupStatus,
   type SettingsPayload,
   type WorkspaceSummary,
 } from "../api";
@@ -30,17 +34,25 @@ async function loadShellSnapshotWithArchived(includeArchived: boolean): Promise<
   modelRows: ModelInfo[];
   workspaceRows: WorkspaceSummary[];
   settingsPayload: SettingsPayload;
+  setupStatus: SetupStatus;
 }> {
   let lastError: unknown = null;
   for (let attempt = 0; attempt < 20; attempt += 1) {
     try {
-      const [runtimeSnapshot, modelRows, workspaceRows, settingsPayload] = await Promise.all([
+      const [runtimeSnapshot, modelRows, workspaceRows, settingsPayload, setupStatus] = await Promise.all([
         fetchRuntimeStatus(),
         fetchModels(),
         fetchWorkspaces(includeArchived),
         fetchSettings(),
+        fetchSetupStatus(),
       ]);
-      return { runtimeSnapshot, modelRows, workspaceRows, settingsPayload };
+      return {
+        runtimeSnapshot,
+        modelRows,
+        workspaceRows,
+        settingsPayload,
+        setupStatus,
+      };
     } catch (error) {
       lastError = error;
       await new Promise((resolve) => window.setTimeout(resolve, 300));
@@ -62,6 +74,7 @@ export interface ConnectionState {
   models: ModelInfo[];
   workspaces: WorkspaceSummary[];
   settings: SettingsPayload | null;
+  setupStatus: SetupStatus | null;
   runtimeManaged: boolean;
   connectionState: "connecting" | "connected" | "failed";
   settingsPreview: Array<{ path: string; section: string; field: string; description: string; configured_display: string; effective_display: string }>;
@@ -69,6 +82,8 @@ export interface ConnectionState {
 
 export interface ConnectionActions {
   retryConnection: () => void;
+  discoverSetupModels: (provider: string, baseUrl: string, apiKey?: string) => Promise<string[]>;
+  completeInitialSetup: (payload: SetupCompleteRequest) => Promise<void>;
   setWorkspaces: React.Dispatch<React.SetStateAction<WorkspaceSummary[]>>;
   setSettings: React.Dispatch<React.SetStateAction<SettingsPayload | null>>;
   setRuntime: React.Dispatch<React.SetStateAction<RuntimeStatus | null>>;
@@ -91,6 +106,7 @@ export function useConnection(deps: {
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [workspaces, setWorkspaces] = useState<WorkspaceSummary[]>([]);
   const [settings, setSettings] = useState<SettingsPayload | null>(null);
+  const [setupStatus, setSetupStatus] = useState<SetupStatus | null>(null);
   const [connectionState, setConnectionState] = useState<"connecting" | "connected" | "failed">("connecting");
   const [connectionAttempt, setConnectionAttempt] = useState(0);
   const [runtimeManaged, setRuntimeManaged] = useState(false);
@@ -113,6 +129,7 @@ export function useConnection(deps: {
           modelRows,
           workspaceRows,
           settingsPayload,
+          setupStatus: setupStatusPayload,
         } = await loadShellSnapshotWithArchived(showArchivedWorkspaces);
         if (cancelled) {
           return;
@@ -122,6 +139,7 @@ export function useConnection(deps: {
         setModels(modelRows);
         setWorkspaces(workspaceRows);
         setSettings(settingsPayload);
+        setSetupStatus(setupStatusPayload);
         consecutiveHealthFailuresRef.current = 0;
         setError("");
         setConnectionState("connected");
@@ -259,15 +277,56 @@ export function useConnection(deps: {
   // Computed
   const settingsPreview = (settings?.basic || []).slice(0, 4);
 
+  async function discoverSetupModels(
+    provider: string,
+    baseUrl: string,
+    apiKey = "",
+  ): Promise<string[]> {
+    const response = await discoverSetupModelsRequest({
+      provider,
+      base_url: baseUrl,
+      api_key: apiKey,
+    });
+    return response.models;
+  }
+
+  async function completeInitialSetup(payload: SetupCompleteRequest): Promise<void> {
+    setError("");
+    await completeInitialSetupRequest(payload);
+    const {
+      runtimeSnapshot,
+      modelRows,
+      workspaceRows,
+      settingsPayload,
+      setupStatus: setupStatusPayload,
+    } = await loadShellSnapshotWithArchived(showArchivedWorkspaces);
+    setRuntime(runtimeSnapshot);
+    setModels(modelRows);
+    setWorkspaces(workspaceRows);
+    setSettings(settingsPayload);
+    setSetupStatus(setupStatusPayload);
+    setConnectionState("connected");
+    setCreateParentPath((current) => current || runtimeSnapshot.workspace_default_path || "");
+    startTransition(() => {
+      setSelectedWorkspaceId((currentId) => {
+        const stillValid = workspaceRows.some((workspace) => workspace.id === currentId);
+        return stillValid ? currentId : (workspaceRows[0]?.id || "");
+      });
+    });
+  }
+
   return {
     runtime,
     models,
     workspaces,
     settings,
+    setupStatus,
     runtimeManaged,
     connectionState,
     settingsPreview,
     retryConnection,
+    discoverSetupModels,
+    completeInitialSetup,
     setWorkspaces,
     setSettings,
     setRuntime,

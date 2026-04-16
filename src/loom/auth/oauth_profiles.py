@@ -64,6 +64,15 @@ class OAuthProfileLoginResult:
     browser_warning: str = ""
 
 
+@dataclass(frozen=True)
+class OAuthProfileStoreResult:
+    """Stored token payload summary for split OAuth flows."""
+
+    token_ref: str
+    expires_at: int | None
+    scopes: tuple[str, ...]
+
+
 def _ensure_oauth_profile(profile: AuthProfile) -> None:
     mode = str(getattr(profile, "mode", "") or "").strip().lower()
     if mode not in {"oauth2_pkce", "oauth2_device"}:
@@ -468,6 +477,68 @@ def refresh_oauth_profile(
     )
 
 
+def store_oauth_profile_token_payload(
+    profile: AuthProfile,
+    *,
+    token_payload: dict[str, Any],
+    provider_scopes: tuple[str, ...] = (),
+    scopes: tuple[str, ...] = (),
+    resolver: SecretResolver | None = None,
+    obtained_via: str = "browser_pkce",
+) -> OAuthProfileStoreResult:
+    """Persist a finished OAuth token payload for one `/auth` profile."""
+    _ensure_oauth_profile(profile)
+    token_ref = _resolve_token_ref(profile)
+    secret_resolver = resolver or SecretResolver()
+    try:
+        secret_resolver.validate_writable(token_ref)
+    except SecretResolutionError as e:
+        raise OAuthProfileError("token_ref_not_writable", str(e)) from e
+
+    access_token_value = str(token_payload.get("access_token", "")).strip()
+    if not access_token_value:
+        raise OAuthProfileError(
+            "token_payload_invalid",
+            "Token response missing access_token.",
+        )
+
+    stored_payload = dict(token_payload)
+    stored_payload["access_token"] = access_token_value
+    stored_payload.setdefault("token_type", "Bearer")
+    merged_scopes = _merge_oauth_scopes(
+        provider_scopes,
+        profile.scopes,
+        scopes,
+        token_payload.get("scope"),
+        token_payload.get("scopes"),
+    )
+    if merged_scopes:
+        stored_payload["scope"] = " ".join(merged_scopes)
+        stored_payload["scopes"] = list(merged_scopes)
+    expires_at_unix = _parse_expiry_from_payload(
+        stored_payload,
+        now_unix=int(time.time()),
+    )
+    if expires_at_unix is not None:
+        stored_payload["expires_at"] = expires_at_unix
+    stored_payload["obtained_via"] = str(obtained_via or "browser_pkce").strip()
+    stored_payload["obtained_at"] = int(time.time())
+
+    try:
+        secret_resolver.store(
+            token_ref,
+            json.dumps(stored_payload, sort_keys=True, separators=(",", ":")),
+        )
+    except SecretResolutionError as e:
+        raise OAuthProfileError("token_store_failed", str(e)) from e
+
+    return OAuthProfileStoreResult(
+        token_ref=token_ref,
+        expires_at=expires_at_unix,
+        scopes=merged_scopes,
+    )
+
+
 def login_oauth_profile(
     profile: AuthProfile,
     *,
@@ -565,45 +636,20 @@ def login_oauth_profile(
     finally:
         engine.shutdown()
 
-    access_token_value = str(token_payload.get("access_token", "")).strip()
-    if not access_token_value:
-        raise OAuthProfileError(
-            "token_payload_invalid",
-            "Token response missing access_token.",
-        )
-
-    stored_payload = dict(token_payload)
-    stored_payload["access_token"] = access_token_value
-    stored_payload.setdefault("token_type", "Bearer")
-    merged_scopes = _merge_oauth_scopes(
-        provider.scopes,
-        profile.scopes,
-        scopes,
-        token_payload.get("scope"),
-        token_payload.get("scopes"),
+    stored = store_oauth_profile_token_payload(
+        profile,
+        token_payload=token_payload,
+        provider_scopes=provider.scopes,
+        scopes=scopes,
+        resolver=secret_resolver,
+        obtained_via="browser_pkce",
     )
-    if merged_scopes:
-        stored_payload["scope"] = " ".join(merged_scopes)
-        stored_payload["scopes"] = list(merged_scopes)
-    expires_at_unix = _parse_expiry_from_payload(stored_payload, now_unix=int(time.time()))
-    if expires_at_unix is not None:
-        stored_payload["expires_at"] = expires_at_unix
-    stored_payload["obtained_via"] = "browser_pkce"
-    stored_payload["obtained_at"] = int(time.time())
-
-    try:
-        secret_resolver.store(
-            token_ref,
-            json.dumps(stored_payload, sort_keys=True, separators=(",", ":")),
-        )
-    except SecretResolutionError as e:
-        raise OAuthProfileError("token_store_failed", str(e)) from e
 
     return OAuthProfileLoginResult(
-        token_ref=token_ref,
+        token_ref=stored.token_ref,
         callback_mode=started.callback_mode,
         authorization_url=started.authorization_url,
-        expires_at=expires_at_unix,
-        scopes=merged_scopes,
+        expires_at=stored.expires_at,
+        scopes=stored.scopes,
         browser_warning=str(getattr(started, "browser_error", "") or "").strip(),
     )

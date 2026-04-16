@@ -551,6 +551,21 @@ export default function ThreadsTab() {
     }
     return "";
   }, [conversationAwaitingInput, activeAskUserToolCallId, renderedTimelineItems]);
+  const showDetachedApprovalCard = Boolean(
+    conversationAwaitingApproval
+    && pendingConversationApproval
+    && !activeApprovalToolTimelineId,
+  );
+  const showDetachedAskUserCard = Boolean(
+    conversationAwaitingInput
+    && pendingConversationPrompt
+    && !activeAskUserTimelineId,
+  );
+  const composerContextHint = conversationAwaitingApproval && pendingConversationApproval
+    ? `Use Approve, Deny, or Always allow to resolve ${pendingConversationApproval.tool_name}. Sending a message only queues it for later.`
+    : conversationAwaitingInput && pendingConversationPrompt
+      ? "Choose a reply option below to continue, or send a message if you want to answer in free text."
+      : "";
   // Scroll to bottom when content changes and pinned (debounced)
   useEffect(() => {
     if (!isPinnedRef.current || userScrollingRef.current) return;
@@ -1105,6 +1120,21 @@ export default function ThreadsTab() {
           </div>
         )}
 
+        {showDetachedApprovalCard && pendingConversationApproval && (
+          <ApprovalActionCard
+            approval={pendingConversationApproval}
+            onResolve={handleResolveConversationApproval}
+          />
+        )}
+
+        {showDetachedAskUserCard && pendingConversationPrompt && (
+          <AskUserCard
+            prompt={pendingConversationPrompt}
+            options={quickReplyOptions}
+            onReply={handleQuickConversationReply}
+          />
+        )}
+
         {/* ===== Injected messages (shown as user bubbles) ===== */}
         {injectedMessages.map((im) => (
           <div key={im.id} className="flex justify-end">
@@ -1220,13 +1250,36 @@ export default function ThreadsTab() {
       {/* ===== Composer (pinned at bottom) ===== */}
       <div className="border-t border-border shrink-0 px-5 py-3">
         {/* Processing indicator above composer */}
-        {conversationIsProcessing && (
+        {(conversationIsProcessing || conversationAwaitingApproval || conversationAwaitingInput) && (
           <div className="flex items-center gap-2 mb-2">
-            <span className="h-1.5 w-1.5 rounded-full bg-sky-400 animate-pulse" />
-            <span className="text-[11px] text-zinc-500">
+            <span
+              className={cn(
+                "h-1.5 w-1.5 rounded-full",
+                conversationAwaitingApproval
+                  ? "bg-yellow-400 animate-pulse"
+                  : conversationAwaitingInput
+                    ? "bg-amber-400 animate-pulse"
+                    : "bg-sky-400 animate-pulse",
+              )}
+            />
+            <span
+              className={cn(
+                "text-[11px]",
+                conversationAwaitingApproval
+                  ? "text-yellow-400"
+                  : conversationAwaitingInput
+                    ? "text-amber-400"
+                    : "text-zinc-500",
+              )}
+            >
               {conversationPhaseLabel || "Processing..."}
             </span>
           </div>
+        )}
+        {composerContextHint && (
+          <p className="mb-2 rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-2 text-[11px] leading-relaxed text-zinc-400">
+            {composerContextHint}
+          </p>
         )}
 
         {/* Pasted image previews */}

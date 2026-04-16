@@ -14,9 +14,31 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+import loom.api.routes as routes_mod
+import loom.auth.oauth_profiles as oauth_profiles_mod
 from loom.api.engine import Engine
 from loom.api.server import LOCAL_CORS_ORIGIN_REGEX, create_app
-from loom.config import Config, ExecutionConfig, ProcessConfig, TelemetryConfig
+from loom.auth.config import (
+    AuthConfig,
+    AuthProfile,
+    load_merged_auth_config,
+    write_auth_file,
+)
+from loom.auth.resources import (
+    AuthBinding,
+    AuthResource,
+    AuthResourcesStore,
+    load_workspace_auth_resources,
+    write_workspace_auth_resources,
+)
+from loom.config import (
+    Config,
+    ExecutionConfig,
+    MCPOAuthConfig,
+    MCPServerConfig,
+    ProcessConfig,
+    TelemetryConfig,
+)
 from loom.config_runtime import ConfigRuntimeStore
 from loom.cowork.session import CoworkTurn, ToolCallEvent
 from loom.engine.orchestrator import Orchestrator
@@ -35,7 +57,9 @@ from loom.events.types import (
     TOKEN_STREAMED,
 )
 from loom.events.webhook import WebhookDelivery
+from loom.integrations.mcp.oauth import MCPOAuthRefreshResult
 from loom.learning.manager import LearningManager
+from loom.mcp.config import load_mcp_file, write_mcp_file
 from loom.models.router import ModelRouter
 from loom.prompts.assembler import PromptAssembler
 from loom.recovery.approval import ApprovalManager, ApprovalRequest
@@ -691,6 +715,100 @@ class TestSystemEndpoints:
         assert isinstance(data["tool_availability"], list)
 
     @pytest.mark.asyncio
+    async def test_setup_status_reports_first_run_guidance(
+        self,
+        client,
+        monkeypatch,
+        tmp_path,
+    ):
+        config_dir = tmp_path / ".loom"
+        config_path = config_dir / "loom.toml"
+        monkeypatch.setattr(routes_mod.setup_mod, "CONFIG_DIR", config_dir)
+        monkeypatch.setattr(routes_mod.setup_mod, "CONFIG_PATH", config_path)
+
+        response = await client.get("/setup/status")
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["needs_setup"] is True
+        assert payload["config_path"] == str(config_path)
+        assert payload["providers"]
+        assert payload["role_presets"]["all"]
+
+    @pytest.mark.asyncio
+    async def test_setup_discover_models_returns_provider_results(
+        self,
+        client,
+        monkeypatch,
+    ):
+        monkeypatch.setattr(
+            routes_mod.setup_mod,
+            "discover_models",
+            lambda provider, base_url, api_key="": ["model-a", "model-b"],
+        )
+
+        response = await client.post(
+            "/setup/discover-models",
+            json={
+                "provider": "openai_compatible",
+                "base_url": "http://localhost:1234/v1",
+                "api_key": "",
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json()["models"] == ["model-a", "model-b"]
+
+    @pytest.mark.asyncio
+    async def test_setup_complete_writes_config_and_reloads_runtime_models(
+        self,
+        client,
+        monkeypatch,
+        tmp_path,
+    ):
+        config_dir = tmp_path / ".loom"
+        config_path = config_dir / "loom.toml"
+        monkeypatch.setattr(routes_mod.setup_mod, "CONFIG_DIR", config_dir)
+        monkeypatch.setattr(routes_mod.setup_mod, "CONFIG_PATH", config_path)
+
+        response = await client.post(
+            "/setup/complete",
+            json={
+                "models": [
+                    {
+                        "name": "primary",
+                        "provider": "ollama",
+                        "base_url": "http://localhost:11434",
+                        "model": "qwen3:14b",
+                        "api_key": "",
+                        "roles": [
+                            "planner",
+                            "executor",
+                            "extractor",
+                            "verifier",
+                            "compactor",
+                        ],
+                        "max_tokens": 8192,
+                        "temperature": 0.1,
+                    },
+                ],
+            },
+        )
+
+        assert response.status_code == 200
+        assert config_path.exists()
+        written = config_path.read_text(encoding="utf-8")
+        assert '[models.primary]' in written
+        assert 'model = "qwen3:14b"' in written
+
+        status_response = await client.get("/setup/status")
+        assert status_response.status_code == 200
+        assert status_response.json()["needs_setup"] is False
+
+        models_response = await client.get("/models")
+        assert models_response.status_code == 200
+        assert any(row["name"] == "primary" for row in models_response.json())
+
+    @pytest.mark.asyncio
     async def test_activity_summary_reports_global_backend_work(
         self,
         client,
@@ -1205,6 +1323,779 @@ class TestWorkspaceFirstEndpoints:
         assert any(row["name"] == "ask_user" for row in payload["tools"])
 
     @pytest.mark.asyncio
+    async def test_workspace_integrations_reports_management_grade_mcp_and_account_state(
+        self,
+        client,
+        tmp_path,
+        workspace_registry,
+        monkeypatch,
+    ):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv(
+            "LOOM_TEST_NOTION_TOKEN",
+            json.dumps({"access_token": "token-123", "token_type": "Bearer"}),
+        )
+
+        workspace_path = tmp_path / "integrations-ws"
+        workspace_path.mkdir()
+        loom_dir = workspace_path / ".loom"
+        loom_dir.mkdir()
+        write_mcp_file(
+            loom_dir / "mcp.toml",
+            {
+                "notion": MCPServerConfig(
+                    type="remote",
+                    url="https://mcp.notion.example",
+                    oauth=MCPOAuthConfig(enabled=True, scopes=["read"]),
+                ),
+                "linear": MCPServerConfig(
+                    type="remote",
+                    url="https://mcp.linear.example",
+                    oauth=MCPOAuthConfig(enabled=True, scopes=["read"]),
+                ),
+            },
+        )
+
+        home_loom_dir = tmp_path / ".loom"
+        home_loom_dir.mkdir(exist_ok=True)
+        write_auth_file(
+            home_loom_dir / "auth.toml",
+            AuthConfig(
+                profiles={
+                    "notion_marketing": AuthProfile(
+                        profile_id="notion_marketing",
+                        provider="notion",
+                        mode="oauth2_pkce",
+                        account_label="Notion Marketing",
+                        mcp_server="notion",
+                        token_ref="${LOOM_TEST_NOTION_TOKEN}",
+                    ),
+                },
+            ),
+        )
+        write_workspace_auth_resources(
+            loom_dir / "auth.resources.toml",
+            AuthResourcesStore(
+                resources={
+                    "resource-mcp-notion": AuthResource(
+                        resource_id="resource-mcp-notion",
+                        resource_kind="mcp",
+                        resource_key="notion",
+                        display_name="MCP: notion",
+                        provider="notion",
+                        source="mcp",
+                        status="active",
+                    ),
+                },
+                bindings={
+                    "binding-notion": AuthBinding(
+                        binding_id="binding-notion",
+                        resource_id="resource-mcp-notion",
+                        profile_id="notion_marketing",
+                        status="active",
+                    ),
+                },
+                workspace_defaults={
+                    "resource-mcp-notion": "notion_marketing",
+                },
+            ),
+        )
+
+        workspace = await workspace_registry.ensure_workspace(
+            str(workspace_path),
+            display_name="Integrations WS",
+        )
+        assert workspace is not None
+
+        response = await client.get(f"/workspaces/{workspace['id']}/integrations")
+        assert response.status_code == 200
+        payload = response.json()
+
+        assert payload["workspace"]["id"] == workspace["id"]
+        assert payload["counts"]["mcp_servers"] == 2
+        assert payload["counts"]["accounts"] == 1
+
+        notion = next(row for row in payload["mcp_servers"] if row["alias"] == "notion")
+        assert notion["source"] == "workspace"
+        assert notion["trust_state"] == "review_recommended"
+        assert notion["approval_required"] is True
+        assert notion["approval_state"] == "pending"
+        assert notion["runtime_state"] == "pending_approval"
+        assert notion["effective_account"]["profile_id"] == "notion_marketing"
+        assert notion["auth_state"]["state"] == "ready"
+
+        linear = next(row for row in payload["mcp_servers"] if row["alias"] == "linear")
+        assert linear["runtime_state"] == "pending_approval"
+        assert (
+            "Approve this workspace-defined remote server before connecting "
+            "an account."
+        ) in linear["remediation"]
+
+        account = payload["accounts"][0]
+        assert account["profile_id"] == "notion_marketing"
+        assert account["effective_for_mcp_servers"] == ["notion"]
+        assert account["used_by_mcp_servers"] == ["notion"]
+        assert account["auth_state"]["state"] == "ready"
+        assert account["writable_storage_kind"] == "env"
+
+    @pytest.mark.asyncio
+    async def test_workspace_mcp_approve_endpoint_updates_management_state(
+        self,
+        client,
+        tmp_path,
+        workspace_registry,
+        monkeypatch,
+    ):
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        workspace_path = tmp_path / "approval-ws"
+        workspace_path.mkdir()
+        loom_dir = workspace_path / ".loom"
+        loom_dir.mkdir()
+        write_mcp_file(
+            loom_dir / "mcp.toml",
+            {
+                "notion": MCPServerConfig(
+                    type="remote",
+                    url="https://mcp.notion.example",
+                    oauth=MCPOAuthConfig(enabled=True, scopes=["read"]),
+                ),
+            },
+        )
+
+        workspace = await workspace_registry.ensure_workspace(
+            str(workspace_path),
+            display_name="Approval WS",
+        )
+        assert workspace is not None
+
+        response = await client.post(f"/workspaces/{workspace['id']}/mcp/notion/approve")
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["alias"] == "notion"
+        assert payload["approval_required"] is True
+        assert payload["approval_state"] == "approved"
+
+    @pytest.mark.asyncio
+    async def test_workspace_mcp_create_update_disable_and_delete_endpoints(
+        self,
+        client,
+        tmp_path,
+        workspace_registry,
+        monkeypatch,
+    ):
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        workspace_path = tmp_path / "manage-mcp-ws"
+        workspace_path.mkdir()
+        loom_dir = workspace_path / ".loom"
+        loom_dir.mkdir()
+
+        workspace = await workspace_registry.ensure_workspace(
+            str(workspace_path),
+            display_name="Manage MCP WS",
+        )
+        assert workspace is not None
+
+        create = await client.post(
+            f"/workspaces/{workspace['id']}/mcp",
+            json={
+                "alias": "filesystem",
+                "type": "local",
+                "command": "npx",
+                "args": ["-y", "@modelcontextprotocol/server-filesystem"],
+                "cwd": str(workspace_path),
+                "timeout_seconds": 45,
+                "enabled": True,
+            },
+        )
+        assert create.status_code == 200
+        created = create.json()
+        assert created["alias"] == "filesystem"
+        assert created["type"] == "local"
+        assert created["command"] == "npx"
+        assert created["args"] == ["-y", "@modelcontextprotocol/server-filesystem"]
+        assert created["timeout_seconds"] == 45
+
+        patch = await client.patch(
+            f"/workspaces/{workspace['id']}/mcp/filesystem",
+            json={
+                "command": "uvx",
+                "args": ["mcp-filesystem"],
+                "cwd": "",
+                "enabled": False,
+            },
+        )
+        assert patch.status_code == 200
+        updated = patch.json()
+        assert updated["command"] == "uvx"
+        assert updated["args"] == ["mcp-filesystem"]
+        assert updated["enabled"] is False
+
+        enable = await client.post(
+            f"/workspaces/{workspace['id']}/mcp/filesystem/enable"
+        )
+        assert enable.status_code == 200
+        assert enable.json()["enabled"] is True
+
+        disable = await client.post(
+            f"/workspaces/{workspace['id']}/mcp/filesystem/disable"
+        )
+        assert disable.status_code == 200
+        assert disable.json()["enabled"] is False
+
+        stored = load_mcp_file(loom_dir / "mcp.toml")
+        filesystem = stored.servers["filesystem"]
+        assert filesystem.command == "uvx"
+        assert filesystem.args == ["mcp-filesystem"]
+        assert filesystem.enabled is False
+
+        delete = await client.delete(
+            f"/workspaces/{workspace['id']}/mcp/filesystem"
+        )
+        assert delete.status_code == 200
+        assert delete.json()["status"] == "ok"
+        assert "filesystem" not in load_mcp_file(loom_dir / "mcp.toml").servers
+
+    @pytest.mark.asyncio
+    async def test_workspace_auth_sync_drafts_endpoint_creates_draft_accounts(
+        self,
+        client,
+        tmp_path,
+        workspace_registry,
+        monkeypatch,
+    ):
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        workspace_path = tmp_path / "draft-sync-ws"
+        workspace_path.mkdir()
+        loom_dir = workspace_path / ".loom"
+        loom_dir.mkdir()
+        write_mcp_file(
+            loom_dir / "mcp.toml",
+            {
+                "notion": MCPServerConfig(
+                    type="remote",
+                    url="https://mcp.notion.example",
+                    oauth=MCPOAuthConfig(enabled=True, scopes=["read"]),
+                ),
+            },
+        )
+
+        workspace = await workspace_registry.ensure_workspace(
+            str(workspace_path),
+            display_name="Draft Sync WS",
+        )
+        assert workspace is not None
+
+        response = await client.post(f"/workspaces/{workspace['id']}/auth/accounts/sync-drafts")
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["created_drafts"] >= 1
+        draft = next(
+            row for row in payload["integrations"]["accounts"] if row["mcp_server"] == "notion"
+        )
+        assert draft["status"] == "draft"
+        assert draft["mode"] == "oauth2_pkce"
+
+    @pytest.mark.asyncio
+    async def test_workspace_mcp_select_account_binds_and_sets_default(
+        self,
+        client,
+        tmp_path,
+        workspace_registry,
+        monkeypatch,
+    ):
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        home_loom_dir = tmp_path / ".loom"
+        home_loom_dir.mkdir()
+        write_auth_file(
+            home_loom_dir / "auth.toml",
+            AuthConfig(
+                profiles={
+                    "notion_personal": AuthProfile(
+                        profile_id="notion_personal",
+                        provider="notion",
+                        mode="oauth2_pkce",
+                        account_label="Notion Personal",
+                        token_ref="keychain://loom/notion/notion_personal/tokens",
+                    ),
+                },
+            ),
+        )
+
+        workspace_path = tmp_path / "select-account-ws"
+        workspace_path.mkdir()
+        loom_dir = workspace_path / ".loom"
+        loom_dir.mkdir()
+        write_mcp_file(
+            loom_dir / "mcp.toml",
+            {
+                "notion": MCPServerConfig(
+                    type="remote",
+                    url="https://mcp.notion.example",
+                    oauth=MCPOAuthConfig(enabled=True, scopes=["read"]),
+                ),
+            },
+        )
+        write_workspace_auth_resources(
+            loom_dir / "auth.resources.toml",
+            AuthResourcesStore(
+                resources={
+                    "resource-mcp-notion": AuthResource(
+                        resource_id="resource-mcp-notion",
+                        resource_kind="mcp",
+                        resource_key="notion",
+                        display_name="MCP: notion",
+                        provider="notion",
+                        source="mcp",
+                        status="active",
+                    ),
+                },
+            ),
+        )
+
+        workspace = await workspace_registry.ensure_workspace(
+            str(workspace_path),
+            display_name="Select Account WS",
+        )
+        assert workspace is not None
+
+        approve = await client.post(f"/workspaces/{workspace['id']}/mcp/notion/approve")
+        assert approve.status_code == 200
+
+        response = await client.post(
+            f"/workspaces/{workspace['id']}/mcp/notion/accounts/notion_personal/select"
+        )
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["alias"] == "notion"
+        assert payload["status"] == "ok"
+
+        store = load_workspace_auth_resources(loom_dir / "auth.resources.toml")
+        assert store.workspace_defaults["resource-mcp-notion"] == "notion_personal"
+        assert any(
+            binding.resource_id == "resource-mcp-notion"
+            and binding.profile_id == "notion_personal"
+            and binding.status == "active"
+            for binding in store.bindings.values()
+        )
+
+        integrations = await client.get(f"/workspaces/{workspace['id']}/integrations")
+        assert integrations.status_code == 200
+        notion = next(
+            row
+            for row in integrations.json()["mcp_servers"]
+            if row["alias"] == "notion"
+        )
+        assert notion["effective_account"]["profile_id"] == "notion_personal"
+
+    @pytest.mark.asyncio
+    async def test_workspace_mcp_reconnect_refreshes_expired_legacy_token_first(
+        self,
+        client,
+        tmp_path,
+        workspace_registry,
+        monkeypatch,
+    ):
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        home_loom_dir = tmp_path / ".loom"
+        home_loom_dir.mkdir()
+        write_mcp_file(
+            home_loom_dir / "mcp.toml",
+            {
+                "notion": MCPServerConfig(
+                    type="remote",
+                    url="https://mcp.notion.com/mcp",
+                    oauth=MCPOAuthConfig(enabled=True, scopes=["read"]),
+                ),
+            },
+        )
+
+        workspace_path = tmp_path / "reconnect-legacy-ws"
+        workspace_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(
+            str(workspace_path),
+            display_name="Reconnect Legacy WS",
+        )
+        assert workspace is not None
+
+        monkeypatch.setattr(
+            routes_mod,
+            "oauth_state_for_alias",
+            lambda alias, server=None: {
+                "state": "expired",
+                "has_token": True,
+                "expired": True,
+            },
+        )
+        refresh_mock = MagicMock(
+            return_value=MCPOAuthRefreshResult(
+                status="refreshed",
+                reason="",
+                refreshed=True,
+            ),
+        )
+        reconnect_mock = MagicMock(
+            return_value=SimpleNamespace(
+                alias="notion",
+                status="healthy",
+                last_error="",
+            ),
+        )
+        monkeypatch.setattr(routes_mod, "refresh_mcp_oauth_token", refresh_mock)
+        monkeypatch.setattr(routes_mod, "runtime_reconnect_alias", reconnect_mock)
+
+        response = await client.post(
+            f"/workspaces/{workspace['id']}/mcp/notion/reconnect"
+        )
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["status"] == "healthy"
+        assert payload["message"] == (
+            "Refreshed legacy OAuth token and Reconnected MCP server notion."
+        )
+        refresh_mock.assert_called_once()
+        reconnect_mock.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_workspace_mcp_reconnect_surfaces_helpful_legacy_refresh_error(
+        self,
+        client,
+        tmp_path,
+        workspace_registry,
+        monkeypatch,
+    ):
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        home_loom_dir = tmp_path / ".loom"
+        home_loom_dir.mkdir()
+        write_mcp_file(
+            home_loom_dir / "mcp.toml",
+            {
+                "notion": MCPServerConfig(
+                    type="remote",
+                    url="https://mcp.notion.com/mcp",
+                    oauth=MCPOAuthConfig(enabled=True, scopes=["read"]),
+                ),
+            },
+        )
+
+        workspace_path = tmp_path / "reconnect-legacy-error-ws"
+        workspace_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(
+            str(workspace_path),
+            display_name="Reconnect Legacy Error WS",
+        )
+        assert workspace is not None
+
+        monkeypatch.setattr(
+            routes_mod,
+            "oauth_state_for_alias",
+            lambda alias, server=None: {
+                "state": "expired",
+                "has_token": True,
+                "expired": True,
+            },
+        )
+        monkeypatch.setattr(
+            routes_mod,
+            "refresh_mcp_oauth_token",
+            lambda alias, server=None, force=False: MCPOAuthRefreshResult(
+                status="failed",
+                reason="Refresh token is missing.",
+                refreshed=False,
+            ),
+        )
+
+        response = await client.post(
+            f"/workspaces/{workspace['id']}/mcp/notion/reconnect"
+        )
+
+        assert response.status_code == 400
+        assert "Create and connect a Loom account instead." in response.json()["detail"]
+
+    @pytest.mark.asyncio
+    async def test_workspace_mcp_test_uses_runtime_verification_for_remote_servers(
+        self,
+        client,
+        tmp_path,
+        workspace_registry,
+        monkeypatch,
+    ):
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        home_loom_dir = tmp_path / ".loom"
+        home_loom_dir.mkdir()
+        write_mcp_file(
+            home_loom_dir / "mcp.toml",
+            {
+                "notion": MCPServerConfig(
+                    type="remote",
+                    url="https://mcp.notion.com/mcp",
+                    oauth=MCPOAuthConfig(enabled=True, scopes=["read"]),
+                ),
+            },
+        )
+
+        workspace_path = tmp_path / "remote-test-ws"
+        workspace_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(
+            str(workspace_path),
+            display_name="Remote Test WS",
+        )
+        assert workspace is not None
+
+        connect_mock = MagicMock(
+            return_value=SimpleNamespace(
+                alias="notion",
+                status="healthy",
+                last_error="",
+            ),
+        )
+        list_tools_mock = MagicMock(
+            return_value=[
+                {"name": "search"},
+                {"name": "query_database"},
+            ],
+        )
+        monkeypatch.setattr(routes_mod, "runtime_connect_alias", connect_mock)
+        monkeypatch.setattr(routes_mod, "runtime_list_tools_alias", list_tools_mock)
+
+        response = await client.post(
+            f"/workspaces/{workspace['id']}/mcp/notion/test"
+        )
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["status"] == "healthy"
+        assert payload["tool_count"] == 2
+        assert payload["tool_names"] == ["query_database", "search"]
+        assert payload["message"] == (
+            "Verified remote MCP server notion and discovered 2 tools."
+        )
+        connect_mock.assert_called_once()
+        list_tools_mock.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_workspace_auth_account_create_update_archive_and_restore(
+        self,
+        client,
+        tmp_path,
+        workspace_registry,
+        monkeypatch,
+    ):
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        workspace_path = tmp_path / "account-manage-ws"
+        workspace_path.mkdir()
+        loom_dir = workspace_path / ".loom"
+        loom_dir.mkdir()
+
+        workspace = await workspace_registry.ensure_workspace(
+            str(workspace_path),
+            display_name="Account Manage WS",
+        )
+        assert workspace is not None
+
+        create = await client.post(
+            f"/workspaces/{workspace['id']}/auth/accounts",
+            json={
+                "profile_id": "notion_personal",
+                "provider": "notion",
+                "mode": "oauth2_pkce",
+                "account_label": "Notion Personal",
+                "mcp_server": "notion",
+                "status": "draft",
+            },
+        )
+        assert create.status_code == 200
+        created = create.json()
+        assert created["profile_id"] == "notion_personal"
+        assert created["status"] == "draft"
+        assert created["auth_state"]["state"] == "draft"
+
+        update = await client.patch(
+            f"/workspaces/{workspace['id']}/auth/accounts/notion_personal",
+            json={
+                "account_label": "Notion Personal Updated",
+                "scopes": ["read", "search"],
+            },
+        )
+        assert update.status_code == 200
+        updated = update.json()
+        assert updated["account_label"] == "Notion Personal Updated"
+
+        archive = await client.post(
+            f"/workspaces/{workspace['id']}/auth/accounts/notion_personal/archive"
+        )
+        assert archive.status_code == 200
+        assert archive.json()["status"] == "archived"
+        assert archive.json()["auth_state"]["state"] == "archived"
+
+        restore = await client.post(
+            f"/workspaces/{workspace['id']}/auth/accounts/notion_personal/restore"
+        )
+        assert restore.status_code == 200
+        assert restore.json()["status"] == "ready"
+
+        merged = load_merged_auth_config(workspace=workspace_path)
+        stored = merged.config.profiles["notion_personal"]
+        assert stored.account_label == "Notion Personal Updated"
+        assert stored.scopes == ["read", "search"]
+        assert stored.status == "ready"
+        assert stored.token_ref == "keychain://loom/notion/notion_personal/tokens"
+
+    @pytest.mark.asyncio
+    async def test_workspace_auth_account_login_start_and_complete(
+        self,
+        client,
+        tmp_path,
+        workspace_registry,
+        monkeypatch,
+    ):
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        stored: dict[str, str] = {}
+
+        class _FakeSecretResolver:
+            def resolve(self, secret_ref: str) -> str:
+                return stored.get(secret_ref, "")
+
+            def validate_writable(self, secret_ref: str) -> None:
+                stored["validated_ref"] = secret_ref
+
+            def store(self, secret_ref: str, secret_value: str) -> None:
+                stored["stored_ref"] = secret_ref
+                stored[secret_ref] = secret_value
+
+        monkeypatch.setattr(oauth_profiles_mod, "SecretResolver", _FakeSecretResolver)
+
+        def _fake_start_auth(
+            self,
+            *,
+            provider,
+            preferred_port,
+            open_browser,
+            allow_manual_fallback,
+            manual_redirect_uri="urn:ietf:wg:oauth:2.0:oob",
+        ):
+            return SimpleNamespace(
+                state="flow-1",
+                authorization_url="https://auth.example/authorize",
+                redirect_uri="http://127.0.0.1:8765/oauth/callback",
+                expires_at_unix=1_763_000_000,
+                callback_mode="loopback",
+                browser_error="",
+            )
+
+        monkeypatch.setattr("loom.oauth.engine.OAuthEngine.start_auth", _fake_start_auth)
+        monkeypatch.setattr(
+            "loom.oauth.engine.OAuthEngine.callback_received",
+            lambda self, *, state: True,
+        )
+        monkeypatch.setattr(
+            "loom.oauth.engine.OAuthEngine.finish_auth",
+            lambda self, *, provider, state, timeout_seconds=1: {
+                "access_token": "access-token",
+                "refresh_token": "refresh-token",
+                "expires_in": 3600,
+                "token_type": "Bearer",
+            },
+        )
+
+        home_auth_dir = tmp_path / ".loom"
+        home_auth_dir.mkdir()
+        write_auth_file(
+            home_auth_dir / "auth.toml",
+            AuthConfig(
+                profiles={
+                    "notion_marketing": AuthProfile(
+                        profile_id="notion_marketing",
+                        provider="notion",
+                        mode="oauth2_pkce",
+                        account_label="Notion Marketing",
+                        mcp_server="notion",
+                        token_ref="keychain://loom/notion/notion_marketing/tokens",
+                        metadata={
+                            "oauth_authorization_endpoint": "https://auth.example/authorize",
+                            "oauth_token_endpoint": "https://auth.example/token",
+                            "oauth_client_id": "loom-desktop",
+                        },
+                        status="draft",
+                    ),
+                },
+            ),
+        )
+
+        workspace_path = tmp_path / "oauth-ws"
+        workspace_path.mkdir()
+        loom_dir = workspace_path / ".loom"
+        loom_dir.mkdir()
+        write_mcp_file(
+            loom_dir / "mcp.toml",
+            {
+                "notion": MCPServerConfig(
+                    type="remote",
+                    url="https://mcp.notion.example",
+                    oauth=MCPOAuthConfig(enabled=True, scopes=["read"]),
+                ),
+            },
+        )
+        write_workspace_auth_resources(
+            loom_dir / "auth.resources.toml",
+            AuthResourcesStore(
+                resources={
+                    "resource-mcp-notion": AuthResource(
+                        resource_id="resource-mcp-notion",
+                        resource_kind="mcp",
+                        resource_key="notion",
+                        display_name="MCP: notion",
+                        provider="notion",
+                        source="mcp",
+                        status="active",
+                    ),
+                },
+                bindings={
+                    "binding-notion": AuthBinding(
+                        binding_id="binding-notion",
+                        resource_id="resource-mcp-notion",
+                        profile_id="notion_marketing",
+                        status="active",
+                    ),
+                },
+                workspace_defaults={"resource-mcp-notion": "notion_marketing"},
+            ),
+        )
+
+        workspace = await workspace_registry.ensure_workspace(
+            str(workspace_path),
+            display_name="OAuth WS",
+        )
+        assert workspace is not None
+
+        start = await client.post(
+            f"/workspaces/{workspace['id']}/auth/accounts/notion_marketing/login/start"
+        )
+        assert start.status_code == 200
+        assert start.json()["flow_id"] == "flow-1"
+
+        complete = await client.post(
+            f"/workspaces/{workspace['id']}/auth/accounts/notion_marketing/login/complete",
+            json={"flow_id": "flow-1"},
+        )
+        assert complete.status_code == 200
+        payload = complete.json()
+        assert payload["status"] == "completed"
+        assert payload["account"]["profile_id"] == "notion_marketing"
+        assert payload["account"]["auth_state"]["state"] == "ready"
+        assert stored["validated_ref"] == "keychain://loom/notion/notion_marketing/tokens"
+        assert stored["stored_ref"] == "keychain://loom/notion/notion_marketing/tokens"
+
+    @pytest.mark.asyncio
     async def test_workspace_search_queries_real_workspace_surfaces(
         self,
         client,
@@ -1214,11 +2105,34 @@ class TestWorkspaceFirstEndpoints:
         workspace_registry,
         memory_manager,
         state_manager,
+        monkeypatch,
     ):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        home_loom_dir = tmp_path / ".loom"
+        home_loom_dir.mkdir(exist_ok=True)
+        write_auth_file(
+            home_loom_dir / "auth.toml",
+            AuthConfig(
+                profiles={
+                    "auth_search_profile": AuthProfile(
+                        profile_id="auth_search_profile",
+                        provider="notion",
+                        mode="oauth2_pkce",
+                        account_label="Auth Search Account",
+                        mcp_server="notion",
+                        token_ref="keychain://loom/notion/auth_search_profile/tokens",
+                        status="ready",
+                    ),
+                },
+            ),
+        )
+
         workspace_path = tmp_path / "search-ws"
         workspace_path.mkdir()
         process_dir = workspace_path / "loom-processes"
         process_dir.mkdir()
+        loom_dir = workspace_path / ".loom"
+        loom_dir.mkdir()
         (process_dir / "auth-audit.yaml").write_text(
             "\n".join([
                 "name: auth-audit",
@@ -1231,6 +2145,43 @@ class TestWorkspaceFirstEndpoints:
         artifact_text = "Authentication audit notes"
         artifact_path.write_text(artifact_text, encoding="utf-8")
         artifact_sha = hashlib.sha256(artifact_text.encode("utf-8")).hexdigest()
+        write_mcp_file(
+            loom_dir / "mcp.toml",
+            {
+                "notion": MCPServerConfig(
+                    type="remote",
+                    url="https://mcp.notion.example",
+                    oauth=MCPOAuthConfig(enabled=True, scopes=["read"]),
+                ),
+            },
+        )
+        write_workspace_auth_resources(
+            loom_dir / "auth.resources.toml",
+            AuthResourcesStore(
+                resources={
+                    "resource-mcp-notion": AuthResource(
+                        resource_id="resource-mcp-notion",
+                        resource_kind="mcp",
+                        resource_key="notion",
+                        display_name="MCP: notion",
+                        provider="notion",
+                        source="mcp",
+                        status="active",
+                    ),
+                },
+                bindings={
+                    "binding-auth-search": AuthBinding(
+                        binding_id="binding-auth-search",
+                        resource_id="resource-mcp-notion",
+                        profile_id="auth_search_profile",
+                        status="active",
+                    ),
+                },
+                workspace_defaults={
+                    "resource-mcp-notion": "auth_search_profile",
+                },
+            ),
+        )
 
         workspace = await workspace_registry.ensure_workspace(
             str(workspace_path),
@@ -1321,6 +2272,11 @@ class TestWorkspaceFirstEndpoints:
         assert payload["artifacts"][0]["path"] == "auth-report.md"
         assert payload["files"][0]["path"] == "auth-report.md"
         assert payload["processes"][0]["title"] == "auth-audit"
+        assert any(
+            item["item_id"] == "auth_search_profile"
+            and item["title"] == "Auth Search Account"
+            for item in payload["accounts"]
+        )
         assert payload["tools"]
 
     @pytest.mark.asyncio
@@ -1711,6 +2667,107 @@ class TestWorkspaceFirstEndpoints:
         event_types = [row["event_type"] for row in events]
         assert "user_message" in event_types
         assert "assistant_text" in event_types
+
+    @pytest.mark.asyncio
+    async def test_post_conversation_message_builds_workspace_auth_context_for_cowork_session(
+        self,
+        client,
+        tmp_path,
+        conversation_store,
+        workspace_registry,
+        engine,
+        monkeypatch,
+    ):
+        workspace_path = tmp_path / "chat-mcp-auth-ws"
+        workspace_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(
+            str(workspace_path),
+            display_name="Chat MCP Auth WS",
+        )
+        assert workspace is not None
+        session_id = await conversation_store.create_session(
+            workspace=str(workspace_path),
+            model_name="chat-model",
+        )
+
+        engine.model_router.add_provider(
+            "chat-model",
+            SimpleNamespace(name="chat-model", roles=["executor"], tier=1),
+        )
+        engine.config.mcp.servers["notion"] = MCPServerConfig(
+            type="remote",
+            url="https://mcp.notion.com/mcp",
+        )
+
+        expected_auth_context = SimpleNamespace(selected_by_mcp_alias={"notion": object()})
+        captured: dict[str, object] = {}
+
+        def fake_build_run_auth_context(
+            *,
+            workspace,
+            metadata,
+            explicit_auth_path=None,
+            required_resources=None,
+            available_mcp_aliases=None,
+        ):
+            captured["workspace"] = workspace
+            captured["metadata"] = metadata
+            captured["explicit_auth_path"] = explicit_auth_path
+            captured["required_resources"] = required_resources
+            captured["available_mcp_aliases"] = available_mcp_aliases
+            return expected_auth_context
+
+        class FakeCoworkSession:
+            def __init__(self, *args, auth_context=None, store=None, session_id="", **kwargs):
+                captured["session_auth_context"] = auth_context
+                self._store = store
+                self._session_id = session_id
+
+            async def resume(self, session_id: str) -> None:
+                self._session_id = session_id
+
+            async def send_streaming(self, user_message: str):
+                turn_count = await self._store.get_turn_count(self._session_id)
+                await self._store.append_turn(
+                    self._session_id,
+                    turn_count + 1,
+                    "user",
+                    user_message,
+                )
+                await self._store.append_turn(
+                    self._session_id,
+                    turn_count + 2,
+                    "assistant",
+                    "MCP-aware reply",
+                )
+                yield CoworkTurn(
+                    text="MCP-aware reply",
+                    tool_calls=[],
+                    tokens_used=12,
+                    model="chat-model",
+                    latency_ms=10,
+                    total_time_ms=20,
+                    tokens_per_second=1.2,
+                    context_tokens=0,
+                    context_messages=0,
+                    omitted_messages=0,
+                    recall_index_used=False,
+                )
+
+        monkeypatch.setattr(routes_mod, "build_run_auth_context", fake_build_run_auth_context)
+        monkeypatch.setattr("loom.api.routes._cowork_session_cls", lambda: FakeCoworkSession)
+
+        response = await client.post(
+            f"/conversations/{session_id}/messages",
+            json={"message": "Can you use Notion?", "role": "user"},
+        )
+        assert response.status_code == 202
+        assert captured["workspace"] == workspace_path.expanduser()
+        assert captured["metadata"] == {}
+        assert captured["explicit_auth_path"] is None
+        assert captured["required_resources"] is None
+        assert captured["available_mcp_aliases"] == {"notion"}
+        assert captured["session_auth_context"] is expected_auth_context
 
     @pytest.mark.asyncio
     async def test_conversation_events_and_stop_status_endpoints(

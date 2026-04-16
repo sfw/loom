@@ -362,4 +362,13 @@ describe("Sidebar", () => {
     );
     expect(mockApp.refreshWorkspaceSurface).not.toHaveBeenCalled();
   });
+
+  it("shows integrations as a top-level navigation target", async () => {
+    const user = userEvent.setup();
+    render(<Sidebar />);
+
+    await user.click(screen.getByRole("button", { name: "Integrations" }));
+
+    expect(mockApp.setActiveTab).toHaveBeenCalledWith("integrations");
+  });
 });

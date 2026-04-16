@@ -1304,6 +1304,29 @@ class TestWorkspaceRefresh:
             },
         })
         chat.add_live_feedback.assert_not_called()
+        chat.add_thinking_text.assert_not_called()
+
+    def test_render_chat_event_assistant_thinking_is_shown_in_transcript_mode(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._chat_transcript_mode = True
+        app._chat_transcript_show_thinking = True
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+
+        assert app._render_chat_event({
+            "event_type": "assistant_thinking",
+            "payload": {
+                "text": "Looking up more context.",
+                "streaming": False,
+            },
+        })
+        chat.add_thinking_text.assert_called_once_with("Looking up more context.")
 
     @pytest.mark.asyncio
     async def test_switch_session_clears_files_panel(self, monkeypatch):
@@ -2227,7 +2250,7 @@ class TestChatReplayHydration:
         chat.add_model_text.assert_called_once_with("still renders", markup=False)
 
     @pytest.mark.asyncio
-    async def test_append_chat_replay_event_trims_with_continuity_sentinel(self):
+    async def test_append_chat_replay_event_shifts_window_in_batched_steps(self):
         from loom.tui.app import LoomApp
 
         app = LoomApp(
@@ -2256,10 +2279,27 @@ class TestChatReplayHydration:
             {"text": "three"},
             persist=False,
         )
+        assert [row["payload"]["text"] for row in app._chat_replay_events] == [
+            "one",
+            "two",
+            "three",
+        ]
+        chat.add_info.assert_not_called()
 
-        assert [row["payload"]["text"] for row in app._chat_replay_events] == ["two", "three"]
+        await app._append_chat_replay_event(
+            "user_message",
+            {"text": "four"},
+            persist=False,
+        )
+        assert [row["payload"]["text"] for row in app._chat_replay_events] == [
+            "one",
+            "two",
+            "three",
+            "four",
+        ]
         sentinel = chat.add_info.call_args_list[-1].args[0]
         assert "Transcript window truncated" in sentinel
+        assert "2 older row(s) hidden" in sentinel
 
     @pytest.mark.asyncio
     async def test_append_chat_replay_event_does_not_render_by_default(self):
@@ -2367,6 +2407,73 @@ class TestChatReplayHydration:
 
         assert loaded is True
         assert elapsed < 0.35
+
+    @pytest.mark.asyncio
+    async def test_load_older_chat_history_moves_window_backward_without_dropping_rows(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._session = SimpleNamespace(session_id="session-1")
+        app._store = MagicMock()
+        app._chat_resume_page_size = MagicMock(return_value=4)
+        app._chat_resume_max_rendered_rows = MagicMock(return_value=2)
+
+        latest = [
+            {
+                "seq": seq,
+                "event_type": "user_message",
+                "payload": {"text": f"latest {seq}"},
+            }
+            for seq in range(201, 205)
+        ]
+        older = [
+            {
+                "seq": seq,
+                "event_type": "user_message",
+                "payload": {"text": f"older {seq}"},
+            }
+            for seq in range(199, 201)
+        ]
+
+        async def _get_chat_events(
+            _session_id: str,
+            *,
+            before_seq: int | None = None,
+            after_seq: int | None = None,
+            limit: int = 200,
+        ):
+            _ = (after_seq, limit)
+            if before_seq is None:
+                return latest
+            return older if before_seq == 201 else []
+
+        app._store.get_chat_events = AsyncMock(side_effect=_get_chat_events)
+        app._store.synthesize_chat_events_from_turns = AsyncMock(return_value=[])
+
+        chat = MagicMock()
+        chat.children = []
+        app.query_one = MagicMock(return_value=chat)
+
+        await app._hydrate_chat_history_for_active_session()
+        rendered_before = [call.args[0] for call in chat.add_user_message.call_args_list]
+        assert rendered_before == ["latest 203", "latest 204"]
+
+        chat.add_user_message.reset_mock()
+        chat.add_info.reset_mock()
+
+        loaded = await app._load_older_chat_history()
+
+        assert loaded is True
+        rendered_after = [call.args[0] for call in chat.add_user_message.call_args_list]
+        assert rendered_after == ["latest 201", "latest 202"]
+        sentinel = chat.add_info.call_args_list[-1].args[0]
+        assert "2 older row(s) hidden" in sentinel
+        assert "2 newer row(s) hidden" in sentinel
+        assert len(app._chat_replay_events) == 6
 
 class TestRunStartAuthResolution:
     def test_collect_required_auth_resources_uses_required_tool_set_when_declared(self):

@@ -6,6 +6,8 @@ This changelog is generated directly from git commit history (non-merge commits)
 
 ## [Unreleased]
 
+- Refactor MCP + auth usability around a shared account authority: new MCP OAuth writes now use Loom secret refs with fingerprinted server identity, workspace-defined remote servers expose approval/trust state, and the desktop app now has a dedicated Integrations tab with management-grade MCP/account state plus guided account connect/routing actions
+
 ## [0.3.0] - 2026-04-07
 
 - Add DB migration `20260403_006_search_provider_state_v1` for authoritative auth-free search provider pacing/cooldown state

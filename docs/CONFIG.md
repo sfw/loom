@@ -467,8 +467,9 @@ Remote MCP aliases additionally support:
 Operational OAuth notes:
 - Browser-first login: `uv run loom mcp auth login <alias>`.
 - Manual fallback: `--manual-token --access-token ...` or `--access-token-env ...`.
-- MCP alias OAuth tokens are stored in `~/.loom/mcp_oauth_tokens.json`.
-- `/auth` profile token refs remain separate (`~/.loom/auth.toml` + secret refs).
+- New MCP OAuth writes use Loom secret refs and secure writable storage.
+- `~/.loom/mcp_oauth_tokens.json` remains readable only as a legacy migration path.
+- `/auth` account profiles remain the durable home for token refs and account identity.
 
 #### MCP OAuth Failure Runbook
 1. Check alias auth state: `uv run loom mcp auth status <alias>`.

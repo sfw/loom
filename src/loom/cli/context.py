@@ -161,6 +161,8 @@ def _serialize_mcp_view(
             "enabled": view.server.oauth.enabled,
             "scopes": list(view.server.oauth.scopes),
         },
+        "approval_required": bool(view.server.approval_required),
+        "approval_state": str(view.server.approval_state or "not_required"),
         "allow_insecure_http": view.server.allow_insecure_http,
         "allow_private_network": view.server.allow_private_network,
         "timeout_seconds": view.server.timeout_seconds,
@@ -171,6 +173,7 @@ def _serialize_mcp_view(
         try:
             payload["oauth_state"] = oauth_state_for_alias(
                 view.alias,
+                server=view.server,
                 store_path=oauth_store_path,
             )
         except Exception:

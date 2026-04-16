@@ -15,7 +15,7 @@ import {
 const workspaceSearchResponse: WorkspaceSearchResponse = {
   workspace: null,
   query: "auth",
-  total_results: 3,
+  total_results: 4,
   workspaces: [
     {
       kind: "workspace",
@@ -74,6 +74,24 @@ const workspaceSearchResponse: WorkspaceSearchResponse = {
   artifacts: [],
   files: [],
   processes: [],
+  accounts: [
+    {
+      kind: "account",
+      item_id: "auth_search_profile",
+      title: "Auth Search Account",
+      subtitle: "notion · oauth2_pkce",
+      snippet: "Linked to notion · Connected",
+      badges: ["ready", "linked:notion"],
+      workspace_id: "ws-1",
+      workspace_display_name: "Workspace One",
+      workspace_path: "/tmp/workspace",
+      conversation_id: "",
+      run_id: "",
+      approval_item_id: "",
+      path: "",
+      metadata: {},
+    },
+  ],
   mcp_servers: [],
   tools: [],
 };
@@ -94,10 +112,17 @@ describe("shell command palette helpers", () => {
   it("builds base commands plus a dynamic search action", () => {
     const baseOptions = buildCommandOptions("");
     const options = buildCommandOptions("auth");
+    const integrationOptions = buildCommandOptions("integr");
 
     expect(baseOptions.some((option) => option.id === "new-run")).toBe(true);
+    expect(baseOptions.some((option) => option.id === "open-integrations")).toBe(true);
     expect(options.some((option) => option.id === "new-run")).toBe(false);
-    expect(options).toEqual([]);
+    expect(options.map((option) => option.id)).toEqual([
+      "open-integrations",
+      "add-remote-server",
+      "connect-account",
+    ]);
+    expect(integrationOptions.map((option) => option.id)).toContain("open-integrations");
   });
 
   it("builds pinned command entries", () => {
@@ -131,7 +156,7 @@ describe("shell command palette helpers", () => {
   it("turns workspace search results into palette result entries", () => {
     const entries = buildResultPaletteEntries(workspaceSearchResponse);
 
-    expect(entries).toHaveLength(3);
+    expect(entries).toHaveLength(4);
     expect(entries[0]).toEqual(
       expect.objectContaining({
         kind: "result",
@@ -142,9 +167,11 @@ describe("shell command palette helpers", () => {
       "Workspace One",
       "Auth thread",
       "Auth run",
+      "Auth Search Account",
     ]);
     expect(entries[1]?.description).toContain("Workspace One");
     expect(entries[2]?.description).toContain("Workspace Two");
+    expect(entries[3]?.description).toContain("Workspace One");
   });
 
   it("shows recent and pinned sections when the command draft is empty", () => {
@@ -195,6 +222,6 @@ describe("shell command palette helpers", () => {
     );
 
     expect(entries.some((entry) => entry.kind === "result")).toBe(true);
-    expect(sections.map((section) => section.label)).toEqual(["Workspaces", "Threads", "Runs"]);
+    expect(sections.map((section) => section.label)).toEqual(["Actions", "Workspaces", "Threads", "Runs", "Accounts"]);
   });
 });

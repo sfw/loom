@@ -515,6 +515,9 @@ class MCPServerConfig:
     cwd: str = ""
     timeout_seconds: int = MCP_DEFAULT_TIMEOUT_SECONDS
     enabled: bool = True
+    approval_required: bool = False
+    approval_state: str = "not_required"
+    server_fingerprint: str = ""
 
 
 @dataclass(frozen=True)

@@ -98,7 +98,15 @@ def initialize_app_state(
     self._chat_history_source = ""
     self._chat_history_oldest_seq = None
     self._chat_history_oldest_turn = None
-    self._chat_trimmed_total = 0
+    self._chat_render_window_start = 0
+    self._chat_follow_latest = True
+    self._chat_hidden_older_count = 0
+    self._chat_hidden_newer_count = 0
+    self._chat_transcript_mode = False
+    self._chat_transcript_show_thinking = False
+    self._chat_search_query = ""
+    self._chat_search_match_positions = []
+    self._chat_search_match_current = -1
     self._active_delegate_streams = {}
     self._workspace_refresh_pending_reasons = set()
     self._workspace_refresh_first_request_at = 0.0

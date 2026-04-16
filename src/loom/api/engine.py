@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from loom import __version__
-from loom.config import Config
+from loom.config import Config, load_config
 from loom.config_runtime.store import ConfigRuntimeStore
 from loom.cowork.approval import ApprovalDecision
 from loom.engine.orchestrator import Orchestrator
@@ -582,6 +582,7 @@ class Engine:
         """Recompute effective config after runtime config mutations."""
         effective = self.config_runtime_store.effective_config()
         self.config = effective
+        self.model_router = ModelRouter.from_config(effective)
         self.tool_registry = create_default_registry(
             effective,
             mcp_startup_mode="background",
@@ -609,6 +610,16 @@ class Engine:
             ),
         )
         return effective
+
+    def reload_config_from_source(self, path: Path | None = None) -> Config:
+        """Reload file-backed config and rebuild runtime state."""
+        target = path or self.config_runtime_store.source_path()
+        loaded = load_config(target)
+        self.config_runtime_store.set_config(
+            loaded,
+            source_path=target if target is not None and target.exists() else None,
+        )
+        return self.refresh_config_from_runtime_store()
 
     def runtime_status_snapshot(self) -> dict[str, object]:
         """Return desktop/client-friendly runtime contract information."""

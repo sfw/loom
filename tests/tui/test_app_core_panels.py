@@ -783,6 +783,37 @@ class TestChatLogStreaming:
 
         assert log._scroll_to_end.call_count == 2
 
+    def test_streaming_markdown_state_keeps_stable_prefix_between_updates(self):
+        from rich.console import Group
+
+        from loom.tui.widgets.chat_log import StreamingMarkdownState
+
+        state = StreamingMarkdownState()
+
+        first = state.render("First paragraph.\n\nSecond")
+        assert state.stable_prefix == "First paragraph.\n\n"
+        assert isinstance(first, Group)
+
+        second = state.render("First paragraph.\n\nSecond line")
+        assert state.stable_prefix == "First paragraph.\n\n"
+        assert isinstance(second, Group)
+
+        state.render("Replacement text")
+        assert state.stable_prefix == ""
+
+    def test_add_thinking_text_mounts_transcript_block(self):
+        from loom.tui.widgets.chat_log import ChatLog
+
+        log = ChatLog()
+        mounted: list = []
+        log.mount = lambda widget, *_args, **_kwargs: mounted.append(widget)
+        log._scroll_to_end = lambda: None
+
+        log.add_thinking_text("Checking the transcript.")
+
+        assert len(mounted) == 1
+        assert "thinking-msg" in mounted[0].classes
+
     def test_scroll_to_end_is_coalesced_per_refresh(self):
         from loom.tui.widgets.chat_log import ChatLog
 

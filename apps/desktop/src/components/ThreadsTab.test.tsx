@@ -868,6 +868,37 @@ describe("ThreadsTab", () => {
     expect(screen.getByRole("button", { name: "Option A" })).toBeInTheDocument();
   });
 
+  it("falls back to a thread-level approval card when no visible tool row can anchor it", async () => {
+    const user = userEvent.setup();
+    mockApp.conversationStatus = {
+      conversation_id: "conversation-1",
+      processing: false,
+      awaiting_approval: true,
+      pending_approval: {
+        approval_id: "approval-1",
+        tool_name: "run_tool",
+        args: { name: "shell_execute", arguments: { command: "pwd" } },
+        risk_info: { impact_preview: "Will run shell_execute in the workspace." },
+      },
+      awaiting_user_input: false,
+      pending_prompt: null,
+    };
+    mockApp.conversationAwaitingApproval = true;
+    mockApp.pendingConversationApproval = mockApp.conversationStatus.pending_approval;
+    mockApp.visibleConversationEvents = [
+      makeEvent(1, "user_message", { text: "Please inspect the repo." }),
+    ];
+
+    render(<ThreadsTab />);
+
+    expect(screen.getByText("Approval Required")).toBeInTheDocument();
+    expect(screen.getByText("Will run shell_execute in the workspace.")).toBeInTheDocument();
+    expect(screen.getByText(/Sending a message only queues it for later\./i)).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Approve" }));
+    expect(mockApp.handleResolveConversationApproval).toHaveBeenCalledWith("approve");
+  });
+
   it("does not leave historical approval-needed cards in the transcript after approval is resolved", () => {
     mockApp.visibleConversationEvents = [
       makeEvent(1, "tool_call_started", {

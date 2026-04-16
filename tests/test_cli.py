@@ -18,6 +18,12 @@ from click.testing import CliRunner
 from loom import __version__
 from loom.__main__ import cli
 from loom.auth.config import AuthConfig, MergedAuthConfig
+from loom.auth.resources import (
+    AuthBinding,
+    AuthResource,
+    AuthResourcesStore,
+    write_workspace_auth_resources,
+)
 from loom.config import Config, MCPConfig, ProcessConfig
 from loom.mcp.config import MergedMCPConfig
 from loom.processes.testing import ProcessCaseResult
@@ -58,6 +64,25 @@ def _oauth_token_server(*, status_code: int = 200, payload: dict | None = None):
         server.shutdown()
         server.server_close()
         thread.join(timeout=1.0)
+
+
+def _patch_fake_mcp_secret_resolver(monkeypatch) -> dict[str, str]:
+    import loom.integrations.mcp.oauth as mcp_oauth_mod
+
+    stored: dict[str, str] = {}
+
+    class _FakeSecretResolver:
+        def validate_writable(self, _secret_ref: str) -> None:
+            return
+
+        def store(self, secret_ref: str, secret_value: str) -> None:
+            stored[secret_ref] = secret_value
+
+        def resolve(self, secret_ref: str) -> str:
+            return stored.get(secret_ref, "")
+
+    monkeypatch.setattr(mcp_oauth_mod, "SecretResolver", _FakeSecretResolver)
+    return stored
 
 
 class TestCLI:
@@ -892,6 +917,72 @@ token_ref = "keychain://loom/notion/notion_marketing/tokens"
         )
         assert check_result.exit_code == 0
         assert "Auth config is valid." in check_result.output
+
+    def test_auth_explain_surfaces_linked_resources_and_next_action(self, tmp_path):
+        cfg = tmp_path / "loom.toml"
+        cfg.write_text("[server]\nport = 9000\n")
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        auth_cfg = tmp_path / "auth.toml"
+        auth_cfg.write_text(
+            """
+[auth.profiles.notion_marketing]
+provider = "notion"
+mode = "oauth2_pkce"
+account_label = "Marketing"
+mcp_server = "notion"
+token_ref = "keychain://loom/notion/notion_marketing/tokens"
+status = "draft"
+"""
+        )
+        loom_dir = workspace / ".loom"
+        loom_dir.mkdir()
+        write_workspace_auth_resources(
+            loom_dir / "auth.resources.toml",
+            AuthResourcesStore(
+                resources={
+                    "resource-mcp-notion": AuthResource(
+                        resource_id="resource-mcp-notion",
+                        resource_kind="mcp",
+                        resource_key="notion",
+                        display_name="MCP: notion",
+                        provider="notion",
+                        source="mcp",
+                        status="active",
+                    ),
+                },
+                bindings={
+                    "binding-notion": AuthBinding(
+                        binding_id="binding-notion",
+                        resource_id="resource-mcp-notion",
+                        profile_id="notion_marketing",
+                        status="active",
+                    ),
+                },
+                workspace_defaults={"resource-mcp-notion": "notion_marketing"},
+            ),
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--auth-config",
+                str(auth_cfg),
+                "--workspace",
+                str(workspace),
+                "auth",
+                "explain",
+                "notion_marketing",
+            ],
+        )
+        assert result.exit_code == 0
+        assert "Status: draft" in result.output
+        assert "Linked MCP aliases: notion" in result.output
+        assert "Linked resources: mcp:notion" in result.output
+        assert "Connect or complete this draft account before using it." in result.output
 
     def test_auth_check_with_explicit_config_ignores_user_overlay_profiles(self, tmp_path):
         cfg = tmp_path / "loom.toml"
@@ -2221,7 +2312,8 @@ for line in sys.stdin:
         assert payload["tool_count"] == 2
         assert payload["tools"] == ["echo", "ping"]
 
-    def test_mcp_auth_login_status_logout(self, tmp_path):
+    def test_mcp_auth_login_status_logout(self, tmp_path, monkeypatch):
+        secret_store = _patch_fake_mcp_secret_resolver(monkeypatch)
         cfg = tmp_path / "loom.toml"
         cfg.write_text("[server]\nport = 9000\n")
         mcp_cfg = tmp_path / "mcp.toml"
@@ -2261,6 +2353,10 @@ scopes = ["read:content"]
         )
         assert login_result.exit_code == 0
         assert oauth_store.exists()
+        saved = json.loads(oauth_store.read_text(encoding="utf-8"))
+        server_fingerprint = saved["alias_bindings"]["remote_demo"]["server_fingerprint"]
+        token_ref = saved["servers"][server_fingerprint]["token_ref"]
+        assert json.loads(secret_store[token_ref])["access_token"] == "token-123"
 
         status_result = runner.invoke(
             cli,
@@ -2299,6 +2395,7 @@ scopes = ["read:content"]
             ],
         )
         assert logout_result.exit_code == 0
+        assert secret_store[token_ref] == ""
 
         status_after_logout = runner.invoke(
             cli,
@@ -2320,7 +2417,8 @@ scopes = ["read:content"]
         after_payload = json.loads(status_after_logout.output)
         assert after_payload["aliases"][0]["state"] == "missing"
 
-    def test_mcp_auth_login_browser_flow_with_manual_callback_code(self, tmp_path):
+    def test_mcp_auth_login_browser_flow_with_manual_callback_code(self, tmp_path, monkeypatch):
+        secret_store = _patch_fake_mcp_secret_resolver(monkeypatch)
         cfg = tmp_path / "loom.toml"
         cfg.write_text("[server]\nport = 9000\n")
         mcp_cfg = tmp_path / "mcp.toml"
@@ -2373,7 +2471,8 @@ scopes = ["read:content"]
         assert result.exit_code == 0
         assert oauth_store.exists()
         raw = json.loads(oauth_store.read_text(encoding="utf-8"))
-        alias_payload = raw["aliases"]["remote_demo"]
+        server_fingerprint = raw["alias_bindings"]["remote_demo"]["server_fingerprint"]
+        alias_payload = json.loads(secret_store[raw["servers"][server_fingerprint]["token_ref"]])
         assert alias_payload["access_token"] == "browser-token"
         assert alias_payload["refresh_token"] == "refresh-browser"
         assert alias_payload["token_endpoint"] == token_url
@@ -2434,7 +2533,9 @@ enabled = true
     def test_mcp_auth_login_manual_token_still_works_when_browser_flag_disabled(
         self,
         tmp_path,
+        monkeypatch,
     ):
+        secret_store = _patch_fake_mcp_secret_resolver(monkeypatch)
         cfg = tmp_path / "loom.toml"
         cfg.write_text(
             """
@@ -2479,7 +2580,9 @@ enabled = true
         )
         assert result.exit_code == 0
         payload = json.loads(oauth_store.read_text(encoding="utf-8"))
-        assert payload["aliases"]["remote_demo"]["access_token"] == "manual-token-123"
+        server_fingerprint = payload["alias_bindings"]["remote_demo"]["server_fingerprint"]
+        token_ref = payload["servers"][server_fingerprint]["token_ref"]
+        assert json.loads(secret_store[token_ref])["access_token"] == "manual-token-123"
 
     def test_mcp_auth_status_redacts_stored_failure_reason(self, tmp_path):
         cfg = tmp_path / "loom.toml"
@@ -2532,7 +2635,12 @@ enabled = true
         assert "super-secret" not in result.output
         assert "<redacted>" in result.output
 
-    def test_mcp_auth_refresh_uses_refresh_token_grant_when_no_access_token(self, tmp_path):
+    def test_mcp_auth_refresh_uses_refresh_token_grant_when_no_access_token(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        secret_store = _patch_fake_mcp_secret_resolver(monkeypatch)
         cfg = tmp_path / "loom.toml"
         cfg.write_text("[server]\nport = 9000\n")
         mcp_cfg = tmp_path / "mcp.toml"
@@ -2594,12 +2702,165 @@ enabled = true
             )
         assert result.exit_code == 0
         saved = json.loads(oauth_store.read_text(encoding="utf-8"))
-        payload = saved["aliases"]["remote_demo"]
+        server_fingerprint = saved["alias_bindings"]["remote_demo"]["server_fingerprint"]
+        payload = json.loads(secret_store[saved["servers"][server_fingerprint]["token_ref"]])
         assert payload["access_token"] == "refreshed-token"
         assert payload["refresh_token"] == "refresh-2"
         assert payload["obtained_via"] == "refresh_token"
         assert captured[0]["grant_type"] == "refresh_token"
         assert captured[0]["refresh_token"] == "refresh-1"
+
+    def test_mcp_show_and_approve_workspace_remote_server(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        cfg = tmp_path / "loom.toml"
+        cfg.write_text("[server]\nport = 9000\n")
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        workspace_mcp = workspace / ".loom" / "mcp.toml"
+        workspace_mcp.parent.mkdir(parents=True)
+        workspace_mcp.write_text(
+            """
+[mcp.servers.remote_demo]
+type = "remote"
+url = "https://example.com/mcp"
+enabled = true
+
+[mcp.servers.remote_demo.oauth]
+enabled = true
+"""
+        )
+        runner = CliRunner()
+
+        before = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--workspace",
+                str(workspace),
+                "mcp",
+                "show",
+                "remote_demo",
+            ],
+        )
+        assert before.exit_code == 0
+        assert "Approval: pending" in before.output
+
+        approve = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--workspace",
+                str(workspace),
+                "mcp",
+                "approve",
+                "remote_demo",
+            ],
+        )
+        assert approve.exit_code == 0
+        assert "Approved MCP server 'remote_demo'" in approve.output
+
+        after = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--workspace",
+                str(workspace),
+                "mcp",
+                "show",
+                "remote_demo",
+            ],
+        )
+        assert after.exit_code == 0
+        assert "Approval: approved" in after.output
+
+    def test_mcp_explain_surfaces_pending_approval_next_action(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        cfg = tmp_path / "loom.toml"
+        cfg.write_text("[server]\nport = 9000\n")
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        workspace_mcp = workspace / ".loom" / "mcp.toml"
+        workspace_mcp.parent.mkdir(parents=True)
+        workspace_mcp.write_text(
+            """
+[mcp.servers.remote_demo]
+type = "remote"
+url = "https://example.com/mcp"
+enabled = true
+
+[mcp.servers.remote_demo.oauth]
+enabled = true
+"""
+        )
+        runner = CliRunner()
+
+        result = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--workspace",
+                str(workspace),
+                "mcp",
+                "explain",
+                "remote_demo",
+            ],
+        )
+        assert result.exit_code == 0
+        assert "Runtime: pending approval" in result.output
+        assert (
+            "Why: This workspace-defined remote server needs approval before Loom will use it."
+            in result.output
+        )
+        assert "Run `loom mcp approve remote_demo` to trust this server." in result.output
+
+    def test_mcp_auth_login_requires_approval_for_workspace_remote_server(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        cfg = tmp_path / "loom.toml"
+        cfg.write_text("[server]\nport = 9000\n")
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        workspace_mcp = workspace / ".loom" / "mcp.toml"
+        workspace_mcp.parent.mkdir(parents=True)
+        workspace_mcp.write_text(
+            """
+[mcp.servers.remote_demo]
+type = "remote"
+url = "https://example.com/mcp"
+enabled = true
+
+[mcp.servers.remote_demo.oauth]
+enabled = true
+"""
+        )
+        runner = CliRunner()
+
+        result = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--workspace",
+                str(workspace),
+                "mcp",
+                "auth",
+                "login",
+                "remote_demo",
+                "--manual-token",
+                "--access-token",
+                "token-123",
+            ],
+        )
+
+        assert result.exit_code == 1
+        assert "needs approval first" in result.output
 
     def test_mcp_status_command_reports_runtime(self, tmp_path):
         cfg = tmp_path / "loom.toml"
