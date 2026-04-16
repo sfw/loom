@@ -437,7 +437,15 @@ export function reconcileOptimisticConversationEvents(
   for (const text of acknowledgedUserTexts) {
     const matchIndex = optimisticUserEventMatchIndex(next, text);
     if (matchIndex >= 0) {
-      next = [...next.slice(0, matchIndex), ...next.slice(matchIndex + 1)];
+      const matchedEvent = next[matchIndex];
+      const matchedClientId = String(matchedEvent?._client_id || "").trim();
+      next = next.filter((event, index) => (
+        index !== matchIndex
+        && (
+          !matchedClientId
+          || event._client_id !== `${matchedClientId}:attachments`
+        )
+      ));
     }
   }
   return next;

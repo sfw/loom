@@ -86,6 +86,22 @@ function makeOptimisticUserEvent(
   };
 }
 
+function makeOptimisticAttachmentEvent(clientId: string) {
+  return {
+    id: -2,
+    session_id: "conversation-1",
+    seq: -2,
+    event_type: "content_indicator",
+    payload: {
+      workspace_paths: ["docs/spec.md"],
+    },
+    payload_parse_error: false,
+    created_at: "2026-03-29T00:00:09Z",
+    _optimistic: true,
+    _client_id: `${clientId}:attachments`,
+  };
+}
+
 describe("conversation replay helpers", () => {
   it("treats synthesized and durable rows as distinct event identities", () => {
     const synthetic = makeLegacyEvent(1, "user_message", "hello");
@@ -236,7 +252,9 @@ describe("conversation replay helpers", () => {
     const reconciled = reconcileOptimisticConversationEvents(
       [
         makeOptimisticUserEvent("queued-1", "please continue", "queued"),
+        makeOptimisticAttachmentEvent("queued-1"),
         makeOptimisticUserEvent("sending-1", "please continue", "sending"),
+        makeOptimisticAttachmentEvent("sending-1"),
       ],
       [makeDurableEvent(10, "user_message", "please continue")],
     );
@@ -245,6 +263,9 @@ describe("conversation replay helpers", () => {
       expect.objectContaining({
         _client_id: "queued-1",
         _delivery_state: "queued",
+      }),
+      expect.objectContaining({
+        _client_id: "queued-1:attachments",
       }),
     ]);
   });
