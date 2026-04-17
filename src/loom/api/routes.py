@@ -3605,25 +3605,47 @@ def _resolve_cowork_model(engine: Engine, model_name: str):
     return engine.model_router.select(role="executor")
 
 
+def _conversation_workspace_path(session: dict[str, Any]) -> Path | None:
+    workspace_text = str(session.get("workspace_path", "") or "").strip()
+    if not workspace_text:
+        return None
+    return Path(workspace_text).expanduser()
+
+
+def _effective_workspace_mcp_config(
+    engine: Engine,
+    *,
+    workspace_path: Path | None,
+):
+    if workspace_path is None:
+        return engine.config
+    return apply_mcp_overrides(
+        engine.config,
+        workspace=workspace_path,
+        legacy_config_path=engine.config_runtime_store.source_path(),
+    )
+
+
 def _build_cowork_auth_context(
     engine: Engine,
     session: dict[str, Any],
+    *,
+    available_mcp_aliases: set[str] | None = None,
 ):
-    workspace_text = str(session.get("workspace_path", "") or "").strip()
-    workspace_path = (
-        Path(workspace_text).expanduser()
-        if workspace_text
-        else None
+    workspace_path = _conversation_workspace_path(session)
+    effective_config = _effective_workspace_mcp_config(
+        engine,
+        workspace_path=workspace_path,
     )
-    available_mcp_aliases = {
+    aliases = available_mcp_aliases or {
         str(alias).strip()
-        for alias in getattr(engine.config.mcp, "servers", {}).keys()
+        for alias in getattr(effective_config.mcp, "servers", {}).keys()
         if str(alias).strip()
     }
     return build_run_auth_context(
         workspace=workspace_path,
         metadata={},
-        available_mcp_aliases=available_mcp_aliases,
+        available_mcp_aliases=aliases,
     )
 
 
@@ -3634,7 +3656,29 @@ def _build_api_cowork_session(engine: Engine, session: dict[str, Any]) -> Cowork
     scratch_dir = Path(str(config.workspace.scratch_dir or "")).expanduser()
     session_cls = _cowork_session_cls()
     conversation_id = str(session.get("id", "") or "")
-    auth_context = _build_cowork_auth_context(engine, session)
+    workspace_path = _conversation_workspace_path(session)
+    effective_mcp_config = _effective_workspace_mcp_config(
+        engine,
+        workspace_path=workspace_path,
+    )
+    available_mcp_aliases = {
+        str(alias).strip()
+        for alias in getattr(effective_mcp_config.mcp, "servers", {}).keys()
+        if str(alias).strip()
+    }
+    auth_context = _build_cowork_auth_context(
+        engine,
+        session,
+        available_mcp_aliases=available_mcp_aliases,
+    )
+    tool_registry = (
+        _build_workspace_mcp_runtime_registry(
+            engine=engine,
+            workspace={"canonical_path": str(workspace_path)},
+        )
+        if workspace_path is not None
+        else engine.tool_registry
+    )
 
     async def approval_callback(tool_name: str, args: dict) -> CoworkApprovalDecision:
         request = engine.begin_conversation_approval(
@@ -3687,18 +3731,16 @@ def _build_api_cowork_session(engine: Engine, session: dict[str, Any]) -> Cowork
         )
         return decision
 
-    return session_cls(
+    cowork_session = session_cls(
         model=model,
-        tools=engine.tool_registry,
+        tools=tool_registry,
         auth_context=auth_context,
-        workspace=Path(str(session.get("workspace_path", "") or "")).expanduser(),
+        workspace=workspace_path,
         scratch_dir=scratch_dir,
         system_prompt=(
             str(session.get("system_prompt", "") or "").strip()
             or build_cowork_system_prompt(
-                workspace=Path(str(session.get("workspace_path", "") or "")).expanduser()
-                if str(session.get("workspace_path", "") or "").strip()
-                else None,
+                workspace=workspace_path,
             )
         ),
         approver=ToolApprover(prompt_callback=approval_callback),
@@ -3735,6 +3777,9 @@ def _build_api_cowork_session(engine: Engine, session: dict[str, Any]) -> Cowork
             getattr(execution, "cowork_recall_index_max_chars", 1200),
         ),
     )
+    if tool_registry is not engine.tool_registry:
+        setattr(cowork_session, "_loom_runtime_registry", tool_registry)
+    return cowork_session
 
 
 async def _append_conversation_replay_event(
@@ -3910,6 +3955,7 @@ async def _run_cowork_turn_for_api(
     user_message: str,
     message_context: dict[str, Any] | None = None,
 ) -> None:
+    runtime_registry = getattr(session, "_loom_runtime_registry", None)
     try:
         await session.resume(conversation_id)
         context_payload = _conversation_context_indicator_payload(message_context)
@@ -4064,6 +4110,9 @@ async def _run_cowork_turn_for_api(
                 "markup": False,
             },
         )
+    finally:
+        if runtime_registry is not None:
+            _close_runtime_registry(runtime_registry)
 
 
 # --- Task Lifecycle ---

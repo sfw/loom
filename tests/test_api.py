@@ -3206,6 +3206,154 @@ class TestWorkspaceFirstEndpoints:
         assert captured["session_auth_context"] is expected_auth_context
 
     @pytest.mark.asyncio
+    async def test_post_conversation_message_uses_workspace_mcp_registry_for_cowork_session(
+        self,
+        client,
+        tmp_path,
+        conversation_store,
+        workspace_registry,
+        engine,
+        monkeypatch,
+    ):
+        workspace_path = tmp_path / "chat-workspace-mcp-ws"
+        workspace_path.mkdir()
+        loom_dir = workspace_path / ".loom"
+        loom_dir.mkdir()
+        write_mcp_file(
+            loom_dir / "mcp.toml",
+            {
+                "notion": MCPServerConfig(
+                    type="remote",
+                    url="https://mcp.notion.com/mcp",
+                    oauth=MCPOAuthConfig(enabled=True, scopes=["read"]),
+                ),
+            },
+        )
+        workspace = await workspace_registry.ensure_workspace(
+            str(workspace_path),
+            display_name="Chat Workspace MCP WS",
+        )
+        assert workspace is not None
+        session_id = await conversation_store.create_session(
+            workspace=str(workspace_path),
+            model_name="chat-model",
+        )
+
+        engine.model_router.add_provider(
+            "chat-model",
+            SimpleNamespace(name="chat-model", roles=["executor"], tier=1),
+        )
+        engine.config.mcp.servers.clear()
+
+        expected_auth_context = SimpleNamespace(selected_by_mcp_alias={"notion": object()})
+        workspace_registry_tooling = SimpleNamespace(name="workspace-registry")
+        captured: dict[str, object] = {}
+        closed: list[object] = []
+
+        def fake_build_run_auth_context(
+            *,
+            workspace,
+            metadata,
+            explicit_auth_path=None,
+            required_resources=None,
+            available_mcp_aliases=None,
+        ):
+            captured["workspace"] = workspace
+            captured["available_mcp_aliases"] = available_mcp_aliases
+            return expected_auth_context
+
+        def fake_build_workspace_mcp_runtime_registry(*, engine, workspace):
+            captured["registry_workspace"] = workspace
+            return workspace_registry_tooling
+
+        class FakeCoworkSession:
+            def __init__(
+                self,
+                *args,
+                tools=None,
+                auth_context=None,
+                store=None,
+                session_id="",
+                **kwargs,
+            ):
+                captured["session_tools"] = tools
+                captured["session_auth_context"] = auth_context
+                self._store = store
+                self._session_id = session_id
+
+            async def resume(self, session_id: str) -> None:
+                self._session_id = session_id
+
+            async def send_streaming(
+                self,
+                user_message: str,
+                *,
+                message_metadata: dict[str, object] | None = None,
+            ):
+                turn_count = await self._store.get_turn_count(self._session_id)
+                await self._store.append_turn(
+                    self._session_id,
+                    turn_count + 1,
+                    "user",
+                    user_message,
+                )
+                await self._store.append_turn(
+                    self._session_id,
+                    turn_count + 2,
+                    "assistant",
+                    "Workspace MCP reply",
+                )
+                yield CoworkTurn(
+                    text="Workspace MCP reply",
+                    tool_calls=[],
+                    tokens_used=12,
+                    model="chat-model",
+                    latency_ms=10,
+                    total_time_ms=20,
+                    tokens_per_second=1.2,
+                    context_tokens=0,
+                    context_messages=0,
+                    omitted_messages=0,
+                    recall_index_used=False,
+                )
+
+        monkeypatch.setattr(routes_mod, "build_run_auth_context", fake_build_run_auth_context)
+        monkeypatch.setattr(
+            routes_mod,
+            "_build_workspace_mcp_runtime_registry",
+            fake_build_workspace_mcp_runtime_registry,
+        )
+        monkeypatch.setattr(
+            routes_mod,
+            "_close_runtime_registry",
+            lambda registry: closed.append(registry),
+        )
+        monkeypatch.setattr("loom.api.routes._cowork_session_cls", lambda: FakeCoworkSession)
+
+        response = await client.post(
+            f"/conversations/{session_id}/messages",
+            json={"message": "Can you use Notion here?", "role": "user"},
+        )
+        assert response.status_code == 202
+
+        for _ in range(20):
+            turns = await conversation_store.get_turns(session_id, limit=10)
+            if len(turns) >= 2 and closed:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("workspace-scoped conversation turn did not finish")
+
+        assert captured["workspace"] == workspace_path.expanduser()
+        assert captured["available_mcp_aliases"] == {"notion"}
+        assert captured["registry_workspace"] == {
+            "canonical_path": str(workspace_path.expanduser()),
+        }
+        assert captured["session_tools"] is workspace_registry_tooling
+        assert captured["session_auth_context"] is expected_auth_context
+        assert closed == [workspace_registry_tooling]
+
+    @pytest.mark.asyncio
     async def test_conversation_events_and_stop_status_endpoints(
         self,
         client,
