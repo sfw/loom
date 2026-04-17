@@ -24,6 +24,8 @@ import {
 } from "@/context/AppContext";
 import { cn } from "@/lib/utils";
 
+const LOOPBACK_LOGIN_POLL_DELAY_MS = 1000;
+
 function runtimeTone(runtimeState: string): string {
   switch (runtimeState) {
     case "ready":
@@ -122,6 +124,7 @@ type AccountEditorState = {
   modeValue: string;
   accountLabel: string;
   mcpServer: string;
+  defaultServerAlias: string;
   scopesText: string;
   startLoginAfterSave: boolean;
   testServerAlias: string;
@@ -139,6 +142,10 @@ function parseScopeList(value: string): string[] {
     .split(/[\n,]/)
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+function uniq<T>(values: T[]): T[] {
+  return Array.from(new Set(values));
 }
 
 export default function IntegrationsTab() {
@@ -181,12 +188,14 @@ export default function IntegrationsTab() {
   } = useAppActions();
   const [pendingLogin, setPendingLogin] = useState<{
     authorizationUrl: string;
+    browserWarning: string;
     callbackInput: string;
     callbackMode: string;
     expiresAt: number;
     flowId: string;
     profileId: string;
     redirectUri: string;
+    showManualEntry: boolean;
     submitting: boolean;
     testServerAlias: string;
   } | null>(null);
@@ -194,6 +203,7 @@ export default function IntegrationsTab() {
   const [serverEditor, setServerEditor] = useState<ServerEditorState | null>(null);
   const [accountEditor, setAccountEditor] = useState<AccountEditorState | null>(null);
   const [showIssuesOnly, setShowIssuesOnly] = useState(false);
+  const [showArchivedAccounts, setShowArchivedAccounts] = useState(false);
 
   useEffect(() => {
     if (!integrationIntent) {
@@ -216,6 +226,20 @@ export default function IntegrationsTab() {
     }
     clearIntegrationIntent();
   }, [clearIntegrationIntent, integrationIntent]);
+
+  useEffect(() => {
+    if (!pendingLogin) {
+      return;
+    }
+    if (pendingLogin.callbackMode !== "loopback" || pendingLogin.showManualEntry || pendingLogin.submitting) {
+      return;
+    }
+
+    const timer = window.setTimeout(() => {
+      void completePendingLogin({ isPolling: true });
+    }, LOOPBACK_LOGIN_POLL_DELAY_MS);
+    return () => window.clearTimeout(timer);
+  }, [pendingLogin]);
 
   if (!selectedWorkspaceSummary) {
     return (
@@ -248,9 +272,49 @@ export default function IntegrationsTab() {
   const visibleIntegrationServers = showIssuesOnly
     ? filteredIntegrationServers.filter((server) => server.remediation.length > 0)
     : filteredIntegrationServers;
-  const visibleAccounts = showIssuesOnly
+  const unarchivedAccounts = filteredAccounts.filter((account) => account.status !== "archived");
+  const scopedAccounts = showIssuesOnly
     ? filteredAccounts.filter((account) => account.remediation.length > 0)
     : filteredAccounts;
+  const archivedScopedAccounts = scopedAccounts.filter((account) => account.status === "archived");
+  const visibleAccounts = scopedAccounts.filter((account) => (
+    showArchivedAccounts || account.status !== "archived"
+  ));
+  const visibleIssueAccounts = showArchivedAccounts ? filteredAccounts : unarchivedAccounts;
+  const allKnownServers: typeof filteredIntegrationServers = uniq([
+    ...integrations.mcp_servers,
+    ...filteredIntegrationServers,
+  ].map((server) => server.alias)).map((alias) => (
+    integrations.mcp_servers.find((server) => server.alias === alias)
+    || filteredIntegrationServers.find((server) => server.alias === alias)
+  )).filter((server): server is typeof filteredIntegrationServers[number] => Boolean(server));
+  const serverAliasByResourceId = Object.fromEntries(
+    allKnownServers
+      .filter((server) => server.resource_id)
+      .map((server) => [server.resource_id, server.alias]),
+  );
+
+  function defaultServerAliasesForSelectors(defaultSelectors: string[]): string[] {
+    return uniq(defaultSelectors.map((selector) => (
+      serverAliasByResourceId[selector] || selector
+    )).filter((selector) => (
+      allKnownServers.some((server) => server.alias === selector)
+    )));
+  }
+
+  function matchesAccountProvider(
+    server: typeof allKnownServers[number],
+    provider: string,
+  ): boolean {
+    const cleanProvider = provider.trim();
+    if (!cleanProvider) {
+      return true;
+    }
+    return (
+      server.alias === cleanProvider
+      || server.auth_provider === cleanProvider
+    );
+  }
 
   async function beginAccountLogin(
     profileId: string,
@@ -264,18 +328,22 @@ export default function IntegrationsTab() {
     }
     setPendingLogin({
       authorizationUrl: started.authorization_url,
+      browserWarning: started.browser_warning,
       callbackInput: "",
       callbackMode: started.callback_mode,
       expiresAt: started.expires_at_unix,
       flowId: started.flow_id,
       profileId,
       redirectUri: started.redirect_uri,
+      showManualEntry: started.callback_mode !== "loopback",
       submitting: false,
       testServerAlias: options?.testServerAlias || "",
     });
   }
 
-  async function completePendingLogin() {
+  async function completePendingLogin(options?: {
+    isPolling?: boolean;
+  }) {
     if (!pendingLogin || pendingLogin.submitting) {
       return;
     }
@@ -290,7 +358,7 @@ export default function IntegrationsTab() {
     const result = await handleCompleteIntegrationAccountLogin(
       pendingLogin.profileId,
       pendingLogin.flowId,
-      pendingLogin.callbackInput,
+      options?.isPolling ? "" : pendingLogin.callbackInput,
     );
     if (result?.status === "completed") {
       const serverAliasToTest = pendingLogin.testServerAlias;
@@ -396,6 +464,7 @@ export default function IntegrationsTab() {
     provider?: string;
     mode?: string;
     mcpServer?: string;
+    defaultServerAlias?: string;
     accountLabel?: string;
     startLoginAfterSave?: boolean;
     testServerAlias?: string;
@@ -408,6 +477,7 @@ export default function IntegrationsTab() {
       modeValue: prefill?.mode || "oauth2_pkce",
       accountLabel: prefill?.accountLabel || "",
       mcpServer: prefill?.mcpServer || "",
+      defaultServerAlias: prefill?.defaultServerAlias || prefill?.mcpServer || "",
       scopesText: "",
       startLoginAfterSave: Boolean(prefill?.startLoginAfterSave),
       testServerAlias: prefill?.testServerAlias || "",
@@ -415,6 +485,7 @@ export default function IntegrationsTab() {
   }
 
   function openEditAccountEditor(account: typeof filteredAccounts[number]) {
+    const defaultServerAliases = defaultServerAliasesForSelectors(account.default_selectors);
     setAccountEditor({
       mode: "edit",
       originalProfileId: account.profile_id,
@@ -423,6 +494,7 @@ export default function IntegrationsTab() {
       modeValue: account.mode,
       accountLabel: account.account_label,
       mcpServer: account.mcp_server,
+      defaultServerAlias: defaultServerAliases[0] || "",
       scopesText: account.auth_state.scopes.join(", "),
       startLoginAfterSave: false,
       testServerAlias: "",
@@ -440,12 +512,13 @@ export default function IntegrationsTab() {
     ).trim();
     const provider = accountEditor.provider.trim();
     const linkedServer = accountEditor.mcpServer.trim();
+    const defaultServerAlias = accountEditor.defaultServerAlias.trim();
     const shouldStartLogin = (
       (connectAfterSave || accountEditor.startLoginAfterSave)
       && accountEditor.modeValue.startsWith("oauth2")
       && Boolean(profileId)
     );
-    const testServerAlias = accountEditor.testServerAlias || linkedServer;
+    const testServerAlias = accountEditor.testServerAlias || defaultServerAlias || linkedServer;
 
     if (accountEditor.mode === "create") {
       const saved = await handleCreateIntegrationAccount({
@@ -458,6 +531,9 @@ export default function IntegrationsTab() {
         status: "draft",
       });
       if (saved) {
+        if (defaultServerAlias) {
+          await handleSelectIntegrationAccountForServer(defaultServerAlias, profileId);
+        }
         setAccountEditor(null);
         if (shouldStartLogin) {
           await beginAccountLogin(profileId, {
@@ -477,6 +553,9 @@ export default function IntegrationsTab() {
       },
     );
     if (saved) {
+      if (defaultServerAlias) {
+        await handleSelectIntegrationAccountForServer(defaultServerAlias, profileId);
+      }
       setAccountEditor(null);
       if (shouldStartLogin) {
         await beginAccountLogin(profileId, {
@@ -490,7 +569,7 @@ export default function IntegrationsTab() {
     ...filteredIntegrationServers
       .filter((server) => server.remediation.length > 0)
       .map((server) => {
-        const compatibleAccounts = filteredAccounts.filter((account) => (
+        const compatibleAccounts = unarchivedAccounts.filter((account) => (
           server.bound_profile_ids.includes(account.profile_id)
           || account.used_by_mcp_servers.includes(server.alias)
           || account.effective_for_mcp_servers.includes(server.alias)
@@ -528,6 +607,7 @@ export default function IntegrationsTab() {
             provider: server.auth_provider || server.alias,
             mode: "oauth2_pkce",
             mcpServer: server.alias,
+            defaultServerAlias: server.alias,
             accountLabel: `${server.alias} account`,
             startLoginAfterSave: true,
             testServerAlias: server.alias,
@@ -556,7 +636,7 @@ export default function IntegrationsTab() {
           onAction,
         };
       }),
-    ...filteredAccounts
+    ...visibleIssueAccounts
       .filter((account) => account.remediation.length > 0)
       .map((account) => {
         let actionLabel = "";
@@ -1009,7 +1089,7 @@ export default function IntegrationsTab() {
                         <div className="mt-4 rounded-xl border border-zinc-800 bg-zinc-900/45 p-3">
                         <div className="flex items-center gap-2 text-[11px] uppercase tracking-wide text-zinc-500">
                           <UserCircle2 size={12} />
-                          Use Existing Account
+                          Default Account
                         </div>
                         <div className="mt-3 flex flex-wrap gap-2">
                           <select
@@ -1035,7 +1115,7 @@ export default function IntegrationsTab() {
                             )}
                             className="rounded-full border border-zinc-700 bg-zinc-900/80 px-3 py-1.5 text-xs font-medium text-zinc-200 transition hover:border-zinc-600 hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-60"
                           >
-                            Use account
+                            Set default
                           </button>
                         </div>
                       </div>
@@ -1078,6 +1158,7 @@ export default function IntegrationsTab() {
                             provider: server.auth_provider || server.alias,
                             mode: "oauth2_pkce",
                             mcpServer: server.alias,
+                            defaultServerAlias: server.alias,
                             accountLabel: `${server.alias} account`,
                             startLoginAfterSave: true,
                             testServerAlias: server.alias,
@@ -1195,6 +1276,17 @@ export default function IntegrationsTab() {
                 </p>
               </div>
               <div className="flex items-center gap-2">
+                {archivedScopedAccounts.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => setShowArchivedAccounts((current) => !current)}
+                    className="rounded-full border border-zinc-700 bg-zinc-900/80 px-3 py-1.5 text-xs font-medium text-zinc-300 transition hover:border-zinc-600 hover:bg-zinc-800"
+                  >
+                    {showArchivedAccounts
+                      ? "Hide archived"
+                      : `Show archived (${archivedScopedAccounts.length})`}
+                  </button>
+                )}
                 <button
                   type="button"
                   onClick={() => openCreateAccountEditor()}
@@ -1285,14 +1377,61 @@ export default function IntegrationsTab() {
                   </label>
                   <label className="block text-xs text-zinc-400">
                     Linked server (optional)
-                    <input
+                    <select
                       value={accountEditor.mcpServer}
                       onChange={(event) => setAccountEditor((current) => (
-                        current ? { ...current, mcpServer: event.target.value } : current
+                        current
+                          ? {
+                              ...current,
+                              mcpServer: event.target.value,
+                              defaultServerAlias: (
+                                current.defaultServerAlias
+                                && current.defaultServerAlias === current.mcpServer
+                              )
+                                ? event.target.value
+                                : current.defaultServerAlias,
+                            }
+                          : current
                       ))}
                       className="mt-2 w-full rounded-xl border border-zinc-800 bg-zinc-950/60 px-3 py-2 text-sm text-zinc-100 outline-none transition focus:border-[#8a9a7b]/60"
-                      placeholder="notion"
-                    />
+                    >
+                      <option value="">No linked server</option>
+                      {allKnownServers
+                        .filter((server) => matchesAccountProvider(server, accountEditor.provider))
+                        .map((server) => (
+                          <option key={server.alias} value={server.alias}>
+                            {server.alias}
+                          </option>
+                        ))}
+                    </select>
+                  </label>
+                  <label className="block text-xs text-zinc-400">
+                    Default for server (optional)
+                    <select
+                      value={accountEditor.defaultServerAlias}
+                      onChange={(event) => setAccountEditor((current) => (
+                        current
+                          ? {
+                              ...current,
+                              defaultServerAlias: event.target.value,
+                              mcpServer: event.target.value || current.mcpServer,
+                            }
+                          : current
+                      ))}
+                      className="mt-2 w-full rounded-xl border border-zinc-800 bg-zinc-950/60 px-3 py-2 text-sm text-zinc-100 outline-none transition focus:border-[#8a9a7b]/60"
+                    >
+                      <option value="">No default server</option>
+                      {allKnownServers
+                        .filter((server) => (
+                          server.oauth_enabled
+                          && matchesAccountProvider(server, accountEditor.provider)
+                        ))
+                        .map((server) => (
+                          <option key={server.alias} value={server.alias}>
+                            {server.alias}
+                          </option>
+                        ))}
+                    </select>
                   </label>
                   <label className="block text-xs text-zinc-400">
                     Scopes (optional)
@@ -1333,6 +1472,8 @@ export default function IntegrationsTab() {
                   ? "No accounts currently need repair in this workspace."
                   : showingFiltered
                   ? "No accounts match the current workspace search."
+                  : archivedScopedAccounts.length > 0 && !showArchivedAccounts
+                  ? `${archivedScopedAccounts.length} archived account${archivedScopedAccounts.length === 1 ? "" : "s"} hidden.`
                   : "No Loom accounts are tracked for this workspace yet."}
               </div>
             ) : (
@@ -1374,9 +1515,9 @@ export default function IntegrationsTab() {
                             ? `Bound to ${account.used_by_mcp_servers.join(", ")}`
                             : "Not routed to any MCP server yet"}
                       </p>
-                      {account.default_selectors.length > 0 && (
+                      {defaultServerAliasesForSelectors(account.default_selectors).length > 0 && (
                         <p className="mt-2 text-[11px] text-zinc-500">
-                          Defaults: <span className="text-zinc-300">{account.default_selectors.join(", ")}</span>
+                          Default for: <span className="text-zinc-300">{defaultServerAliasesForSelectors(account.default_selectors).join(", ")}</span>
                         </p>
                       )}
                       {account.writable_storage_kind && account.writable_storage_kind !== "none" && (
@@ -1468,10 +1609,14 @@ export default function IntegrationsTab() {
                 <div className="flex items-center justify-between gap-3">
                   <div>
                     <h3 className="text-sm font-semibold text-zinc-100">
-                      Finish Account Connection
+                      {pendingLogin.callbackMode === "loopback" && !pendingLogin.showManualEntry
+                        ? "Waiting for Browser Callback"
+                        : "Finish Account Connection"}
                     </h3>
                     <p className="text-xs text-zinc-500">
-                      Complete OAuth for {pendingLogin.profileId} and confirm the callback.
+                      {pendingLogin.callbackMode === "loopback" && !pendingLogin.showManualEntry
+                        ? `Complete OAuth for ${pendingLogin.profileId} in your browser. Loom will finish the local callback automatically.`
+                        : `Complete OAuth for ${pendingLogin.profileId} and confirm the callback.`}
                     </p>
                   </div>
                   <button
@@ -1498,32 +1643,71 @@ export default function IntegrationsTab() {
                   <p className="break-all text-[11px] text-zinc-600">
                     Redirect URI: {pendingLogin.redirectUri}
                   </p>
-                  <label className="block text-xs text-zinc-400">
-                    Paste callback URL or authorization code
-                    <textarea
-                      value={pendingLogin.callbackInput}
-                      onChange={(event) => setPendingLogin((current) => (
-                        current
-                          ? {
-                              ...current,
-                              callbackInput: event.target.value,
-                            }
-                          : current
-                      ))}
-                      rows={3}
-                      className="mt-2 w-full rounded-xl border border-zinc-800 bg-zinc-950/60 px-3 py-2 text-sm text-zinc-100 outline-none transition focus:border-[#8a9a7b]/60"
-                      placeholder="Callback URL or code"
-                    />
-                  </label>
+                  {pendingLogin.browserWarning && (
+                    <div className="rounded-xl border border-amber-500/20 bg-amber-500/10 px-3 py-3 text-xs text-amber-100">
+                      Browser launch warning: {pendingLogin.browserWarning}
+                    </div>
+                  )}
+                  {pendingLogin.callbackMode === "loopback" && !pendingLogin.showManualEntry && (
+                    <div className="rounded-xl border border-zinc-800 bg-zinc-950/40 px-3 py-3">
+                      <p className="text-sm text-zinc-100">
+                        Waiting for the local OAuth callback...
+                      </p>
+                      <p className="mt-1 text-xs text-zinc-500">
+                        If the browser did not open, use the URL above. You can also switch to
+                        manual entry if this provider returns a code instead of redirecting back.
+                      </p>
+                    </div>
+                  )}
+                  {(pendingLogin.callbackMode !== "loopback" || pendingLogin.showManualEntry) && (
+                    <label className="block text-xs text-zinc-400">
+                      Paste callback URL or authorization code
+                      <textarea
+                        value={pendingLogin.callbackInput}
+                        onChange={(event) => setPendingLogin((current) => (
+                          current
+                            ? {
+                                ...current,
+                                callbackInput: event.target.value,
+                              }
+                            : current
+                        ))}
+                        rows={3}
+                        className="mt-2 w-full rounded-xl border border-zinc-800 bg-zinc-950/60 px-3 py-2 text-sm text-zinc-100 outline-none transition focus:border-[#8a9a7b]/60"
+                        placeholder="Callback URL or code"
+                      />
+                    </label>
+                  )}
                   <div className="flex flex-wrap gap-2">
-                    <button
-                      type="button"
-                      onClick={() => void completePendingLogin()}
-                      disabled={pendingLogin.submitting}
-                      className="rounded-full border border-[#8a9a7b]/30 bg-[#8a9a7b]/15 px-3 py-1.5 text-xs font-medium text-[#d8e5cd] transition hover:bg-[#8a9a7b]/20 disabled:cursor-not-allowed disabled:opacity-60"
-                    >
-                      {pendingLogin.submitting ? "Finishing..." : "Finish connection"}
-                    </button>
+                    {pendingLogin.callbackMode === "loopback" && (
+                      <button
+                        type="button"
+                        onClick={() => setPendingLogin((current) => (
+                          current
+                            ? {
+                                ...current,
+                                callbackInput: "",
+                                showManualEntry: !current.showManualEntry,
+                              }
+                            : current
+                        ))}
+                        className="rounded-full border border-zinc-700 bg-zinc-900/80 px-3 py-1.5 text-xs font-medium text-zinc-200 transition hover:border-zinc-600 hover:bg-zinc-800"
+                      >
+                        {pendingLogin.showManualEntry
+                          ? "Use automatic callback"
+                          : "Enter callback manually"}
+                      </button>
+                    )}
+                    {(pendingLogin.callbackMode !== "loopback" || pendingLogin.showManualEntry) && (
+                      <button
+                        type="button"
+                        onClick={() => void completePendingLogin()}
+                        disabled={pendingLogin.submitting}
+                        className="rounded-full border border-[#8a9a7b]/30 bg-[#8a9a7b]/15 px-3 py-1.5 text-xs font-medium text-[#d8e5cd] transition hover:bg-[#8a9a7b]/20 disabled:cursor-not-allowed disabled:opacity-60"
+                      >
+                        {pendingLogin.submitting ? "Finishing..." : "Finish connection"}
+                      </button>
+                    )}
                   </div>
                 </div>
               </article>

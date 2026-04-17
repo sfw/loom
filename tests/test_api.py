@@ -1960,6 +1960,7 @@ class TestWorkspaceFirstEndpoints:
         monkeypatch.setenv("HOME", str(tmp_path))
 
         stored: dict[str, str] = {}
+        captured_start: dict[str, object] = {}
 
         class _FakeSecretResolver:
             def resolve(self, secret_ref: str) -> str:
@@ -1983,6 +1984,7 @@ class TestWorkspaceFirstEndpoints:
             allow_manual_fallback,
             manual_redirect_uri="urn:ietf:wg:oauth:2.0:oob",
         ):
+            captured_start["open_browser"] = open_browser
             return SimpleNamespace(
                 state="flow-1",
                 authorization_url="https://auth.example/authorize",
@@ -2082,6 +2084,7 @@ class TestWorkspaceFirstEndpoints:
         )
         assert start.status_code == 200
         assert start.json()["flow_id"] == "flow-1"
+        assert captured_start["open_browser"] is True
 
         complete = await client.post(
             f"/workspaces/{workspace['id']}/auth/accounts/notion_marketing/login/complete",
@@ -2094,6 +2097,235 @@ class TestWorkspaceFirstEndpoints:
         assert payload["account"]["auth_state"]["state"] == "ready"
         assert stored["validated_ref"] == "keychain://loom/notion/notion_marketing/tokens"
         assert stored["stored_ref"] == "keychain://loom/notion/notion_marketing/tokens"
+
+    @pytest.mark.asyncio
+    async def test_workspace_auth_account_login_start_uses_mcp_oauth_metadata_fallback(
+        self,
+        client,
+        tmp_path,
+        workspace_registry,
+        monkeypatch,
+    ):
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        captured: dict[str, object] = {}
+
+        def _fake_start_auth(
+            self,
+            *,
+            provider,
+            preferred_port,
+            open_browser,
+            allow_manual_fallback,
+            manual_redirect_uri="urn:ietf:wg:oauth:2.0:oob",
+        ):
+            captured["provider"] = provider
+            return SimpleNamespace(
+                state="flow-mcp-fallback",
+                authorization_url="https://auth.example/authorize",
+                redirect_uri="http://127.0.0.1:8765/oauth/callback",
+                expires_at_unix=1_763_000_000,
+                callback_mode="loopback",
+                browser_error="",
+            )
+
+        monkeypatch.setattr("loom.oauth.engine.OAuthEngine.start_auth", _fake_start_auth)
+        monkeypatch.setattr(
+            routes_mod,
+            "resolve_mcp_oauth_provider",
+            lambda **kwargs: SimpleNamespace(
+                authorization_endpoint="https://auth.example/authorize",
+                token_endpoint="https://auth.example/token",
+                client_id="loom-desktop",
+                scopes=tuple(kwargs.get("scopes", ()) or ()),
+                authorize_params={"resource": "https://mcp.notion.example"},
+                token_params={},
+            ),
+        )
+
+        home_auth_dir = tmp_path / ".loom"
+        home_auth_dir.mkdir()
+        write_auth_file(
+            home_auth_dir / "auth.toml",
+            AuthConfig(
+                profiles={
+                    "notion_personal": AuthProfile(
+                        profile_id="notion_personal",
+                        provider="notion",
+                        mode="oauth2_pkce",
+                        account_label="Notion Personal",
+                        mcp_server="notion",
+                        token_ref="keychain://loom/notion/notion_personal/tokens",
+                        status="draft",
+                    ),
+                },
+            ),
+        )
+
+        workspace_path = tmp_path / "oauth-fallback-ws"
+        workspace_path.mkdir()
+        loom_dir = workspace_path / ".loom"
+        loom_dir.mkdir()
+        write_mcp_file(
+            loom_dir / "mcp.toml",
+            {
+                "notion": MCPServerConfig(
+                    type="remote",
+                    url="https://mcp.notion.example",
+                    oauth=MCPOAuthConfig(enabled=True, scopes=["read", "search"]),
+                ),
+            },
+        )
+        write_workspace_auth_resources(
+            loom_dir / "auth.resources.toml",
+            AuthResourcesStore(
+                resources={
+                    "resource-mcp-notion": AuthResource(
+                        resource_id="resource-mcp-notion",
+                        resource_kind="mcp",
+                        resource_key="notion",
+                        display_name="MCP: notion",
+                        provider="notion",
+                        source="mcp",
+                        status="active",
+                    ),
+                },
+                bindings={
+                    "binding-notion": AuthBinding(
+                        binding_id="binding-notion",
+                        resource_id="resource-mcp-notion",
+                        profile_id="notion_personal",
+                        status="active",
+                    ),
+                },
+                workspace_defaults={"resource-mcp-notion": "notion_personal"},
+            ),
+        )
+
+        workspace = await workspace_registry.ensure_workspace(
+            str(workspace_path),
+            display_name="OAuth Fallback WS",
+        )
+        assert workspace is not None
+
+        approve = await client.post(f"/workspaces/{workspace['id']}/mcp/notion/approve")
+        assert approve.status_code == 200
+
+        start = await client.post(
+            f"/workspaces/{workspace['id']}/auth/accounts/notion_personal/login/start"
+        )
+        assert start.status_code == 200
+        assert start.json()["flow_id"] == "flow-mcp-fallback"
+
+        provider = captured["provider"]
+        assert provider.authorization_endpoint == "https://auth.example/authorize"
+        assert provider.token_endpoint == "https://auth.example/token"
+        assert provider.client_id == "loom-desktop"
+        assert provider.scopes == ("read", "search")
+
+    @pytest.mark.asyncio
+    async def test_workspace_auth_account_login_complete_keeps_pending_loopback_flow(
+        self,
+        client,
+        tmp_path,
+        workspace_registry,
+        monkeypatch,
+    ):
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        callback_ready = {"value": False}
+        stored: dict[str, str] = {}
+
+        class _FakeSecretResolver:
+            def resolve(self, secret_ref: str) -> str:
+                return stored.get(secret_ref, "")
+
+            def validate_writable(self, secret_ref: str) -> None:
+                stored["validated_ref"] = secret_ref
+
+            def store(self, secret_ref: str, secret_value: str) -> None:
+                stored["stored_ref"] = secret_ref
+                stored[secret_ref] = secret_value
+
+        monkeypatch.setattr(oauth_profiles_mod, "SecretResolver", _FakeSecretResolver)
+
+        monkeypatch.setattr(
+            "loom.oauth.engine.OAuthEngine.start_auth",
+            lambda self, **kwargs: SimpleNamespace(
+                state="flow-pending",
+                authorization_url="https://auth.example/authorize",
+                redirect_uri="http://127.0.0.1:8765/oauth/callback",
+                expires_at_unix=1_763_000_000,
+                callback_mode="loopback",
+                browser_error="",
+            ),
+        )
+        monkeypatch.setattr(
+            "loom.oauth.engine.OAuthEngine.callback_received",
+            lambda self, *, state: callback_ready["value"],
+        )
+        monkeypatch.setattr(
+            "loom.oauth.engine.OAuthEngine.finish_auth",
+            lambda self, *, provider, state, timeout_seconds=1: {
+                "access_token": "access-token",
+                "refresh_token": "refresh-token",
+                "expires_in": 3600,
+                "token_type": "Bearer",
+            },
+        )
+
+        home_auth_dir = tmp_path / ".loom"
+        home_auth_dir.mkdir()
+        write_auth_file(
+            home_auth_dir / "auth.toml",
+            AuthConfig(
+                profiles={
+                    "notion_personal": AuthProfile(
+                        profile_id="notion_personal",
+                        provider="notion",
+                        mode="oauth2_pkce",
+                        account_label="Notion Personal",
+                        mcp_server="notion",
+                        token_ref="keychain://loom/notion/notion_personal/tokens",
+                        metadata={
+                            "oauth_authorization_endpoint": "https://auth.example/authorize",
+                            "oauth_token_endpoint": "https://auth.example/token",
+                            "oauth_client_id": "loom-desktop",
+                        },
+                        status="draft",
+                    ),
+                },
+            ),
+        )
+
+        workspace_path = tmp_path / "oauth-pending-ws"
+        workspace_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(
+            str(workspace_path),
+            display_name="OAuth Pending WS",
+        )
+        assert workspace is not None
+
+        start = await client.post(
+            f"/workspaces/{workspace['id']}/auth/accounts/notion_personal/login/start"
+        )
+        assert start.status_code == 200
+        assert start.json()["flow_id"] == "flow-pending"
+
+        pending = await client.post(
+            f"/workspaces/{workspace['id']}/auth/accounts/notion_personal/login/complete",
+            json={"flow_id": "flow-pending"},
+        )
+        assert pending.status_code == 200
+        assert pending.json()["status"] == "pending"
+
+        callback_ready["value"] = True
+        complete = await client.post(
+            f"/workspaces/{workspace['id']}/auth/accounts/notion_personal/login/complete",
+            json={"flow_id": "flow-pending"},
+        )
+        assert complete.status_code == 200
+        assert complete.json()["status"] == "completed"
 
     @pytest.mark.asyncio
     async def test_workspace_search_queries_real_workspace_surfaces(

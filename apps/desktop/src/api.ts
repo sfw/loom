@@ -1027,6 +1027,9 @@ export function createWorkspaceMcpServer(
     {
       method: "POST",
       body: JSON.stringify(payload),
+      headers: {
+        "content-type": "application/json",
+      },
     },
   );
 }
@@ -1041,6 +1044,9 @@ export function updateWorkspaceMcpServer(
     {
       method: "PATCH",
       body: JSON.stringify(payload),
+      headers: {
+        "content-type": "application/json",
+      },
     },
   );
 }
@@ -1151,6 +1157,9 @@ export function createWorkspaceAuthAccount(
     {
       method: "POST",
       body: JSON.stringify(payload),
+      headers: {
+        "content-type": "application/json",
+      },
     },
   );
 }
@@ -1165,6 +1174,9 @@ export function updateWorkspaceAuthAccount(
     {
       method: "PATCH",
       body: JSON.stringify(payload),
+      headers: {
+        "content-type": "application/json",
+      },
     },
   );
 }

@@ -1,6 +1,8 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 
 import {
+  createWorkspaceAuthAccount,
+  createWorkspaceMcpServer,
   createTask,
   fetchConversationEvents,
   fetchConversationMessages,
@@ -12,6 +14,8 @@ import {
   subscribeConversationStream,
   subscribeNotificationsStream,
   subscribeRunStream,
+  updateWorkspaceAuthAccount,
+  updateWorkspaceMcpServer,
 } from "./api";
 
 describe("conversation stream api", () => {
@@ -280,6 +284,93 @@ describe("request errors", () => {
 
     await expect(fetchRuntimeStatus()).rejects.toThrow(
       "Loom found an expired legacy MCP token for 'notion'. Create and connect a Loom account instead.",
+    );
+  });
+});
+
+describe("JSON request headers", () => {
+  it("sends JSON headers for MCP server save requests", async () => {
+    const fetchMock = vi.fn(async () => new Response(
+      JSON.stringify({ alias: "notion" }),
+      {
+        status: 200,
+        headers: {
+          "content-type": "application/json",
+        },
+      },
+    ));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await createWorkspaceMcpServer("workspace-1", {
+      alias: "notion",
+      type: "remote",
+    });
+    await updateWorkspaceMcpServer("workspace-1", "notion", {
+      url: "https://mcp.notion.example",
+    });
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      expect.stringContaining("/workspaces/workspace-1/mcp"),
+      expect.objectContaining({
+        method: "POST",
+        headers: expect.objectContaining({
+          "content-type": "application/json",
+        }),
+      }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      expect.stringContaining("/workspaces/workspace-1/mcp/notion"),
+      expect.objectContaining({
+        method: "PATCH",
+        headers: expect.objectContaining({
+          "content-type": "application/json",
+        }),
+      }),
+    );
+  });
+
+  it("sends JSON headers for account save requests", async () => {
+    const fetchMock = vi.fn(async () => new Response(
+      JSON.stringify({ profile_id: "notion_personal" }),
+      {
+        status: 200,
+        headers: {
+          "content-type": "application/json",
+        },
+      },
+    ));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await createWorkspaceAuthAccount("workspace-1", {
+      profile_id: "notion_personal",
+      provider: "notion",
+      mode: "oauth2_pkce",
+    });
+    await updateWorkspaceAuthAccount("workspace-1", "notion_personal", {
+      account_label: "Notion Personal",
+    });
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      expect.stringContaining("/workspaces/workspace-1/auth/accounts"),
+      expect.objectContaining({
+        method: "POST",
+        headers: expect.objectContaining({
+          "content-type": "application/json",
+        }),
+      }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      expect.stringContaining("/workspaces/workspace-1/auth/accounts/notion_personal"),
+      expect.objectContaining({
+        method: "PATCH",
+        headers: expect.objectContaining({
+          "content-type": "application/json",
+        }),
+      }),
     );
   });
 });

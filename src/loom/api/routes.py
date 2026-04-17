@@ -176,7 +176,12 @@ from loom.events.types import (
     TOKEN_STREAMED,
 )
 from loom.events.verbosity import should_deliver_operator
-from loom.integrations.mcp.oauth import oauth_state_for_alias, refresh_mcp_oauth_token
+from loom.integrations.mcp.oauth import (
+    MCPOAuthFlowError,
+    oauth_state_for_alias,
+    refresh_mcp_oauth_token,
+    resolve_mcp_oauth_provider,
+)
 from loom.integrations.mcp_tools import (
     runtime_connect_alias,
     runtime_disconnect_alias,
@@ -6180,6 +6185,98 @@ def _default_account_status_for_restore(profile: AuthProfile) -> str:
     return "draft"
 
 
+def _oauth_provider_config_from_mcp_alias(
+    *,
+    engine: Engine,
+    workspace: dict[str, Any],
+    profile: AuthProfile,
+    alias: str,
+) -> OAuthProviderConfig:
+    clean_alias = ensure_valid_alias(alias)
+    manager = _workspace_mcp_manager(engine=engine, workspace=workspace)
+    view = manager.get_view(clean_alias)
+    if view is None:
+        raise MCPOAuthFlowError(f"MCP server not found: {clean_alias}")
+    if view.server.type != MCP_SERVER_TYPE_REMOTE:
+        raise MCPOAuthFlowError(
+            "Browser OAuth login is only available for remote MCP aliases."
+        )
+    if not view.server.oauth.enabled:
+        raise MCPOAuthFlowError(
+            f"MCP server {clean_alias!r} does not have OAuth enabled."
+        )
+    if view.server.approval_required and view.server.approval_state != "approved":
+        raise MCPOAuthFlowError(
+            "Approve this workspace-defined remote server before connecting an account."
+        )
+
+    resolved = resolve_mcp_oauth_provider(
+        server_url=view.server.url,
+        scopes=[
+            *list(getattr(view.server.oauth, "scopes", []) or []),
+            *list(getattr(profile, "scopes", []) or []),
+        ],
+        redirect_uris=(
+            "http://127.0.0.1:8765/oauth/callback",
+            "http://localhost:8765/oauth/callback",
+            "urn:ietf:wg:oauth:2.0:oob",
+        ),
+        client_name=f"Loom account ({profile.profile_id})",
+    )
+    return OAuthProviderConfig(
+        authorization_endpoint=resolved.authorization_endpoint,
+        token_endpoint=resolved.token_endpoint,
+        client_id=resolved.client_id,
+        scopes=resolved.scopes,
+        authorize_params=dict(resolved.authorize_params),
+        token_params=dict(resolved.token_params),
+    )
+
+
+async def _oauth_provider_for_workspace_account(
+    *,
+    engine: Engine,
+    workspace: dict[str, Any],
+    profile: AuthProfile,
+) -> OAuthProviderConfig | None:
+    direct = oauth_provider_config_for_profile(profile)
+    if direct is not None:
+        return direct
+
+    payload = await _workspace_integrations_payload(engine=engine, workspace=workspace)
+    account_row = _find_workspace_account_row(payload=payload, profile_id=profile.profile_id)
+    alias_candidates: list[str] = []
+    if account_row is not None:
+        alias_candidates.extend(account_row.effective_for_mcp_servers)
+        alias_candidates.extend(account_row.used_by_mcp_servers)
+    linked_alias = str(getattr(profile, "mcp_server", "") or "").strip()
+    if linked_alias:
+        alias_candidates.append(linked_alias)
+
+    seen: set[str] = set()
+    last_error: MCPOAuthFlowError | None = None
+    for raw_alias in alias_candidates:
+        clean_alias = str(raw_alias or "").strip()
+        if not clean_alias or clean_alias in seen:
+            continue
+        seen.add(clean_alias)
+        try:
+            return await asyncio.to_thread(
+                _oauth_provider_config_from_mcp_alias,
+                engine=engine,
+                workspace=workspace,
+                profile=profile,
+                alias=clean_alias,
+            )
+        except MCPOAuthFlowError as e:
+            last_error = e
+            continue
+
+    if last_error is not None:
+        raise HTTPException(status_code=400, detail=str(last_error)) from last_error
+    return None
+
+
 def _build_workspace_mcp_runtime_registry(
     *,
     engine: Engine,
@@ -7176,7 +7273,11 @@ async def start_workspace_auth_account_login(
         workspace=workspace,
         profile_id=profile_id,
     )
-    provider = oauth_provider_config_for_profile(profile)
+    provider = await _oauth_provider_for_workspace_account(
+        engine=engine,
+        workspace=workspace,
+        profile=profile,
+    )
     if provider is None:
         raise HTTPException(
             status_code=400,
@@ -7191,7 +7292,7 @@ async def start_workspace_auth_account_login(
             runtime.engine.start_auth,
             provider=provider,
             preferred_port=8765,
-            open_browser=False,
+            open_browser=True,
             allow_manual_fallback=True,
         )
     except OAuthEngineError as e:
@@ -7235,6 +7336,7 @@ async def complete_workspace_auth_account_login(
         profile_id=profile_id,
     )
     callback_input = str(body.callback_input or "").strip()
+    should_discard_flow = True
     try:
         if callback_input:
             await asyncio.to_thread(
@@ -7243,6 +7345,7 @@ async def complete_workspace_auth_account_login(
                 raw_input=callback_input,
             )
         elif not runtime.engine.callback_received(state=flow.flow_id):
+            should_discard_flow = False
             return IntegrationOAuthCompleteResponse(
                 status="pending",
                 message="Waiting for OAuth callback.",
@@ -7270,7 +7373,8 @@ async def complete_workspace_auth_account_login(
     except OAuthProfileError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     finally:
-        runtime.flows.pop(flow.flow_id, None)
+        if should_discard_flow:
+            runtime.flows.pop(flow.flow_id, None)
     payload = await _workspace_integrations_payload(engine=engine, workspace=workspace)
     row = _find_workspace_account_row(payload=payload, profile_id=profile_id)
     return IntegrationOAuthCompleteResponse(
