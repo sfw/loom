@@ -64,6 +64,7 @@ import {
   Check,
   X,
   ChevronDown,
+  ChevronRight,
   ChevronUp,
   Loader2,
   Wrench,
@@ -2256,10 +2257,11 @@ function ToolEventCard({
           expanded && "rounded-b-none",
         )}
       >
-        <ChevronDown
-          size={12}
-          className={cn("shrink-0 text-zinc-600 transition-transform", expanded && "rotate-180")}
-        />
+        {expanded ? (
+          <ChevronDown size={12} className="shrink-0 text-zinc-600" />
+        ) : (
+          <ChevronRight size={12} className="shrink-0 text-zinc-600" />
+        )}
         {!completed ? (
           <Loader2 size={12} className="text-[#a3b396] animate-spin shrink-0" />
         ) : success ? (
@@ -2419,13 +2421,11 @@ function ToolCallCard({ msg, summary }: { msg: { id: number; tool_name: string |
           expanded && "rounded-b-none border-b-0",
         )}
       >
-        <ChevronDown
-          size={12}
-          className={cn(
-            "shrink-0 text-zinc-600 transition-transform",
-            !expanded && "-rotate-90",
-          )}
-        />
+        {expanded ? (
+          <ChevronDown size={12} className="shrink-0 text-zinc-600" />
+        ) : (
+          <ChevronRight size={12} className="shrink-0 text-zinc-600" />
+        )}
         {success === false ? (
           <XCircle size={13} className="shrink-0 text-red-400" />
         ) : success === true ? (

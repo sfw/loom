@@ -85,6 +85,9 @@ def ctx(tmp_path: Path) -> ToolContext:
 
 
 class TestConversationRecallTool:
+    def test_timeout_budget_accounts_for_compaction(self):
+        assert ConversationRecallTool().timeout_seconds == 90
+
     async def test_search(self, populated_store, ctx):
         store, sid = populated_store
         tool = ConversationRecallTool(store=store, session_id=sid)

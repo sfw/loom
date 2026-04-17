@@ -1532,10 +1532,15 @@ class CoworkSession:
     def _format_recall_marker_line(self, entry: dict, marker: str) -> str:
         summary, _ = _compact_preview(entry.get("summary", ""), _RECALL_INDEX_LINE_CHARS)
         status = str(entry.get("status", "active") or "active").strip().lower() or "active"
+        try:
+            entry_id = max(0, int(entry.get("id", 0) or 0))
+        except (TypeError, ValueError):
+            entry_id = 0
         start = max(0, int(entry.get("source_turn_start", 0) or 0))
         end = max(start, int(entry.get("source_turn_end", start) or start))
         turns = f"turn {start}" if start == end else f"turns {start}-{end}"
-        line = f"[{marker}][{status}] {summary} ({turns})"
+        id_part = f"id={entry_id} " if entry_id > 0 else ""
+        line = f"[{marker}][{status}] {id_part}{summary} ({turns})"
         compact, _ = _compact_preview(line, _RECALL_INDEX_LINE_CHARS)
         return compact
 
@@ -1660,7 +1665,7 @@ class CoworkSession:
             '  * {"action":"decision_context","topic":"<topic>","limit":5}',
             '  * {"action":"entries","entry_type":"decision","status":"active","limit":5}',
             '  * {"action":"open_questions","topic":"<topic>","limit":5}',
-            '  * {"action":"source_turns","entry_ids":[<id>],"limit":6}',
+            '  * {"action":"source_turns","entry_ids":[<id from recall index>],"limit":6}',
             '  * {"action":"search","query":"<keywords>","limit":5}',
         ]
         for line in action_lines:

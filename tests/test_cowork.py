@@ -695,6 +695,7 @@ class TestCoworkSession:
         session.session_state.update_memory_snapshot({
             "active_decisions": [
                 {
+                    "id": 108,
                     "entry_type": "decision",
                     "status": "active",
                     "summary": "Use compactor model for cowork memory extraction",
@@ -735,6 +736,7 @@ class TestCoworkSession:
         recall_content = str(recall_messages[0].get("content", ""))
         assert "Active DECISION" in recall_content
         assert "Open QUESTION" in recall_content
+        assert "id=108" in recall_content
         assert "decision_context" in recall_content
 
     async def test_context_window_repairs_dangling_assistant_tool_calls(
