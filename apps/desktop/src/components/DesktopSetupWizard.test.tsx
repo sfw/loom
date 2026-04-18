@@ -52,6 +52,10 @@ describe("DesktopSetupWizard", () => {
       "sk-test",
     ));
 
+    await user.clear(screen.getByLabelText("Temperature"));
+    await user.type(screen.getByLabelText("Temperature"), "1");
+    await user.clear(screen.getByLabelText("Max Tokens"));
+    await user.type(screen.getByLabelText("Max Tokens"), "4096");
     await user.click(screen.getByRole("button", { name: "Continue" }));
     await user.click(screen.getByRole("button", { name: /All roles/ }));
     await user.click(screen.getByRole("button", { name: "Continue" }));
@@ -64,6 +68,8 @@ describe("DesktopSetupWizard", () => {
           provider: "anthropic",
           model: "claude-sonnet-4-5",
           roles: ["planner", "executor", "extractor", "verifier", "compactor"],
+          temperature: 1,
+          max_tokens: 4096,
         }),
       ],
     }));

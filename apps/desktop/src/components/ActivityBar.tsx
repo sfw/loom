@@ -17,6 +17,14 @@ function usePrefersReducedMotion(): boolean {
     }
 
     const mediaQuery = window.matchMedia("(prefers-reduced-motion: reduce)");
+    if (
+      !mediaQuery
+      || typeof mediaQuery.matches !== "boolean"
+      || typeof mediaQuery.addEventListener !== "function"
+      || typeof mediaQuery.removeEventListener !== "function"
+    ) {
+      return;
+    }
     const update = () => {
       setPrefersReducedMotion(mediaQuery.matches);
     };

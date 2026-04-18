@@ -19,6 +19,7 @@ import type {
   MCPServerActionResult,
   MCPServerUpdateRequest,
   ModelInfo,
+  ModelPatchRequest,
   NotificationEvent,
   RunArtifact,
   RunConversationEntry,
@@ -345,6 +346,7 @@ export interface AppActions {
   retryConnection: () => void;
   discoverSetupModels: (provider: string, baseUrl: string, apiKey?: string) => Promise<string[]>;
   completeInitialSetup: (payload: SetupCompleteRequest) => Promise<void>;
+  updateModelSettings: (modelName: string, payload: ModelPatchRequest) => Promise<void>;
   setNotice: React.Dispatch<React.SetStateAction<string>>;
   setIntegrationIntent: React.Dispatch<React.SetStateAction<{
     kind: "add_local_server" | "add_remote_server" | "create_account" | "focus_issues";
@@ -740,6 +742,7 @@ export function useAppState(): AppState & AppActions {
     retryConnection: connection.retryConnection,
     discoverSetupModels: connection.discoverSetupModels,
     completeInitialSetup: connection.completeInitialSetup,
+    updateModelSettings: connection.updateModelSettings,
 
     // Workspace
     workspaceNameDraft: workspace.workspaceNameDraft,

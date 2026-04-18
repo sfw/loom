@@ -96,6 +96,11 @@ class SettingsPatchRequest(BaseModel):
     persist: bool = False
 
 
+class ModelPatchRequest(BaseModel):
+    max_tokens: int | None = None
+    temperature: float | None = None
+
+
 class WorkspaceSettingsPatchRequest(BaseModel):
     overrides: dict[str, Any] = Field(default_factory=dict)
 
@@ -210,10 +215,14 @@ class ModelCapabilitiesResponse(BaseModel):
 
 class ModelInfo(BaseModel):
     name: str
+    provider: str = ""
+    base_url: str = ""
     model: str
     model_id: str = ""
     tier: int
     roles: list[str]
+    max_tokens: int = 0
+    temperature: float = 0.0
     capabilities: ModelCapabilitiesResponse | None = None
 
 

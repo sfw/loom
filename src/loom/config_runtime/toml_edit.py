@@ -31,6 +31,8 @@ def render_toml_scalar(value: object) -> str:
         return "true" if value else "false"
     if isinstance(value, int):
         return str(value)
+    if isinstance(value, float):
+        return str(value)
     text = str(value or "")
     escaped = text.replace("\\", "\\\\").replace('"', '\\"')
     return f'"{escaped}"'

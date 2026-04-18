@@ -58,6 +58,7 @@ from loom.api.schemas import (
     MCPServerUpdateRequest,
     ModelCapabilitiesResponse,
     ModelInfo,
+    ModelPatchRequest,
     PlanResponse,
     ProcessInfoResponse,
     ProgressResponse,
@@ -144,6 +145,12 @@ from loom.config_runtime import (
     ConfigPersistConflictError,
     ConfigPersistDisabledError,
     list_entries,
+)
+from loom.config_runtime.toml_edit import (
+    atomic_write_text,
+    read_mtime_ns,
+    render_toml_scalar,
+    upsert_scalar_value,
 )
 from loom.content import deserialize_block, serialize_block
 from loom.content_utils import extract_docx_text, extract_pptx_text, get_image_dimensions
@@ -5271,6 +5278,32 @@ def _setup_provider_rows() -> list[SetupProviderResponse]:
     ]
 
 
+def _model_info_from_provider(provider: dict[str, Any]) -> ModelInfo:
+    caps = provider.get("capabilities")
+    caps_response = None
+    if caps:
+        caps_response = ModelCapabilitiesResponse(
+            vision=caps.get("vision", False),
+            native_pdf=caps.get("native_pdf", False),
+            thinking=caps.get("thinking", False),
+            citations=caps.get("citations", False),
+            audio_input=caps.get("audio_input", False),
+            audio_output=caps.get("audio_output", False),
+        )
+    return ModelInfo(
+        name=provider["name"],
+        provider=str(provider.get("provider", "") or ""),
+        base_url=str(provider.get("base_url", "") or ""),
+        model=provider["model"],
+        model_id=provider.get("model_id", ""),
+        tier=provider["tier"],
+        roles=provider["roles"],
+        max_tokens=int(provider.get("max_tokens", 0) or 0),
+        temperature=float(provider.get("temperature", 0.0) or 0.0),
+        capabilities=caps_response,
+    )
+
+
 def _validate_setup_models(models: list[Any]) -> list[dict[str, Any]]:
     if not models:
         raise HTTPException(status_code=400, detail="At least one model is required.")
@@ -9368,28 +9401,82 @@ async def list_models(request: Request):
     """List available models and their health status."""
     engine = _get_engine(request)
     providers = engine.model_router.list_providers()
-    result = []
-    for p in providers:
-        caps = p.get("capabilities")
-        caps_response = None
-        if caps:
-            caps_response = ModelCapabilitiesResponse(
-                vision=caps.get("vision", False),
-                native_pdf=caps.get("native_pdf", False),
-                thinking=caps.get("thinking", False),
-                citations=caps.get("citations", False),
-                audio_input=caps.get("audio_input", False),
-                audio_output=caps.get("audio_output", False),
-            )
-        result.append(ModelInfo(
-            name=p["name"],
-            model=p["model"],
-            model_id=p.get("model_id", ""),
-            tier=p["tier"],
-            roles=p["roles"],
-            capabilities=caps_response,
-        ))
-    return result
+    return [_model_info_from_provider(provider) for provider in providers]
+
+
+@router.patch("/models/{model_name}", response_model=ModelInfo)
+async def patch_model(request: Request, model_name: str, body: ModelPatchRequest):
+    """Persist editable model parameters and reload the runtime."""
+    engine = _get_engine(request)
+    if not _request_is_local(request):
+        raise HTTPException(
+            status_code=403,
+            detail="Model settings mutation requires a local caller.",
+        )
+
+    clean_name = str(model_name or "").strip()
+    if not clean_name:
+        raise HTTPException(status_code=400, detail="Model name is required.")
+
+    config_path = engine.config_runtime_store.source_path()
+    if config_path is None or not config_path.exists():
+        raise HTTPException(
+            status_code=400,
+            detail="Model settings persistence requires a writable loom.toml source path.",
+        )
+
+    model_config = engine.config.models.get(clean_name)
+    if model_config is None:
+        raise HTTPException(status_code=404, detail=f"Unknown model: {clean_name}")
+
+    updates: list[tuple[str, object]] = []
+    if body.max_tokens is not None:
+        if body.max_tokens <= 0:
+            raise HTTPException(status_code=422, detail="max_tokens must be greater than 0.")
+        updates.append(("max_tokens", int(body.max_tokens)))
+    if body.temperature is not None:
+        updates.append(("temperature", float(body.temperature)))
+    if not updates:
+        raise HTTPException(status_code=400, detail="No model settings were provided.")
+
+    original_text = config_path.read_text(encoding="utf-8")
+    next_text = original_text
+    section = f"models.{clean_name}"
+    for key, value in updates:
+        next_text = upsert_scalar_value(
+            next_text,
+            section=section,
+            key=key,
+            rendered_value=render_toml_scalar(value),
+        )
+
+    try:
+        atomic_write_text(
+            config_path,
+            text=next_text,
+            expected_mtime_ns=read_mtime_ns(config_path),
+        )
+    except ConfigPersistConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except ConfigPersistDisabledError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    engine.reload_config_from_source(config_path)
+
+    provider = next(
+        (
+            row
+            for row in engine.model_router.list_providers()
+            if str(row.get("name", "") or "").strip() == clean_name
+        ),
+        None,
+    )
+    if provider is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Updated model is no longer available after reload.",
+        )
+    return _model_info_from_provider(provider)
 
 
 @router.get("/tools", response_model=list[ToolInfo])

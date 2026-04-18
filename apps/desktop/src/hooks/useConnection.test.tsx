@@ -9,6 +9,7 @@ const apiMocks = vi.hoisted(() => ({
   discoverSetupModels: vi.fn(),
   fetchDesktopSidecarStatus: vi.fn(),
   fetchModels: vi.fn(),
+  patchModel: vi.fn(),
   fetchRuntimeStatus: vi.fn(),
   fetchSettings: vi.fn(),
   fetchSetupStatus: vi.fn(),
@@ -22,6 +23,7 @@ vi.mock("../api", () => ({
   discoverSetupModels: apiMocks.discoverSetupModels,
   fetchDesktopSidecarStatus: apiMocks.fetchDesktopSidecarStatus,
   fetchModels: apiMocks.fetchModels,
+  patchModel: apiMocks.patchModel,
   fetchRuntimeStatus: apiMocks.fetchRuntimeStatus,
   fetchSettings: apiMocks.fetchSettings,
   fetchSetupStatus: apiMocks.fetchSetupStatus,
@@ -41,6 +43,7 @@ describe("useConnection", () => {
     apiMocks.discoverSetupModels.mockReset();
     apiMocks.fetchDesktopSidecarStatus.mockReset();
     apiMocks.fetchModels.mockReset();
+    apiMocks.patchModel.mockReset();
     apiMocks.fetchRuntimeStatus.mockReset();
     apiMocks.fetchSettings.mockReset();
     apiMocks.fetchSetupStatus.mockReset();
@@ -55,6 +58,15 @@ describe("useConnection", () => {
     apiMocks.discoverSetupModels.mockResolvedValue({ models: [] });
     apiMocks.fetchDesktopSidecarStatus.mockResolvedValue(null);
     apiMocks.fetchModels.mockResolvedValue([]);
+    apiMocks.patchModel.mockResolvedValue({
+      name: "primary",
+      model: "gpt-4o",
+      model_id: "gpt-4o",
+      tier: 1,
+      roles: ["executor"],
+      max_tokens: 8192,
+      temperature: 0.1,
+    });
     apiMocks.fetchSettings.mockResolvedValue({ basic: [] });
     apiMocks.fetchSetupStatus.mockResolvedValue({
       needs_setup: false,

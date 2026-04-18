@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import {
   shallowEqual,
+  useAppActions,
   useAppSelector,
 } from "@/context/AppContext";
 import { cn } from "@/lib/utils";
@@ -65,9 +66,13 @@ export default function SettingsPanel() {
     models: state.models,
     settings: state.settings,
   }), shallowEqual);
+  const { updateModelSettings, setError, setNotice } = useAppActions();
 
   // ---- Theme state ----
   const [theme, setThemeState] = useState<ThemePreference>(getStoredTheme);
+  const [editingModel, setEditingModel] = useState("");
+  const [modelDrafts, setModelDrafts] = useState<Record<string, { temperature: string; max_tokens: string }>>({});
+  const [savingModel, setSavingModel] = useState("");
 
   const setTheme = useCallback((next: ThemePreference) => {
     setThemeState(next);
@@ -125,6 +130,49 @@ export default function SettingsPanel() {
       icon: Monitor,
     },
   ];
+
+  function modelDraftFor(model: {
+    name: string;
+    temperature?: number;
+    max_tokens?: number;
+  }) {
+    return modelDrafts[model.name] ?? {
+      temperature: String(model.temperature ?? 0),
+      max_tokens: String(model.max_tokens ?? 0),
+    };
+  }
+
+  async function handleSaveModel(modelName: string) {
+    const draft = modelDrafts[modelName];
+    if (!draft) {
+      return;
+    }
+    const nextTemperature = Number(draft.temperature);
+    const nextMaxTokens = Number(draft.max_tokens);
+    if (!Number.isFinite(nextTemperature)) {
+      setError("Temperature must be a valid number.");
+      return;
+    }
+    if (!Number.isInteger(nextMaxTokens) || nextMaxTokens <= 0) {
+      setError("Max tokens must be a whole number greater than 0.");
+      return;
+    }
+
+    setSavingModel(modelName);
+    setError("");
+    try {
+      await updateModelSettings(modelName, {
+        temperature: nextTemperature,
+        max_tokens: nextMaxTokens,
+      });
+      setNotice(`Updated ${modelName} model settings.`);
+      setEditingModel("");
+    } catch (error) {
+      setError(error instanceof Error ? error.message : "Failed to update model settings.");
+    } finally {
+      setSavingModel("");
+    }
+  }
 
   return (
     <div className="flex h-full flex-col overflow-y-auto">
@@ -290,36 +338,122 @@ export default function SettingsPanel() {
                 {models.map((model) => (
                   <div
                     key={model.name}
-                    className="flex items-start gap-3 rounded-lg border border-zinc-800 bg-zinc-900/30 px-4 py-3"
+                    className="rounded-lg border border-zinc-800 bg-zinc-900/30 px-4 py-3"
                   >
-                    <div className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-[#6b7a5e]/10">
-                      <Cpu size={14} className="text-[#a3b396]" />
-                    </div>
-                    <div className="min-w-0 flex-1">
-                      <div className="flex items-center gap-2">
-                        <p className="truncate text-sm font-semibold text-zinc-200">
-                          {model.name}
-                        </p>
-                        <span className="shrink-0 rounded bg-[#8a9a7b]/15 px-1.5 py-px text-[10px] font-semibold text-[#a3b396]">
-                          Tier {model.tier}
-                        </span>
+                    <div className="flex items-start gap-3">
+                      <div className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-[#6b7a5e]/10">
+                        <Cpu size={14} className="text-[#a3b396]" />
                       </div>
-                      <p className="mt-0.5 truncate text-xs font-mono text-zinc-500">
-                        {model.model_id || model.model}
-                      </p>
-                      {model.roles.length > 0 && (
-                        <div className="mt-1.5 flex flex-wrap gap-1">
-                          {model.roles.map((role) => (
-                            <span
-                              key={role}
-                              className="rounded-md bg-zinc-800 px-1.5 py-0.5 text-[10px] font-medium text-zinc-400"
-                            >
-                              {role}
-                            </span>
-                          ))}
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-2">
+                          <p className="truncate text-sm font-semibold text-zinc-200">
+                            {model.name}
+                          </p>
+                          <span className="shrink-0 rounded bg-[#8a9a7b]/15 px-1.5 py-px text-[10px] font-semibold text-[#a3b396]">
+                            Tier {model.tier}
+                          </span>
                         </div>
-                      )}
+                        <p className="mt-0.5 truncate text-xs font-mono text-zinc-500">
+                          {model.model_id || model.model}
+                        </p>
+                        {model.roles.length > 0 && (
+                          <div className="mt-1.5 flex flex-wrap gap-1">
+                            {model.roles.map((role) => (
+                              <span
+                                key={role}
+                                className="rounded-md bg-zinc-800 px-1.5 py-0.5 text-[10px] font-medium text-zinc-400"
+                              >
+                                {role}
+                              </span>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setEditingModel((current) => current === model.name ? "" : model.name);
+                          setModelDrafts((current) => ({
+                            ...current,
+                            [model.name]: {
+                              temperature: String(model.temperature ?? 0),
+                              max_tokens: String(model.max_tokens ?? 0),
+                            },
+                          }));
+                        }}
+                        className="rounded-lg border border-zinc-700 px-3 py-1.5 text-xs font-medium text-zinc-300 transition-colors hover:border-zinc-600 hover:text-zinc-100"
+                      >
+                        {editingModel === model.name ? "Close" : "Tune"}
+                      </button>
                     </div>
+                    <div className="mt-3 grid gap-2 text-xs text-zinc-500 sm:grid-cols-2">
+                      <div className="rounded-lg border border-zinc-800/80 bg-zinc-950/60 px-3 py-2">
+                        <p className="uppercase tracking-[0.18em] text-[10px]">Temperature</p>
+                        <p className="mt-1 text-sm font-medium text-zinc-200">{model.temperature ?? 0}</p>
+                      </div>
+                      <div className="rounded-lg border border-zinc-800/80 bg-zinc-950/60 px-3 py-2">
+                        <p className="uppercase tracking-[0.18em] text-[10px]">Max Tokens</p>
+                        <p className="mt-1 text-sm font-medium text-zinc-200">{model.max_tokens ?? 0}</p>
+                      </div>
+                    </div>
+                    {editingModel === model.name && (
+                      <div className="mt-3 rounded-xl border border-zinc-800/80 bg-zinc-950/70 p-3">
+                        <div className="grid gap-3 md:grid-cols-2">
+                          <label className="grid gap-2 text-xs font-medium uppercase tracking-[0.18em] text-zinc-500">
+                            Temperature
+                            <input
+                              aria-label={`${model.name} temperature`}
+                              type="number"
+                              step="0.1"
+                              value={modelDraftFor(model).temperature}
+                              onChange={(event) => setModelDrafts((current) => ({
+                                ...current,
+                                [model.name]: {
+                                  ...modelDraftFor(model),
+                                  temperature: event.target.value,
+                                },
+                              }))}
+                              className="rounded-xl border border-zinc-800 bg-zinc-950/80 px-3 py-2.5 text-sm normal-case tracking-normal text-zinc-100 outline-none transition-colors focus:border-[#8a9a7b]"
+                            />
+                          </label>
+                          <label className="grid gap-2 text-xs font-medium uppercase tracking-[0.18em] text-zinc-500">
+                            Max Tokens
+                            <input
+                              aria-label={`${model.name} max tokens`}
+                              type="number"
+                              min="1"
+                              step="1"
+                              value={modelDraftFor(model).max_tokens}
+                              onChange={(event) => setModelDrafts((current) => ({
+                                ...current,
+                                [model.name]: {
+                                  ...modelDraftFor(model),
+                                  max_tokens: event.target.value,
+                                },
+                              }))}
+                              className="rounded-xl border border-zinc-800 bg-zinc-950/80 px-3 py-2.5 text-sm normal-case tracking-normal text-zinc-100 outline-none transition-colors focus:border-[#8a9a7b]"
+                            />
+                          </label>
+                        </div>
+                        <div className="mt-3 flex items-center justify-end gap-2">
+                          <button
+                            type="button"
+                            onClick={() => setEditingModel("")}
+                            className="rounded-lg border border-zinc-700 px-3 py-2 text-xs font-medium text-zinc-300 transition-colors hover:border-zinc-600 hover:text-zinc-100"
+                          >
+                            Cancel
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => void handleSaveModel(model.name)}
+                            disabled={savingModel === model.name}
+                            className="rounded-lg bg-[#6b7a5e] px-3 py-2 text-xs font-semibold text-white transition-colors hover:bg-[#8a9a7b] disabled:cursor-not-allowed disabled:opacity-60"
+                          >
+                            {savingModel === model.name ? "Saving..." : "Save"}
+                          </button>
+                        </div>
+                      </div>
+                    )}
                   </div>
                 ))}
               </div>

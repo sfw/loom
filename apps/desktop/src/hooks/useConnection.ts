@@ -12,10 +12,12 @@ import {
   discoverSetupModels as discoverSetupModelsRequest,
   fetchDesktopSidecarStatus,
   fetchModels,
+  patchModel as patchModelRequest,
   fetchRuntimeStatus,
   fetchSettings,
   fetchSetupStatus,
   fetchWorkspaces,
+  type ModelPatchRequest,
   type ModelInfo,
   type RuntimeStatus,
   type SetupCompleteRequest,
@@ -84,6 +86,7 @@ export interface ConnectionActions {
   retryConnection: () => void;
   discoverSetupModels: (provider: string, baseUrl: string, apiKey?: string) => Promise<string[]>;
   completeInitialSetup: (payload: SetupCompleteRequest) => Promise<void>;
+  updateModelSettings: (modelName: string, payload: ModelPatchRequest) => Promise<void>;
   setWorkspaces: React.Dispatch<React.SetStateAction<WorkspaceSummary[]>>;
   setSettings: React.Dispatch<React.SetStateAction<SettingsPayload | null>>;
   setRuntime: React.Dispatch<React.SetStateAction<RuntimeStatus | null>>;
@@ -315,6 +318,17 @@ export function useConnection(deps: {
     });
   }
 
+  async function updateModelSettings(
+    modelName: string,
+    payload: ModelPatchRequest,
+  ): Promise<void> {
+    setError("");
+    const updated = await patchModelRequest(modelName, payload);
+    setModels((current) => current.map((model) => (
+      model.name === updated.name ? updated : model
+    )));
+  }
+
   return {
     runtime,
     models,
@@ -327,6 +341,7 @@ export function useConnection(deps: {
     retryConnection,
     discoverSetupModels,
     completeInitialSetup,
+    updateModelSettings,
     setWorkspaces,
     setSettings,
     setRuntime,

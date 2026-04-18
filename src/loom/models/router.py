@@ -91,10 +91,14 @@ class ModelRouter:
             model_id = getattr(provider, "_model", "") or provider.name
             info: dict = {
                 "name": name,
+                "provider": str(getattr(getattr(provider, "_config", None), "provider", "") or ""),
+                "base_url": str(getattr(getattr(provider, "_config", None), "base_url", "") or ""),
                 "model": provider.name,
                 "model_id": model_id,
                 "tier": provider.tier,
                 "roles": provider.roles,
+                "max_tokens": getattr(provider, "configured_max_tokens", None) or 0,
+                "temperature": getattr(provider, "configured_temperature", None) or 0.0,
             }
             # Include capabilities if provider exposes them
             caps = getattr(provider, "_capabilities", None)

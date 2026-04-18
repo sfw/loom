@@ -66,10 +66,19 @@ export interface ActivitySummary {
 
 export interface ModelInfo {
   name: string;
+  provider?: string;
+  base_url?: string;
   model: string;
   model_id: string;
   tier: number;
   roles: string[];
+  max_tokens?: number;
+  temperature?: number;
+}
+
+export interface ModelPatchRequest {
+  max_tokens?: number;
+  temperature?: number;
 }
 
 export interface ToolInfo {
@@ -959,6 +968,19 @@ export function fetchActivitySummary(): Promise<ActivitySummary> {
 
 export function fetchModels(): Promise<ModelInfo[]> {
   return requestJson<ModelInfo[]>("/models");
+}
+
+export function patchModel(
+  modelName: string,
+  body: ModelPatchRequest,
+): Promise<ModelInfo> {
+  return requestJson<ModelInfo>(`/models/${encodeURIComponent(modelName)}`, {
+    method: "PATCH",
+    body: JSON.stringify(body),
+    headers: {
+      "content-type": "application/json",
+    },
+  });
 }
 
 export function fetchWorkspaces(includeArchived = false): Promise<WorkspaceSummary[]> {

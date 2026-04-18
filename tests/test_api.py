@@ -902,7 +902,56 @@ class TestSystemEndpoints:
     async def test_models(self, client):
         response = await client.get("/models")
         assert response.status_code == 200
-        assert isinstance(response.json(), list)
+        rows = response.json()
+        assert isinstance(rows, list)
+        if rows:
+            assert "temperature" in rows[0]
+            assert "max_tokens" in rows[0]
+
+    @pytest.mark.asyncio
+    async def test_patch_model_persists_temperature_and_max_tokens(
+        self,
+        client,
+        engine,
+        tmp_path,
+    ):
+        config_path = tmp_path / "loom.toml"
+        config_path.write_text(
+            """
+[server]
+host = "127.0.0.1"
+port = 9000
+
+[models.primary]
+provider = "openai_compatible"
+base_url = "http://localhost:1234/v1"
+model = "gpt-4.1"
+max_tokens = 8192
+temperature = 0.1
+roles = ["planner", "executor"]
+""".strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        engine.reload_config_from_source(config_path)
+
+        response = await client.patch(
+            "/models/primary",
+            json={
+                "temperature": 1.0,
+                "max_tokens": 4096,
+            },
+        )
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["name"] == "primary"
+        assert payload["temperature"] == 1.0
+        assert payload["max_tokens"] == 4096
+
+        updated = config_path.read_text(encoding="utf-8")
+        assert "temperature = 1.0" in updated
+        assert "max_tokens = 4096" in updated
 
     @pytest.mark.asyncio
     async def test_tools(self, client):

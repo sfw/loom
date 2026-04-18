@@ -124,6 +124,14 @@ export default function DesktopSetupWizard({
         setError("Enter a server URL and model name to continue.");
         return;
       }
+      if (!Number.isFinite(currentDraft.temperature)) {
+        setError("Enter a valid temperature before continuing.");
+        return;
+      }
+      if (!Number.isInteger(currentDraft.max_tokens) || currentDraft.max_tokens <= 0) {
+        setError("Max tokens must be a whole number greater than 0.");
+        return;
+      }
       if (activeTarget === "utility") {
         setStep("review");
         return;
@@ -318,6 +326,48 @@ export default function DesktopSetupWizard({
             placeholder="claude-sonnet-4-5, gpt-4.1, qwen3:14b..."
           />
         </div>
+
+        <div className="grid gap-4 md:grid-cols-2">
+          <div className="grid gap-2">
+            <label className="text-xs font-medium uppercase tracking-[0.2em] text-zinc-500" htmlFor="setup-temperature">
+              Temperature
+            </label>
+            <input
+              id="setup-temperature"
+              type="number"
+              step="0.1"
+              value={currentDraft.temperature}
+              onChange={(event) => {
+                const next = Number(event.target.value);
+                setDraft((draft) => ({ ...draft, temperature: Number.isFinite(next) ? next : draft.temperature }));
+              }}
+              className="rounded-xl border border-zinc-800 bg-zinc-950/80 px-3 py-2.5 text-sm text-zinc-100 outline-none transition-colors focus:border-[#8a9a7b]"
+            />
+            <p className="text-xs text-zinc-500">
+              Lower is steadier. Raise this when a provider or model expects a hotter default.
+            </p>
+          </div>
+          <div className="grid gap-2">
+            <label className="text-xs font-medium uppercase tracking-[0.2em] text-zinc-500" htmlFor="setup-max-tokens">
+              Max Tokens
+            </label>
+            <input
+              id="setup-max-tokens"
+              type="number"
+              min="1"
+              step="1"
+              value={currentDraft.max_tokens}
+              onChange={(event) => {
+                const next = Number(event.target.value);
+                setDraft((draft) => ({ ...draft, max_tokens: Number.isInteger(next) ? next : draft.max_tokens }));
+              }}
+              className="rounded-xl border border-zinc-800 bg-zinc-950/80 px-3 py-2.5 text-sm text-zinc-100 outline-none transition-colors focus:border-[#8a9a7b]"
+            />
+            <p className="text-xs text-zinc-500">
+              Controls how large each response is allowed to be for this model.
+            </p>
+          </div>
+        </div>
       </div>
     );
   }
@@ -432,6 +482,8 @@ export default function DesktopSetupWizard({
         <div className="mt-4 space-y-2 text-sm text-zinc-300">
           <p><span className="text-zinc-500">Endpoint:</span> {draft.base_url}</p>
           <p><span className="text-zinc-500">Model:</span> {draft.model}</p>
+          <p><span className="text-zinc-500">Temperature:</span> {draft.temperature}</p>
+          <p><span className="text-zinc-500">Max tokens:</span> {draft.max_tokens}</p>
         </div>
       </div>
     );
