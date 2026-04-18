@@ -3626,10 +3626,24 @@ def _effective_workspace_mcp_config(
 ):
     if workspace_path is None:
         return engine.config
-    return apply_mcp_overrides(
+    layered = apply_mcp_overrides(
         engine.config,
         workspace=workspace_path,
         legacy_config_path=engine.config_runtime_store.source_path(),
+    )
+    runtime_servers = dict(getattr(engine.config.mcp, "servers", {}) or {})
+    if not runtime_servers:
+        return layered
+    merged_servers = dict(runtime_servers)
+    merged_servers.update(getattr(layered.mcp, "servers", {}) or {})
+    return replace(
+        layered,
+        mcp=replace(
+            layered.mcp,
+            # Preserve runtime-only MCP aliases while still letting workspace/user
+            # file layers override them when those aliases are explicitly defined.
+            servers=merged_servers,
+        ),
     )
 
 

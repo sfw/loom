@@ -3335,6 +3335,9 @@ class TestWorkspaceFirstEndpoints:
         engine,
         monkeypatch,
     ):
+        home_dir = tmp_path / "home"
+        home_dir.mkdir()
+        monkeypatch.setenv("HOME", str(home_dir))
         workspace_path = tmp_path / "chat-mcp-auth-ws"
         workspace_path.mkdir()
         workspace = await workspace_registry.ensure_workspace(
@@ -3441,6 +3444,9 @@ class TestWorkspaceFirstEndpoints:
         engine,
         monkeypatch,
     ):
+        home_dir = tmp_path / "home"
+        home_dir.mkdir()
+        monkeypatch.setenv("HOME", str(home_dir))
         workspace_path = tmp_path / "chat-workspace-mcp-ws"
         workspace_path.mkdir()
         loom_dir = workspace_path / ".loom"
