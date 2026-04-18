@@ -1545,6 +1545,126 @@ class TestWorkspaceFirstEndpoints:
         assert account["writable_storage_kind"] == "env"
 
     @pytest.mark.asyncio
+    async def test_workspace_integrations_prefers_live_mcp_oauth_state_over_stale_profile_expiry(
+        self,
+        client,
+        tmp_path,
+        workspace_registry,
+        monkeypatch,
+    ):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv(
+            "LOOM_TEST_NOTION_TOKEN",
+            json.dumps(
+                {
+                    "access_token": "stale-token-123",
+                    "refresh_token": "refresh-token-123",
+                    "token_type": "Bearer",
+                    "expires_at": 1,
+                }
+            ),
+        )
+
+        home_loom_dir = tmp_path / ".loom"
+        home_loom_dir.mkdir(exist_ok=True)
+        write_mcp_file(
+            home_loom_dir / "mcp.toml",
+            {
+                "notion": MCPServerConfig(
+                    type="remote",
+                    url="https://mcp.notion.example",
+                    oauth=MCPOAuthConfig(enabled=True, scopes=["read"]),
+                ),
+            },
+        )
+        write_auth_file(
+            home_loom_dir / "auth.toml",
+            AuthConfig(
+                profiles={
+                    "notion_personal": AuthProfile(
+                        profile_id="notion_personal",
+                        provider="notion",
+                        mode="oauth2_pkce",
+                        account_label="Notion Personal",
+                        mcp_server="notion",
+                        token_ref="${LOOM_TEST_NOTION_TOKEN}",
+                    ),
+                },
+            ),
+        )
+
+        workspace_path = tmp_path / "runtime-auth-state-ws"
+        workspace_path.mkdir()
+        loom_dir = workspace_path / ".loom"
+        loom_dir.mkdir()
+        write_workspace_auth_resources(
+            loom_dir / "auth.resources.toml",
+            AuthResourcesStore(
+                resources={
+                    "resource-mcp-notion": AuthResource(
+                        resource_id="resource-mcp-notion",
+                        resource_kind="mcp",
+                        resource_key="notion",
+                        display_name="MCP: notion",
+                        provider="notion",
+                        source="mcp",
+                        status="active",
+                    ),
+                },
+                bindings={
+                    "binding-notion": AuthBinding(
+                        binding_id="binding-notion",
+                        resource_id="resource-mcp-notion",
+                        profile_id="notion_personal",
+                        status="active",
+                    ),
+                },
+                workspace_defaults={
+                    "resource-mcp-notion": "notion_personal",
+                },
+            ),
+        )
+
+        monkeypatch.setattr(
+            routes_mod,
+            "oauth_state_for_alias",
+            lambda alias, server=None: {
+                "state": "ready" if alias == "notion" else "missing",
+                "has_token": alias == "notion",
+                "expired": False,
+                "expires_at": 1_900_000_000 if alias == "notion" else None,
+                "token_type": "Bearer" if alias == "notion" else None,
+                "scopes": ["read"] if alias == "notion" else [],
+                "last_failure_reason": "",
+                "storage": "secret_ref" if alias == "notion" else "missing",
+            },
+        )
+
+        workspace = await workspace_registry.ensure_workspace(
+            str(workspace_path),
+            display_name="Runtime Auth State WS",
+        )
+        assert workspace is not None
+
+        response = await client.get(f"/workspaces/{workspace['id']}/integrations")
+        assert response.status_code == 200
+        payload = response.json()
+
+        notion = next(row for row in payload["mcp_servers"] if row["alias"] == "notion")
+        assert notion["auth_state"]["state"] == "ready"
+        assert notion["auth_state"]["storage"] == "secret_ref"
+        assert notion["auth_state"]["expired"] is False
+        assert "Reconnect or refresh this account." not in notion["remediation"]
+
+        account = next(
+            row for row in payload["accounts"] if row["profile_id"] == "notion_personal"
+        )
+        assert account["auth_state"]["state"] == "ready"
+        assert account["auth_state"]["storage"] == "secret_ref"
+        assert account["auth_state"]["expired"] is False
+        assert account["remediation"] == []
+
+    @pytest.mark.asyncio
     async def test_workspace_mcp_approve_endpoint_updates_management_state(
         self,
         client,

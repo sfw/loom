@@ -5435,7 +5435,58 @@ def _server_source_details(
     return source_label, source_path_text, "unknown", "Source metadata is incomplete."
 
 
-def _profile_auth_state(profile: AuthProfile) -> IntegrationAuthStateResponse:
+def _mcp_runtime_auth_state_override(
+    *,
+    profile: AuthProfile,
+    mcp_alias: str = "",
+    mcp_server: MCPServerConfig | None = None,
+) -> IntegrationAuthStateResponse | None:
+    clean_alias = str(mcp_alias or "").strip()
+    mode = str(getattr(profile, "mode", "") or "").strip().lower()
+    if (
+        not clean_alias
+        or mcp_server is None
+        or not bool(getattr(mcp_server.oauth, "enabled", False))
+        or mode not in {"oauth2_pkce", "oauth2_device"}
+    ):
+        return None
+
+    oauth_state = oauth_state_for_alias(clean_alias, server=mcp_server)
+    if (
+        str(oauth_state.get("state", "") or "").strip().lower() != "ready"
+        or not bool(oauth_state.get("has_token", False))
+    ):
+        return None
+
+    return IntegrationAuthStateResponse(
+        state="ready",
+        label=_integration_auth_state_label("ready"),
+        reason=str(oauth_state.get("last_failure_reason", "") or ""),
+        storage=str(oauth_state.get("storage", "") or "mcp_bound_token_ref"),
+        has_token=True,
+        expired=False,
+        expires_at=oauth_state.get("expires_at"),
+        token_type=(
+            str(oauth_state.get("token_type", "") or "").strip()
+            or None
+        ),
+        scopes=[
+            str(scope).strip()
+            for scope in list(oauth_state.get("scopes", []) or [])
+            if str(scope).strip()
+        ],
+        profile_id=profile.profile_id,
+        account_label=profile.account_label,
+        mode=profile.mode,
+    )
+
+
+def _profile_auth_state(
+    profile: AuthProfile,
+    *,
+    mcp_alias: str = "",
+    mcp_server: MCPServerConfig | None = None,
+) -> IntegrationAuthStateResponse:
     status = str(getattr(profile, "status", "ready") or "ready").strip().lower() or "ready"
     mode = str(getattr(profile, "mode", "") or "").strip().lower()
 
@@ -5461,6 +5512,13 @@ def _profile_auth_state(profile: AuthProfile) -> IntegrationAuthStateResponse:
         )
 
     if mode in {"oauth2_pkce", "oauth2_device"}:
+        runtime_auth_state = _mcp_runtime_auth_state_override(
+            profile=profile,
+            mcp_alias=mcp_alias,
+            mcp_server=mcp_server,
+        )
+        if runtime_auth_state is not None:
+            return runtime_auth_state
         oauth_state = oauth_state_for_profile(profile)
         return IntegrationAuthStateResponse(
             state=oauth_state.state,
@@ -5827,7 +5885,11 @@ def _build_workspace_integrations_response(
             flags.append("legacy_config")
 
         if effective_profile is not None:
-            auth_state = _profile_auth_state(effective_profile)
+            auth_state = _profile_auth_state(
+                effective_profile,
+                mcp_alias=view.alias,
+                mcp_server=view.server,
+            )
             profile_source, profile_source_path = _profile_source_details(
                 profile_id=effective_profile.profile_id,
                 explicit_profile_ids=merged_auth.explicit_profile_ids,
@@ -5963,6 +6025,7 @@ def _build_workspace_integrations_response(
         ))
 
     account_rows: list[AccountInfoResponse] = []
+    views_by_alias = {view.alias: view for view in mcp_views}
     for profile_id, profile in sorted(merged_auth.config.profiles.items()):
         profile_source, profile_source_path = _profile_source_details(
             profile_id=profile_id,
@@ -5970,7 +6033,6 @@ def _build_workspace_integrations_response(
             explicit_path=merged_auth.explicit_path,
             user_path=merged_auth.user_path,
         )
-        auth_state = _profile_auth_state(profile)
         bound_refs = sorted(set(bound_resource_refs_by_profile.get(profile_id, [])))
         used_by_mcp_servers = sorted({
             ref.split(":", 1)[1]
@@ -5979,6 +6041,17 @@ def _build_workspace_integrations_response(
         })
         effective_for_mcp_servers = sorted(
             set(effective_server_aliases_by_profile.get(profile_id, []))
+        )
+        preferred_mcp_alias = (
+            str(profile.mcp_server or "").strip()
+            or (effective_for_mcp_servers[0] if effective_for_mcp_servers else "")
+            or (used_by_mcp_servers[0] if used_by_mcp_servers else "")
+        )
+        linked_view = views_by_alias.get(preferred_mcp_alias)
+        auth_state = _profile_auth_state(
+            profile,
+            mcp_alias=preferred_mcp_alias,
+            mcp_server=linked_view.server if linked_view is not None else None,
         )
         remediation = _integration_account_remediation(
             auth_state=auth_state,
