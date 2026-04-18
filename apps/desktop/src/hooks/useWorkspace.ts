@@ -752,6 +752,31 @@ export function useWorkspace(deps: {
     }
   });
 
+  const setApprovalInboxSurface = useEffectEvent((
+    workspaceId: string,
+    approvalPayload: ApprovalFeedItem[],
+  ) => {
+    if (selectedWorkspaceIdRef.current !== workspaceId) {
+      return;
+    }
+    setApprovalInbox(approvalPayload);
+    setOverview((current) => {
+      if (!current || current.workspace.id !== workspaceId) {
+        return current;
+      }
+      const nextPendingApprovals = approvalPayload.length;
+      if (Number(current.pending_approvals_count || 0) === nextPendingApprovals) {
+        return current;
+      }
+      const nextOverview = {
+        ...current,
+        pending_approvals_count: nextPendingApprovals,
+      };
+      overviewRef.current = nextOverview;
+      return nextOverview;
+    });
+  });
+
   // Heavy recovery path: use for bootstrap, reconnect/manual refresh, or
   // explicit stale-repair cases when local patches cannot reliably derive
   // the affected workspace state.
@@ -764,11 +789,14 @@ export function useWorkspace(deps: {
       fetchApprovals(workspaceId),
     ]);
     const isCurrentWorkspace = selectedWorkspaceIdRef.current === workspaceId;
-    applyWorkspaceOverview(workspaceId, overviewPayload);
+    applyWorkspaceOverview(workspaceId, {
+      ...overviewPayload,
+      pending_approvals_count: approvalPayload.length,
+    });
     if (!isCurrentWorkspace) {
       return;
     }
-    setApprovalInbox(approvalPayload);
+    setApprovalInboxSurface(workspaceId, approvalPayload);
     await refreshVisibleWorkspaceTabState(workspaceId);
   });
 
@@ -782,7 +810,7 @@ export function useWorkspace(deps: {
   });
 
   const refreshApprovalInbox = useEffectEvent(async (workspaceId: string) => {
-    setApprovalInbox(await fetchApprovals(workspaceId));
+    setApprovalInboxSurface(workspaceId, await fetchApprovals(workspaceId));
   });
 
   const patchPendingApprovalCount = useEffectEvent((workspaceId: string, delta: number) => {
@@ -1465,9 +1493,12 @@ export function useWorkspace(deps: {
         if (cancelled) {
           return;
         }
-        setApprovalInbox(approvalPayload);
         setWorkspaceSearchResults(null);
-        applyWorkspaceOverview(selectedWorkspaceId, overviewPayload);
+        applyWorkspaceOverview(selectedWorkspaceId, {
+          ...overviewPayload,
+          pending_approvals_count: approvalPayload.length,
+        });
+        setApprovalInboxSurface(selectedWorkspaceId, approvalPayload);
         void refreshVisibleWorkspaceTabState(selectedWorkspaceId).catch((err) => {
           if (!isTransientRequestError(err)) {
             setError(err instanceof Error ? err.message : "Failed to load workspace details.");

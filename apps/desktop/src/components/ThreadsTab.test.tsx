@@ -695,7 +695,7 @@ describe("ThreadsTab", () => {
     expect(screen.queryByText("Thinking...")).not.toBeInTheDocument();
   });
 
-  it("renders live feedback in a bounded scroll panel with preserved paragraph breaks", () => {
+  it("renders the live panel in a bounded scroll area with preserved paragraph breaks", () => {
     mockApp.conversationStatus = {
       conversation_id: "conversation-1",
       processing: true,
@@ -715,13 +715,34 @@ describe("ThreadsTab", () => {
 
     const { container } = render(<ThreadsTab />);
 
-    expect(screen.getByText("Live Feedback")).toBeInTheDocument();
+    expect(screen.getByText("Live")).toBeInTheDocument();
     expect(screen.getByText("Let me search for blink49 and the Banff festival specifically:")).toBeInTheDocument();
     expect(screen.getByText("Let me try a broader search.")).toBeInTheDocument();
-    expect(screen.getByText("Live")).toBeInTheDocument();
     expect(screen.getByText("Working through the numbers now")).toBeInTheDocument();
     expect(screen.queryByText("Thinking...")).not.toBeInTheDocument();
     expect(container.querySelector(".max-h-52.overflow-y-auto")).not.toBeNull();
+  });
+
+  it("renders one combined live panel when feedback and draft are both streaming", () => {
+    mockApp.conversationStatus = {
+      conversation_id: "conversation-1",
+      processing: true,
+    };
+    mockApp.conversationStreaming = true;
+    mockApp.conversationIsProcessing = true;
+    mockApp.conversationPhaseLabel = "Running";
+    mockApp.visibleConversationEvents = [
+      makeEvent(1, "user_message", { text: "hello" }),
+    ];
+    mockApp.streamingThinking = "Checking prior context now.";
+    mockApp.streamingText = "I found the relevant thread details.";
+
+    const { container } = render(<ThreadsTab />);
+
+    expect(screen.getByText("Live")).toBeInTheDocument();
+    expect(screen.getByText("Checking prior context now.")).toBeInTheDocument();
+    expect(screen.getByText("I found the relevant thread details.")).toBeInTheDocument();
+    expect(container.querySelectorAll(".group.relative.pr-8").length).toBeGreaterThanOrEqual(1);
   });
 
   it("renders optimistic outgoing user bubbles immediately with a sending state", () => {

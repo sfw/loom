@@ -150,7 +150,9 @@ export default function AppShell() {
         : (workspace.active_run_count ?? 0)
     )
   ), 0);
-  const pendingApprovals = approvalInbox.length;
+  const pendingApprovals = overviewWorkspace
+    ? Number(overview?.pending_approvals_count || 0)
+    : approvalInbox.length;
   const conversationCount = overview?.recent_conversations?.length ?? 0;
   const runCount = overview?.recent_runs?.length ?? 0;
   const closeConfirmedRef = useRef(false);

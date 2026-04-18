@@ -126,37 +126,68 @@ function ThinkingIndicator({
 
 function LiveFeedbackPanel({
   text,
+  draftText,
   markdownComponents,
 }: {
   text: string;
+  draftText?: string;
   markdownComponents: Parameters<typeof Markdown>[0]["components"];
 }) {
+  const hasThinking = Boolean(text.trim());
+  const hasDraft = Boolean((draftText || "").trim());
+
   return (
-    <div className="rounded-xl border border-[#8a9a7b]/20 bg-[#11150f] px-4 py-3 shadow-[inset_0_1px_0_rgba(163,179,150,0.06)]">
-      <div className="mb-2 flex items-center justify-between gap-3">
-        <div className="inline-flex items-center gap-2 rounded-full border border-[#8a9a7b]/25 bg-[#8a9a7b]/10 px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-[#a3b396]">
+    <div className="group relative pr-8">
+      <div className="rounded-xl border border-[#8a9a7b]/10 bg-[#8a9a7b]/[0.05] px-4 py-3">
+        <span className="float-right ml-3 mt-0.5 inline-flex items-center gap-1.5 rounded-full bg-[#8a9a7b]/15 px-1.5 py-px text-[9px] font-medium text-[#a3b396]">
           <span className="h-1.5 w-1.5 rounded-full bg-[#a3b396] animate-pulse" />
-          Live Feedback
-        </div>
-        <span className="text-[10px] text-zinc-500">Streaming</span>
-      </div>
-      <div className="max-h-52 overflow-y-auto pr-1">
-        <div className={cn(
-          "prose prose-invert prose-sm max-w-none",
-          "prose-p:my-2 prose-p:leading-relaxed",
-          "prose-headings:mb-2 prose-headings:mt-3 prose-headings:font-semibold prose-headings:text-zinc-200",
-          "prose-h1:text-lg prose-h2:text-base prose-h3:text-sm",
-          "prose-code:rounded prose-code:bg-zinc-800 prose-code:px-1 prose-code:py-0.5 prose-code:text-xs prose-code:text-[#bec8b4] prose-code:before:content-none prose-code:after:content-none",
-          "prose-pre:rounded-lg prose-pre:border prose-pre:border-zinc-800 prose-pre:bg-zinc-900 prose-pre:text-xs",
-          "prose-a:text-[#a3b396] prose-a:no-underline hover:prose-a:underline",
-          "prose-strong:text-zinc-200 prose-em:text-zinc-300",
-          "prose-ul:my-2 prose-ol:my-2 prose-li:my-0.5",
-          "prose-blockquote:border-[#8a9a7b]/30 prose-blockquote:text-zinc-400",
-          "prose-hr:border-zinc-800",
-          "prose-th:text-zinc-300 prose-td:text-zinc-400",
-          "text-[13px] leading-6 text-zinc-300",
-        )}>
-          <Markdown remarkPlugins={[remarkGfm]} components={markdownComponents}>{text}</Markdown>
+          Live
+        </span>
+        <div className="max-h-52 overflow-y-auto pr-1">
+        {hasThinking && (
+          <div className={cn(
+            "prose prose-invert prose-sm max-w-none",
+            "prose-p:my-1.5 prose-p:leading-relaxed",
+            "prose-headings:mb-1.5 prose-headings:mt-3 prose-headings:font-semibold prose-headings:text-zinc-200",
+            "prose-h1:text-lg prose-h2:text-base prose-h3:text-sm",
+            "prose-code:rounded prose-code:bg-zinc-800 prose-code:px-1 prose-code:py-0.5 prose-code:text-xs prose-code:text-[#bec8b4] prose-code:before:content-none prose-code:after:content-none",
+            "prose-pre:rounded-lg prose-pre:border prose-pre:border-zinc-800 prose-pre:bg-zinc-900 prose-pre:text-xs",
+            "prose-a:text-[#a3b396] prose-a:no-underline hover:prose-a:underline",
+            "prose-strong:text-zinc-200 prose-em:text-zinc-300",
+            "prose-ul:my-1.5 prose-ol:my-1.5 prose-li:my-0.5",
+            "prose-blockquote:border-[#8a9a7b]/30 prose-blockquote:text-zinc-400",
+            "prose-hr:border-zinc-800",
+            "prose-th:text-zinc-300 prose-td:text-zinc-400",
+            "text-zinc-300",
+          )}>
+            <Markdown remarkPlugins={[remarkGfm]} components={markdownComponents}>{text}</Markdown>
+          </div>
+        )}
+        {hasDraft && (
+          <div className={cn(
+            hasThinking && "mt-3 border-t border-[#8a9a7b]/15 pt-3",
+            "text-zinc-300",
+          )}>
+            <div className={cn(
+              "prose prose-invert prose-sm max-w-none",
+              "prose-p:my-1.5 prose-p:leading-relaxed",
+              "prose-headings:mb-1.5 prose-headings:mt-3 prose-headings:font-semibold prose-headings:text-zinc-200",
+              "prose-h1:text-lg prose-h2:text-base prose-h3:text-sm",
+              "prose-code:rounded prose-code:bg-zinc-800 prose-code:px-1 prose-code:py-0.5 prose-code:text-xs prose-code:text-[#bec8b4] prose-code:before:content-none prose-code:after:content-none",
+              "prose-pre:rounded-lg prose-pre:border prose-pre:border-zinc-800 prose-pre:bg-zinc-900 prose-pre:text-xs",
+              "prose-a:text-[#a3b396] prose-a:no-underline hover:prose-a:underline",
+              "prose-strong:text-zinc-200 prose-em:text-zinc-300",
+              "prose-ul:my-1.5 prose-ol:my-1.5 prose-li:my-0.5",
+              "prose-blockquote:border-[#8a9a7b]/30 prose-blockquote:text-zinc-400",
+              "prose-hr:border-zinc-800",
+              "prose-th:text-zinc-300 prose-td:text-zinc-400",
+              "text-zinc-300",
+            )}>
+              <Markdown remarkPlugins={[remarkGfm]} components={markdownComponents}>{draftText || ""}</Markdown>
+              <span className="ml-0.5 inline-block h-4 w-1 rounded-full bg-[#a3b396]/70 align-[-0.15em] animate-pulse" />
+            </div>
+          </div>
+        )}
         </div>
       </div>
     </div>
@@ -1517,6 +1548,7 @@ export default function ThreadsTab() {
         {showLiveFeedback && (
           <LiveFeedbackPanel
             text={streamingThinking}
+            draftText={showLiveAssistantDraft ? streamingText : ""}
             markdownComponents={markdownComponents}
           />
         )}
@@ -1527,7 +1559,7 @@ export default function ThreadsTab() {
           </div>
         )}
 
-        {showLiveAssistantDraft && (
+        {showLiveAssistantDraft && !showLiveFeedback && (
           <div className="group relative pr-8">
             <div className="rounded-xl border border-[#8a9a7b]/10 bg-[#8a9a7b]/[0.05] px-4 py-3">
               <span className="float-right ml-3 mt-0.5 inline-flex items-center gap-1.5 rounded-full bg-[#8a9a7b]/15 px-1.5 py-px text-[9px] font-medium text-[#a3b396]">

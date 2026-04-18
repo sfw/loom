@@ -655,6 +655,94 @@ describe("useWorkspace", () => {
     expect(apiMocks.fetchWorkspaceOverview).not.toHaveBeenCalled();
   });
 
+  it("reconciles stale pending approval counts from a repair refresh", async () => {
+    vi.useFakeTimers();
+    let notificationEvent: ((event: any) => void) | undefined;
+    apiMocks.subscribeNotificationsStream.mockImplementation(((
+      _workspaceId: string,
+      onEvent: (event: unknown) => void,
+    ) => {
+      notificationEvent = onEvent as (event: any) => void;
+      return () => {};
+    }) as any);
+
+    const { result } = renderHook(() => {
+      const [workspaces, setWorkspaces] = useState([{
+        id: "workspace-1",
+        canonical_path: "/tmp/workspace",
+        display_name: "Workspace 1",
+        metadata: {},
+        is_archived: false,
+        sort_order: 0,
+        conversation_count: 0,
+        run_count: 0,
+        active_run_count: 0,
+      }] as any);
+      return useWorkspace({
+        selectedWorkspaceId: "workspace-1",
+        selectedConversationId: "",
+        selectedRunId: "",
+        setSelectedWorkspaceId: vi.fn(),
+        showArchivedWorkspaces: false,
+        setShowArchivedWorkspaces: vi.fn(),
+        createParentPath: "/tmp",
+        setCreateParentPath: vi.fn(),
+        workspaces,
+        setWorkspaces,
+        runtime: null,
+        setError: vi.fn(),
+        setNotice: vi.fn(),
+        activeTab: "overview",
+        setActiveTab: vi.fn(),
+        setSelectedConversationId: vi.fn(),
+        setSelectedRunId: vi.fn(),
+      });
+    });
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    apiMocks.fetchApprovals.mockClear();
+    apiMocks.fetchWorkspaceOverview.mockClear();
+    apiMocks.fetchApprovals.mockResolvedValueOnce([]);
+
+    act(() => {
+      notificationEvent?.({
+        id: "evt-approval-1",
+        stream_id: 11,
+        event_type: "approval_requested",
+        created_at: "2026-03-27T00:00:00Z",
+        workspace_id: "workspace-1",
+        workspace_path: "/tmp/workspace",
+        workspace_display_name: "Workspace 1",
+        task_id: "",
+        conversation_id: "",
+        approval_id: "",
+        kind: "task_approval",
+        title: "Task approval",
+        summary: "Pending approval",
+        payload: {},
+      });
+    });
+
+    expect(result.current.overview?.pending_approvals_count).toBe(1);
+    expect(result.current.approvalInbox).toEqual([]);
+
+    act(() => {
+      vi.advanceTimersByTime(200);
+    });
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(apiMocks.fetchApprovals).toHaveBeenCalledWith("workspace-1");
+    expect(result.current.overview?.pending_approvals_count).toBe(0);
+    expect(result.current.approvalInbox).toEqual([]);
+  });
+
   it("preserves the loaded workspace surface during a disconnect and refreshes on reconnect", async () => {
     const initialProps: { connectionState: "connected" | "failed" } = {
       connectionState: "connected",

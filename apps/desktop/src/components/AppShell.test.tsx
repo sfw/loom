@@ -208,6 +208,23 @@ describe("AppShell close confirmation", () => {
     expect(screen.queryByText("2 running")).not.toBeInTheDocument();
   });
 
+  it("uses the selected workspace overview count for the pending chip when the inbox drifts", () => {
+    mockApp.approvalInbox = Array.from({ length: 4 }, (_, index) => ({ id: `approval-${index}` }));
+    mockApp.overview = {
+      workspace: {
+        ...mockApp.selectedWorkspaceSummary,
+      },
+      recent_conversations: [],
+      recent_runs: [],
+      pending_approvals_count: 0,
+      counts: {},
+    };
+
+    render(<AppShell />);
+
+    expect(screen.queryByText("4")).not.toBeInTheDocument();
+  });
+
   it("keeps the shell visible and shows a reconnect banner when cached data exists", () => {
     mockApp.connectionState = "failed";
 
