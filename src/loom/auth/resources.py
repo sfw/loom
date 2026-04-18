@@ -803,19 +803,9 @@ def _mcp_view_uses_external_auth(view: object) -> bool:
     if server is None:
         return False
 
-    server_type = str(getattr(server, "type", "") or "").strip().lower()
-    oauth = getattr(server, "oauth", None)
-    oauth_enabled = False
-    if isinstance(oauth, dict):
-        oauth_enabled = _parse_bool(oauth.get("enabled"), default=False)
-    elif oauth is not None:
-        oauth_enabled = _parse_bool(getattr(oauth, "enabled", False), default=False)
-
-    # Remote aliases with OAuth enabled are MCP-owned by default.
-    if server_type == "remote" and oauth_enabled:
-        return True
-
-    # Backward-compatible fallback for legacy mcp-remote command specs.
+    # Legacy `mcp-remote` wrapper commands still own their auth lifecycle
+    # outside Loom's `/auth` account model, so avoid generating misleading
+    # local draft accounts for them.
     command = str(getattr(server, "command", "") or "").strip().lower()
     raw_args = getattr(server, "args", ())
     args: list[str] = []
@@ -957,6 +947,16 @@ def discover_auth_resources(
                     display_name=f"MCP: {alias}",
                     provider=alias,
                     source="mcp",
+                    modes=(
+                        ("oauth2_pkce",)
+                        if bool(getattr(view.server.oauth, "enabled", False))
+                        else ()
+                    ),
+                    scopes=tuple(
+                        str(scope).strip()
+                        for scope in list(getattr(view.server.oauth, "scopes", []) or [])
+                        if str(scope).strip()
+                    ),
                 )
                 existing = discovered_by_key.get(discovery_key)
                 if existing is None:

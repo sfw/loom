@@ -1514,23 +1514,19 @@ class TestCommandPaletteProcessActions:
         input_widget = SimpleNamespace(value="/s", cursor_position=0)
         app.query_one = MagicMock(return_value=input_widget)
 
-        assert app._apply_slash_tab_completion(reverse=False) is True
-        assert input_widget.value == "/sessions"
+        candidates = app._slash_completion_candidates("/s")
+        assert candidates
+        assert {"/session", "/sessions", "/setup", "/steer", "/stop"}.issubset(candidates)
+
+        seen: list[str] = []
+        for _ in candidates:
+            assert app._apply_slash_tab_completion(reverse=False) is True
+            seen.append(input_widget.value)
+
+        assert seen == candidates
 
         assert app._apply_slash_tab_completion(reverse=False) is True
-        assert input_widget.value == "/session"
-
-        assert app._apply_slash_tab_completion(reverse=False) is True
-        assert input_widget.value == "/stop"
-
-        assert app._apply_slash_tab_completion(reverse=False) is True
-        assert input_widget.value == "/steer"
-
-        assert app._apply_slash_tab_completion(reverse=False) is True
-        assert input_widget.value == "/setup"
-
-        assert app._apply_slash_tab_completion(reverse=False) is True
-        assert input_widget.value == "/sessions"
+        assert input_widget.value == candidates[0]
 
     def test_slash_tab_completion_cycles_backward(self):
         from loom.tui.app import LoomApp
@@ -1543,8 +1539,19 @@ class TestCommandPaletteProcessActions:
         input_widget = SimpleNamespace(value="/s", cursor_position=0)
         app.query_one = MagicMock(return_value=input_widget)
 
+        candidates = app._slash_completion_candidates("/s")
+        assert candidates
+        assert {"/session", "/sessions", "/setup", "/steer", "/stop"}.issubset(candidates)
+
+        seen: list[str] = []
+        for _ in candidates:
+            assert app._apply_slash_tab_completion(reverse=True) is True
+            seen.append(input_widget.value)
+
+        assert seen == list(reversed(candidates))
+
         assert app._apply_slash_tab_completion(reverse=True) is True
-        assert input_widget.value == "/setup"
+        assert input_widget.value == candidates[-1]
 
     def test_slash_tab_completion_cycles_tool_names_for_tool_command(self):
         from loom.tui.app import LoomApp

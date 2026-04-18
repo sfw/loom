@@ -245,7 +245,7 @@ class AnthropicProvider(ModelProvider):
             elif role == "user":
                 anthropic_messages.append({
                     "role": "user",
-                    "content": msg.get("content", ""),
+                    "content": self._build_user_message_content(msg),
                 })
 
             else:
@@ -259,6 +259,78 @@ class AnthropicProvider(ModelProvider):
                 })
 
         return system_prompt, anthropic_messages
+
+    @staticmethod
+    def _attachment_path_text(message: dict) -> str:
+        workspace_paths = message.get("workspace_paths")
+        if not isinstance(workspace_paths, list) or not workspace_paths:
+            return ""
+        lines = [
+            str(path or "").strip()
+            for path in workspace_paths
+            if str(path or "").strip()
+        ]
+        if not lines:
+            return ""
+        return "Attached workspace context:\n" + "\n".join(f"- {path}" for path in lines)
+
+    def _build_user_message_content(self, message: dict) -> str | list[dict]:
+        text_segments = [
+            str(message.get("content", "") or "").strip(),
+            self._attachment_path_text(message),
+        ]
+        base_text = "\n\n".join(segment for segment in text_segments if segment)
+        blocks = message.get("content_blocks")
+        if not isinstance(blocks, list) or not blocks:
+            return base_text
+
+        anthropic_blocks: list[dict] = []
+        if base_text:
+            anthropic_blocks.append({"type": "text", "text": base_text})
+
+        caps = self._capabilities
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            btype = str(block.get("type", "") or "").strip().lower()
+            if btype == "text":
+                text = str(block.get("text", "") or "")
+                if text:
+                    anthropic_blocks.append({"type": "text", "text": text})
+                continue
+            if btype == "image" and caps.vision:
+                source_path = str(block.get("source_path", "") or "").strip()
+                image_data = encode_image_base64(Path(source_path)) if source_path else None
+                if image_data:
+                    anthropic_blocks.append({
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": block.get("media_type", "image/png"),
+                            "data": image_data,
+                        },
+                    })
+                    continue
+            if btype == "document" and caps.native_pdf:
+                source_path = str(block.get("source_path", "") or "").strip()
+                doc_data = encode_file_base64(Path(source_path)) if source_path else None
+                if doc_data:
+                    anthropic_blocks.append({
+                        "type": "document",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "application/pdf",
+                            "data": doc_data,
+                        },
+                    })
+                    continue
+            fallback = str(block.get("text_fallback", "") or "").strip()
+            if fallback:
+                anthropic_blocks.append({"type": "text", "text": fallback})
+
+        if not anthropic_blocks:
+            return base_text
+        return anthropic_blocks
 
     def _convert_tools(self, tools: list[dict] | None) -> list[dict] | None:
         """Convert OpenAI-format tool schemas to Anthropic format."""

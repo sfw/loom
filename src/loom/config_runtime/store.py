@@ -237,6 +237,7 @@ class ConfigRuntimeStore:
                 "supports_persist": entry.supports_persist,
                 "application_class": entry.application_class,
                 "requires_restart": entry.requires_restart,
+                "exposure_level": entry.exposure_level,
                 "configured": configured,
                 "configured_display": display_value(
                     configured,

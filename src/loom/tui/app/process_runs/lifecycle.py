@@ -574,6 +574,8 @@ async def execute_process_run(self, run_id: str) -> None:
             return
         if isinstance(data, dict):
             run.task_id = str(data.get("task_id", "") or run.task_id)
+            if run.task_id:
+                self._persist_process_run_conversation_link(run)
             event_log_path = str(data.get("event_log_path", "")).strip()
             if event_log_path:
                 self._append_process_run_activity(

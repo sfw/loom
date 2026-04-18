@@ -545,8 +545,9 @@ class AuthManagerScreen(Vertical):
                         )
                         yield Label(
                             "OAuth token storage reference. Must be keychain://... "
-                            "and should stay separate from MCP alias token stores. "
-                            "Default: keychain://loom/<provider>/<profile>/tokens.",
+                            "or another writable secret ref. Do not point this at "
+                            "legacy MCP alias token storage. Default: "
+                            "keychain://loom/<provider>/<profile>/tokens.",
                             classes="auth-help",
                         )
                     with Vertical(id="auth-scopes-section"):
@@ -1953,6 +1954,23 @@ class AuthManagerScreen(Vertical):
                     severity="warning",
                 )
             return
+        if str(getattr(profile, "status", "ready") or "ready").strip().lower() == "draft":
+            try:
+                target = resolve_auth_write_path(
+                    explicit_path=self._explicit_auth_path,
+                )
+                await asyncio.to_thread(
+                    upsert_auth_profile,
+                    target,
+                    replace(profile, status="ready"),
+                    True,
+                )
+                await self._refresh_summary()
+            except Exception as e:
+                self.notify(
+                    f"OAuth login warning: failed to promote draft to ready: {e}",
+                    severity="warning",
+                )
         auth_url = start_payload.get("authorization_url", "") or result.authorization_url
         if auth_url:
             self.notify(f"OAuth login URL: {auth_url}")
@@ -2017,6 +2035,23 @@ class AuthManagerScreen(Vertical):
                 severity="error",
             )
             return
+        if str(getattr(profile, "status", "ready") or "ready").strip().lower() == "draft":
+            try:
+                target = resolve_auth_write_path(
+                    explicit_path=self._explicit_auth_path,
+                )
+                await asyncio.to_thread(
+                    upsert_auth_profile,
+                    target,
+                    replace(profile, status="ready"),
+                    True,
+                )
+                await self._refresh_summary()
+            except Exception as e:
+                self.notify(
+                    f"OAuth refresh warning: failed to promote draft to ready: {e}",
+                    severity="warning",
+                )
         if result.expires_at is not None:
             self.notify(
                 "OAuth refresh complete: "

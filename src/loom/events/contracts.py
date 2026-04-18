@@ -32,6 +32,7 @@ _register(
         types.TASK_COMPLETED,
         types.TASK_FAILED,
         types.TASK_CANCELLED,
+        types.TASK_RESTARTED,
         types.TASK_PAUSED,
         types.TASK_RESUMED,
         types.TASK_INJECTED,
@@ -58,11 +59,12 @@ _register(
         types.SUBTASK_BLOCKED,
         types.SUBTASK_OUTPUT_CONFLICT_DEFERRED,
         types.SUBTASK_OUTPUT_CONFLICT_STARVATION_WARNING,
-        types.SUBTASK_POLICY_RECONCILED,
         types.SUBTASK_RETRYING,
     ),
     "subtask",
 )
+
+_register((types.SUBTASK_POLICY_RECONCILED,), "task")
 
 _register(
     (
@@ -107,6 +109,8 @@ _register(
     (
         types.APPROVAL_REQUESTED,
         types.APPROVAL_RECEIVED,
+        types.APPROVAL_REJECTED,
+        types.APPROVAL_TIMED_OUT,
         types.ASK_USER_REQUESTED,
         types.ASK_USER_ANSWERED,
         types.ASK_USER_TIMEOUT,

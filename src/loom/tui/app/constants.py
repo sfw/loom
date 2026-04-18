@@ -75,8 +75,11 @@ _SLASH_COMMANDS: tuple[SlashCommandSpec, ...] = (
     ),
     SlashCommandSpec(
         canonical="/history",
-        usage="[older]",
-        description="load older chat history for current session",
+        usage=(
+            "[older|latest|transcript [on|off]|thinking [show|hide]|"
+            "search <query>|next|prev|clear-search]"
+        ),
+        description="browse, search, and clean up the current chat transcript",
     ),
     SlashCommandSpec(
         canonical="/learned",

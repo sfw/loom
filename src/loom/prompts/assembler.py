@@ -329,6 +329,19 @@ class PromptAssembler:
                     + "\n\nPROCESS EXECUTION CONSTRAINTS:\n"
                     + executor_constraints
                 )
+            if self._process.verifier_tool_success_policy() == "development_balanced":
+                from loom.engine.verification.development import (
+                    development_executor_constraints,
+                    development_helper_tool_guidance,
+                )
+
+                constraints = (
+                    constraints
+                    + "\n\nDEVELOPMENT EXECUTION CONSTRAINTS:\n"
+                    + development_executor_constraints()
+                    + "\n\nDEVELOPMENT HELPER TOOL GUIDANCE:\n"
+                    + development_helper_tool_guidance()
+                )
 
         metadata = task.metadata if isinstance(task.metadata, dict) else {}
         raw_read_roots = metadata.get("read_roots", [])
@@ -340,6 +353,13 @@ class PromptAssembler:
                 text = str(item or "").strip()
                 if text:
                     read_roots.append(text)
+        raw_attached_read_path_map = metadata.get("attached_read_path_map", {})
+        attached_read_paths: list[str] = []
+        if isinstance(raw_attached_read_path_map, dict):
+            for item in raw_attached_read_path_map:
+                text = str(item or "").strip()
+                if text:
+                    attached_read_paths.append(text)
         if read_roots:
             workspace_name = ""
             try:
@@ -364,6 +384,14 @@ class PromptAssembler:
                 f"{roots_text}\n"
                 "- Use explicit `path` when exploring reference roots so reads are "
                 "unambiguous."
+            )
+        if attached_read_paths:
+            attached_text = "\n".join(f"- {path}" for path in attached_read_paths[:8])
+            constraints += (
+                "\n\nATTACHED READ-ONLY CONTEXT:\n"
+                "- These explicit attached workspace paths are available for read-only access:\n"
+                f"{attached_text}\n"
+                "- Prefer these exact relative paths when opening attached files or directories."
             )
 
         sections = [
@@ -560,6 +588,67 @@ class PromptAssembler:
                     "\n\nPROCESS VERIFIER CONSTRAINTS:\n"
                     + verifier_constraints
                 )
+            if self._process.verifier_tool_success_policy() == "development_balanced":
+                from loom.engine.verification.development import (
+                    development_helper_tool_guidance,
+                    development_verifier_constraints,
+                )
+
+                instructions += (
+                    "\n\nDEVELOPMENT VERIFIER CONSTRAINTS:\n"
+                    + development_verifier_constraints()
+                    + "\n\nDEVELOPMENT HELPER TOOL GUIDANCE:\n"
+                    + development_helper_tool_guidance()
+                )
+                capability_contracts = self._process.verifier_capability_contracts()
+                if capability_contracts:
+                    capability_lines = []
+                    for item in capability_contracts:
+                        label = str(item.get("capability", "") or "").strip()
+                        if not label:
+                            continue
+                        optionality = (
+                            "optional"
+                            if bool(item.get("optional", False))
+                            else "required"
+                        )
+                        detail_parts = [optionality]
+                        helper = str(item.get("helper", "") or "").strip()
+                        if helper:
+                            detail_parts.append(f"helper={helper}")
+                        name = str(item.get("name", "") or "").strip()
+                        if name:
+                            detail_parts.append(name)
+                        capability_lines.append(
+                            f"- {label}: {', '.join(detail_parts)}"
+                        )
+                    if capability_lines:
+                        instructions += (
+                            "\n\nDEVELOPMENT VERIFICATION CAPABILITIES:\n"
+                            + "\n".join(capability_lines)
+                        )
+                helper_specs = self._process.verifier_helper_specs()
+                if helper_specs:
+                    helper_lines = []
+                    for item in helper_specs:
+                        helper = str(item.get("helper", "") or "").strip()
+                        capability = str(item.get("capability", "") or "").strip()
+                        description = str(item.get("description", "") or "").strip()
+                        bound = bool(item.get("bound", False))
+                        if not helper:
+                            continue
+                        line = f"- {helper}"
+                        if capability:
+                            line += f" ({capability})"
+                        line += ", available" if bound else ", registered"
+                        if description:
+                            line += f": {description}"
+                        helper_lines.append(line)
+                    if helper_lines:
+                        instructions += (
+                            "\n\nDEVELOPMENT HELPER REGISTRY:\n"
+                            + "\n".join(helper_lines)
+                        )
             output_contract = self._process.verifier_output_contract()
             metadata_fields = output_contract.get("metadata_fields", [])
             if isinstance(metadata_fields, list) and metadata_fields:

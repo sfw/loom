@@ -19,6 +19,21 @@ MCP server config layers are resolved in this order:
 3. `~/.loom/mcp.toml`
 4. Legacy `[mcp]` section inside `loom.toml`
 
+## Desktop Settings API
+
+The workspace-first desktop shell uses the runtime config registry instead of a
+parallel settings system.
+
+- `GET /settings` returns entries grouped into `basic` and `advanced`
+- `PATCH /settings` applies runtime overrides or persisted writes
+- `GET /workspaces/{id}/settings` returns workspace-local JSON overrides
+- `PATCH /workspaces/{id}/settings` updates workspace-local JSON overrides
+
+The grouped `basic` section currently includes:
+
+- `execution.ask_user_policy`
+- `execution.cowork_tool_exposure_mode`
+
 ## `loom.toml` Reference
 
 ### `[server]`
@@ -27,6 +42,9 @@ MCP server config layers are resolved in this order:
 | --- | --- | --- | --- |
 | `host` | `string` | `"127.0.0.1"` | API bind host for `loom serve`. |
 | `port` | `int` | `9000` | API bind port for `loom serve`. |
+
+`loomd` uses the same `[server]` settings by default, but can override them at
+launch time with `--host` and `--port`.
 
 ### `[models.<name>]`
 
@@ -61,6 +79,15 @@ Recommended two-model split:
 | --- | --- | --- | --- |
 | `default_path` | `string` | `"~/projects"` | Default workspace root when none is supplied. |
 | `scratch_dir` | `string` | `"~/.loom/scratch"` | Scratch/temp storage path. |
+
+`loomd` can override both at launch time:
+
+- `--scratch-dir <path>`
+- `--workspace-default-path <path>`
+- `--database-path <path>`
+
+The Tauri desktop shell uses these overrides to keep desktop-owned runtime
+state separate from the default CLI/TUI database and scratch paths.
 
 ### `[execution]`
 
@@ -100,6 +127,7 @@ Recommended two-model split:
 | `enable_wp_tools` | `bool` | `true` | Enable WordPress development tools (`wp_cli`, `wp_env`, scaffolding, quality gate). |
 | `wp_high_risk_requires_confirmation` | `bool` | `true` | Require explicit confirmation for high-risk WordPress operations. |
 | `agent_tools_allowed_providers` | `list[string]` | `["codex","claude_code","opencode"]` | Restrict which external agent providers are exposed. |
+| `tool_binary_overrides` | `map[string,string]` | `{}` | Optional explicit binary paths/commands keyed by tool/provider/binary name (for example `codex`, `wp`, `npx`). |
 | `agent_tools_max_timeout_seconds` | `int` | `1800` | Max allowed timeout for coding-agent tool calls. |
 | `agent_tools_default_network_mode` | `string` | `"on"` | Default network mode for coding-agent tool calls (`on` or `off`). |
 
@@ -324,6 +352,14 @@ Operational notes:
   ephemeral fallback for existing files).
 - New DB creation failures are blocking by default; pass CLI flag
   `--ephemeral` to explicitly allow ephemeral fallback.
+- Loom's local SQLite runtime is explicitly tuned for the single-sidecar
+  desktop case: WAL mode, `busy_timeout=5000`, `synchronous=NORMAL`,
+  `wal_autocheckpoint=2000`, `temp_store=MEMORY`, and a small long-lived
+  read/write connection set instead of per-query connection churn.
+- Event compliance persistence is batched through an in-memory queue before
+  SQLite writes. This improves latency under bursty run/conversation traffic,
+  but it also means durability is slightly delayed by a short queue flush
+  window rather than one commit per emitted event.
 - Use `loom db status|migrate|doctor|backup` for migration operations.
 - See `docs/DB-MIGRATIONS.md` for schema authoring and upgrade policy.
 
@@ -431,8 +467,9 @@ Remote MCP aliases additionally support:
 Operational OAuth notes:
 - Browser-first login: `uv run loom mcp auth login <alias>`.
 - Manual fallback: `--manual-token --access-token ...` or `--access-token-env ...`.
-- MCP alias OAuth tokens are stored in `~/.loom/mcp_oauth_tokens.json`.
-- `/auth` profile token refs remain separate (`~/.loom/auth.toml` + secret refs).
+- New MCP OAuth writes use Loom secret refs and secure writable storage.
+- `~/.loom/mcp_oauth_tokens.json` remains readable only as a legacy migration path.
+- `/auth` account profiles remain the durable home for token refs and account identity.
 
 #### MCP OAuth Failure Runbook
 1. Check alias auth state: `uv run loom mcp auth status <alias>`.

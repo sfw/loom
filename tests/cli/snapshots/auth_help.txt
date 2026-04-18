@@ -8,6 +8,7 @@ Options:
 Commands:
   audit    Audit auth resources, bindings, and legacy defaults.
   check    Validate auth profile references and defaults.
+  explain  Explain where an account is used, its status, and the next...
   list     List merged auth profiles and defaults.
   migrate  Migrate legacy provider defaults to resource bindings/defaults.
   profile  Manage auth profile definitions.

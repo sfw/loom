@@ -43,6 +43,7 @@ _MEDIA_TYPE_EXTENSION = {
     "image/gif": ".gif",
     "image/webp": ".webp",
     "text/html": ".html",
+    "text/markdown": ".md",
     "text/plain": ".txt",
 }
 
@@ -84,11 +85,13 @@ def _iter_scope_dirs(root: Path) -> list[Path]:
 
 
 def _guess_extension(*, media_type: str, source_url: str) -> str:
+    ext = _MEDIA_TYPE_EXTENSION.get(str(media_type or "").strip().lower())
+    if ext:
+        return ext
     parsed = urlparse(source_url or "")
     suffix = Path(parsed.path).suffix.lower()
     if suffix:
         return suffix
-    ext = _MEDIA_TYPE_EXTENSION.get(str(media_type or "").strip().lower())
     return ext or ".bin"
 
 

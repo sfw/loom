@@ -139,10 +139,22 @@ class TestTaskStateManager:
     def test_exists(self, tmp_path: Path):
         mgr = TaskStateManager(tmp_path)
         assert not mgr.exists("nonexistent")
+        assert (tmp_path / "tasks" / "nonexistent").exists() is False
 
         task = _make_task()
         mgr.create(task)
         assert mgr.exists("test-123")
+
+    def test_delete_removes_task_directory(self, tmp_path: Path):
+        mgr = TaskStateManager(tmp_path)
+        task = _make_task()
+        mgr.create(task)
+        mgr.save_evidence_records(task.id, [{"evidence_id": "EV-1"}])
+
+        mgr.delete(task.id)
+
+        assert mgr.exists(task.id) is False
+        assert (tmp_path / "tasks" / task.id).exists() is False
 
     def test_load_missing_raises(self, tmp_path: Path):
         mgr = TaskStateManager(tmp_path)

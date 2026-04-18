@@ -12,12 +12,45 @@ from typing import TYPE_CHECKING
 from loom.processes.phase_alignment import infer_phase_id_for_subtask
 from loom.state.task_state import Subtask
 
-from .types import Check, VerificationResult
+from .development import (
+    ToolFailureDisposition,
+    build_development_verification_summary,
+    development_product_reason_code,
+    development_report_consistency_checks,
+    development_runtime_probe_capability,
+    development_validation_artifact_snapshot,
+    development_verifier_reason_code,
+    extract_claude_code_prompt,
+    extract_shell_execute_command,
+    format_development_failure_detail,
+    looks_like_development_browser_probe,
+    looks_like_development_runtime_probe,
+    merge_development_validation_snapshot,
+)
+from .types import Check, VerificationResult, severity_class_for_reason_code
 
 if TYPE_CHECKING:
     from loom.processes.schema import ProcessDefinition
 
 logger = logging.getLogger(__name__)
+
+_DEVELOPMENT_HELPER_CAPABILITIES = {
+    "run_test_suite": "command_execution",
+    "run_build_check": "command_execution",
+    "serve_static": "service_runtime",
+    "http_assert": "service_runtime",
+    "browser_assert": "browser_runtime",
+    "render_verification_report": "report_rendering",
+}
+_DEVELOPMENT_HELPER_REASON_CODES = frozenset({
+    "dev_verifier_timeout",
+    "dev_verifier_capability_unavailable",
+    "dev_test_failed",
+    "dev_build_failed",
+    "dev_contract_failed",
+    "dev_browser_check_failed",
+    "dev_report_contract_violation",
+})
 
 _HTTP_STATUS_PATTERN = re.compile(
     r"\b(?:http|status(?:\s*code)?)\s*[:=]?\s*([1-5]\d{2})\b",
@@ -51,8 +84,19 @@ class DeterministicVerifier:
     _ADVISORY_TOOL_FAILURES = frozenset({"web_fetch", "web_fetch_html", "web_search"})
     _TOOL_SUCCESS_POLICIES = frozenset({
         "all_tools_hard",
+        "development_balanced",
+        "method_resilient",
         "safety_integrity_only",
     })
+    _WRITE_RETRYABLE_TOOLS = frozenset({
+        "write_file",
+        "edit_file",
+        "document_write",
+        "spreadsheet",
+        "move_file",
+        "delete_file",
+    })
+    _WEB_TOOLS = frozenset({"web_fetch", "web_fetch_html", "web_search"})
     _PLACEHOLDER_RULE_HEURISTIC_MARKERS = (
         "placeholder",
         "todo",
@@ -86,32 +130,14 @@ class DeterministicVerifier:
     ) -> str:
         if process is None:
             return "all_tools_hard"
-        policy = getattr(process, "verification_policy", None)
-        static_checks = getattr(policy, "static_checks", {})
-        if isinstance(static_checks, dict):
-            raw = str(static_checks.get("tool_success_policy", "") or "").strip().lower()
+        resolver = getattr(process, "verifier_tool_success_policy", None)
+        if callable(resolver):
+            raw = str(
+                resolver(include_adhoc_fallback=True) or "",
+            ).strip().lower()
             if raw in cls._TOOL_SUCCESS_POLICIES:
                 return raw
-        if cls._is_adhoc_process(process):
-            # Backward compatibility for cached/generated ad-hoc processes that
-            # predate verification_policy defaults.
-            return "safety_integrity_only"
         return "all_tools_hard"
-
-    @staticmethod
-    def _is_adhoc_process(process: ProcessDefinition) -> bool:
-        tags = getattr(process, "tags", [])
-        if isinstance(tags, list):
-            for tag in tags:
-                if str(tag or "").strip().lower() == "adhoc":
-                    return True
-
-        version = str(getattr(process, "version", "") or "").strip().lower()
-        if version.startswith("adhoc-"):
-            return True
-
-        name = str(getattr(process, "name", "") or "").strip().lower()
-        return name.endswith("-adhoc")
 
     async def verify(
         self,
@@ -129,6 +155,8 @@ class DeterministicVerifier:
         placeholder_findings: list[dict[str, object]] = []
         expected_deliverable_paths: set[str] = set()
         retry_writable_paths: set[str] = set()
+        changed_paths: set[str] = set()
+        development_artifact_snapshot: dict[str, object] = {}
 
         if self._process:
             expected_deliverables = self._expected_deliverables_for_subtask(subtask)
@@ -147,20 +175,27 @@ class DeterministicVerifier:
         # 1. Did tool calls succeed?
         for tc in tool_calls:
             if not tc.result.success:
-                if self._is_advisory_tool_failure(tc.tool, tc.result.error):
+                disposition = self._classify_tool_failure(
+                    subtask=subtask,
+                    tool_name=tc.tool,
+                    tool_args=getattr(tc, "args", {}),
+                    tool_result_data=getattr(tc.result, "data", None),
+                    error=tc.result.error,
+                )
+                if disposition.advisory:
                     checks.append(Check(
                         name=f"tool_{tc.tool}_advisory",
                         passed=True,
                         detail=(
                             "Advisory tool failure (non-blocking): "
-                            f"{tc.result.error or 'unknown error'}"
+                            f"{disposition.detail or tc.result.error or 'unknown error'}"
                         ),
                     ))
                     continue
                 checks.append(Check(
                     name=f"tool_{tc.tool}_success",
                     passed=False,
-                    detail=tc.result.error,
+                    detail=disposition.detail or tc.result.error,
                 ))
                 continue
 
@@ -173,6 +208,9 @@ class DeterministicVerifier:
         if workspace:
             for tc in tool_calls:
                 for f in tc.result.files_changed:
+                    normalized = self._normalize_workspace_relpath(workspace, str(f or ""))
+                    if normalized:
+                        changed_paths.add(normalized)
                     fpath = workspace / f
                     if fpath.exists():
                         fsize = fpath.stat().st_size
@@ -216,6 +254,18 @@ class DeterministicVerifier:
                                     ))
                                 continue
                             checks.append(syntax_check)
+
+            if self._tool_success_policy == "development_balanced":
+                development_artifact_snapshot = development_validation_artifact_snapshot(
+                    workspace=workspace,
+                    changed_paths=changed_paths,
+                )
+                checks.extend(
+                    development_report_consistency_checks(
+                        workspace=workspace,
+                        changed_paths=changed_paths,
+                    ),
+                )
 
         # 4. Process regex rules
         if self._process:
@@ -335,9 +385,12 @@ class DeterministicVerifier:
         if hard_failures:
             reason_code = self._hard_failure_reason_code(hard_failures)
             severity_class = (
-                "hard_invariant"
-                if reason_code == "hard_invariant_failed"
-                else "semantic"
+                severity_class_for_reason_code(reason_code)
+                or (
+                    "hard_invariant"
+                    if reason_code == "hard_invariant_failed"
+                    else "semantic"
+                )
             )
             feedback = self._build_feedback(hard_failures)
         elif recoverable_placeholder_failures:
@@ -354,6 +407,11 @@ class DeterministicVerifier:
             ),
             "advisory_count": len(advisory_hits),
         }
+        if self._tool_success_policy == "development_balanced":
+            metadata["dev_verification_summary"] = merge_development_validation_snapshot(
+                build_development_verification_summary(checks),
+                artifact_snapshot=development_artifact_snapshot,
+            )
         if hard_failures and reason_code:
             metadata["hard_failure_reason_code"] = reason_code
         if placeholder_findings:
@@ -377,6 +435,319 @@ class DeterministicVerifier:
             severity_class=severity_class,
             metadata=metadata,
         )
+
+    def _classify_tool_failure(
+        self,
+        *,
+        subtask: Subtask,
+        tool_name: str,
+        tool_args: object,
+        tool_result_data: object = None,
+        error: str | None,
+    ) -> ToolFailureDisposition:
+        detail = str(error or "").strip()
+        if self._tool_success_policy == "development_balanced":
+            disposition = self._classify_development_tool_failure(
+                subtask=subtask,
+                tool_name=tool_name,
+                tool_args=tool_args,
+                tool_result_data=tool_result_data,
+                error=detail,
+            )
+            if disposition is not None:
+                return disposition
+        structured_reason_code = self._reason_code_from_failure_detail(detail)
+        if structured_reason_code:
+            return ToolFailureDisposition(
+                advisory=False,
+                detail=detail,
+                reason_code=structured_reason_code,
+            )
+        capability_disposition = self._classify_runtime_tool_capability_failure(
+            tool_name=tool_name,
+            tool_result_data=tool_result_data,
+            error=detail,
+        )
+        if capability_disposition is not None:
+            return capability_disposition
+        if self._tool_success_policy != "safety_integrity_only":
+            method_disposition = self._classify_recoverable_method_failure(
+                tool_name=tool_name,
+                tool_result_data=tool_result_data,
+                error=detail,
+            )
+            if method_disposition is not None and (
+                self._tool_success_policy == "method_resilient"
+                or tool_name not in self._ADVISORY_TOOL_FAILURES
+            ):
+                return method_disposition
+        if self._is_advisory_tool_failure(tool_name, detail):
+            return ToolFailureDisposition(advisory=True, detail=detail)
+        return ToolFailureDisposition(advisory=False, detail=detail)
+
+    def _classify_development_tool_failure(
+        self,
+        *,
+        subtask: Subtask,
+        tool_name: str,
+        tool_args: object,
+        tool_result_data: object,
+        error: str,
+    ) -> ToolFailureDisposition | None:
+        if not error:
+            return None
+        if self._is_hard_safety_or_integrity_failure(error):
+            return ToolFailureDisposition(advisory=False, detail=error)
+
+        if tool_name == "shell_execute":
+            command = extract_shell_execute_command(tool_args)
+            if looks_like_development_runtime_probe(command):
+                reason_code = development_verifier_reason_code(error)
+                capability = development_runtime_probe_capability(command)
+                if reason_code:
+                    return ToolFailureDisposition(
+                        advisory=True,
+                        detail=format_development_failure_detail(
+                            reason_code=reason_code,
+                            capability=capability,
+                            detail=error,
+                        ),
+                        reason_code=reason_code,
+                        capability=capability,
+                    )
+            product_reason = development_product_reason_code(command)
+            if product_reason:
+                return ToolFailureDisposition(
+                    advisory=False,
+                    detail=format_development_failure_detail(
+                        reason_code=product_reason,
+                        detail=error,
+                    ),
+                    reason_code=product_reason,
+                )
+
+        if tool_name == "claude_code":
+            prompt = extract_claude_code_prompt(tool_args)
+            if looks_like_development_browser_probe(prompt):
+                reason_code = development_verifier_reason_code(error)
+                if reason_code:
+                    return ToolFailureDisposition(
+                        advisory=True,
+                        detail=format_development_failure_detail(
+                            reason_code=reason_code,
+                            capability="browser_runtime",
+                            detail=error,
+                        ),
+                        reason_code=reason_code,
+                        capability="browser_runtime",
+                    )
+
+        if tool_name == "verification_helper" and isinstance(tool_args, dict):
+            helper_name = str(tool_args.get("helper", "") or "").strip().lower()
+            normalized_error = str(error or "").strip().lower()
+            result_data = tool_result_data if isinstance(tool_result_data, dict) else {}
+            if not normalized_error:
+                normalized_error = str(
+                    result_data.get("helper_reason_code", "") or "",
+                ).strip().lower()
+            capability = str(result_data.get("helper_capability", "") or "").strip()
+            if not capability:
+                capability = _DEVELOPMENT_HELPER_CAPABILITIES.get(helper_name, "")
+            if capability and normalized_error in _DEVELOPMENT_HELPER_REASON_CODES:
+                severity_class = severity_class_for_reason_code(normalized_error)
+                return ToolFailureDisposition(
+                    advisory=severity_class != "semantic",
+                    detail=format_development_failure_detail(
+                        reason_code=normalized_error,
+                        capability=capability,
+                        detail=error,
+                    ),
+                    reason_code=normalized_error,
+                    capability=capability,
+                )
+
+        return None
+
+    @staticmethod
+    def _classify_runtime_tool_capability_failure(
+        *,
+        tool_name: str,
+        tool_result_data: object,
+        error: str,
+    ) -> ToolFailureDisposition | None:
+        data = tool_result_data if isinstance(tool_result_data, dict) else {}
+        error_code = str(data.get("error_code", "") or "").strip().lower()
+        reason_code = str(data.get("reason_code", "") or "").strip().lower()
+        if not reason_code:
+            if error_code == "binary_not_found":
+                if tool_name in {"openai_codex", "claude_code", "opencode"}:
+                    reason_code = "provider_binary_not_found"
+                else:
+                    reason_code = "tool_runtime_capability_unavailable"
+            elif error_code == "unsupported_version":
+                reason_code = "provider_binary_unsupported"
+            elif error_code in {
+                "feature_disabled",
+                "provider_not_allowed",
+                "network_disabled",
+                "unsupported_mode_combination",
+                "binary_not_executable",
+            }:
+                reason_code = "tool_capability_unavailable"
+        if not reason_code:
+            return None
+        return ToolFailureDisposition(
+            advisory=False,
+            detail=format_development_failure_detail(
+                reason_code=reason_code,
+                capability=f"tool:{tool_name}",
+                detail=error or error_code,
+            ),
+            reason_code=reason_code,
+            capability=f"tool:{tool_name}",
+        )
+
+    @classmethod
+    def _classify_recoverable_method_failure(
+        cls,
+        *,
+        tool_name: str,
+        tool_result_data: object,
+        error: str,
+    ) -> ToolFailureDisposition | None:
+        if not error:
+            return None
+        if cls._is_hard_safety_or_integrity_failure(error):
+            return None
+        data = tool_result_data if isinstance(tool_result_data, dict) else {}
+        error_code = str(data.get("error_code", "") or "").strip().lower()
+        lowered = str(error or "").strip().lower()
+        reason_code = ""
+
+        if tool_name in cls._WRITE_RETRYABLE_TOOLS:
+            if error_code in {
+                "path_outside_workspace",
+                "path_exists",
+                "command_failed",
+                "timeout_exceeded",
+                "tool_runtime_error",
+                "invalid_arguments",
+            }:
+                reason_code = "tool_write_retryable"
+            elif any(
+                marker in lowered
+                for marker in (
+                    "permission denied",
+                    "operation not permitted",
+                    "read-only file system",
+                    "not writable",
+                    "failed to write",
+                    "failed to save",
+                    "disk full",
+                    "resource busy",
+                    "text file busy",
+                    "i/o error",
+                    "io error",
+                )
+            ):
+                reason_code = "tool_write_retryable"
+
+        if not reason_code and (
+            tool_name in cls._WEB_TOOLS
+            or any(
+                marker in lowered
+                for marker in (
+                    "http ",
+                    "status code",
+                    "connection failed",
+                    "connection reset",
+                    "connection refused",
+                    "temporarily unavailable",
+                    "service unavailable",
+                    "bad gateway",
+                    "gateway timeout",
+                    "rate limit",
+                    "rate-limited",
+                )
+            )
+        ):
+            status_code = _extract_http_status(error)
+            if status_code is not None:
+                if status_code in {408, 425, 429, 500, 502, 503, 504, 521, 522}:
+                    reason_code = "tool_transient_failure"
+                elif 400 <= status_code < 600:
+                    reason_code = "tool_upstream_unavailable"
+            elif any(
+                marker in lowered
+                for marker in (
+                    "timeout",
+                    "timed out",
+                    "connection failed",
+                    "connection reset",
+                    "connection refused",
+                    "temporarily unavailable",
+                    "service unavailable",
+                    "bad gateway",
+                    "gateway timeout",
+                    "rate limit",
+                    "rate-limited",
+                )
+            ):
+                reason_code = "tool_transient_failure"
+
+        if not reason_code and error_code in {
+            "timeout_exceeded",
+            "command_failed",
+            "tool_runtime_error",
+            "invalid_arguments",
+        }:
+            if error_code == "timeout_exceeded":
+                reason_code = "tool_transient_failure"
+            elif error_code == "invalid_arguments":
+                reason_code = "tool_method_failed"
+            else:
+                reason_code = "tool_runtime_retryable"
+
+        if not reason_code and any(
+            marker in lowered
+            for marker in (
+                "timeout",
+                "timed out",
+                "traceback",
+                "command failed",
+                "runtime error",
+                "failed:",
+                "exception",
+            )
+        ):
+            reason_code = "tool_runtime_retryable"
+
+        if not reason_code:
+            reason_code = "tool_method_failed"
+        return ToolFailureDisposition(
+            advisory=False,
+            detail=format_development_failure_detail(
+                reason_code=reason_code,
+                capability=f"tool:{tool_name}",
+                detail=error or error_code,
+            ),
+            reason_code=reason_code,
+            capability=f"tool:{tool_name}",
+        )
+
+    @staticmethod
+    def _reason_code_from_failure_detail(error: str | None) -> str:
+        detail = str(error or "").strip()
+        if not detail:
+            return ""
+        match = re.search(
+            r"\breason_code\b\s*[:=]\s*([a-z0-9_]+)",
+            detail,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            return ""
+        return str(match.group(1) or "").strip().lower()
 
     @classmethod
     def _hard_failure_reason_code(cls, hard_failures: list[Check]) -> str:
@@ -903,14 +1274,11 @@ class DeterministicVerifier:
         hard_fail_markers = (
             "blocked host:",
             "safety violation:",
-            "only http:// and https:// urls are allowed",
-            "no url provided",
-            "no search query provided",
-            "permission denied",
-            "operation not permitted",
-            "read-only file system",
             "outside writable roots",
             "path escapes",
+            "forbidden_output_path",
+            "artifact_seal_invalid",
+            "manifest_input_policy_violation",
         )
         return any(marker in text for marker in hard_fail_markers)
 

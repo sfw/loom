@@ -11,6 +11,7 @@ import io
 from pathlib import Path
 
 from loom.tools.registry import Tool, ToolContext, ToolResult
+from loom.utils.concurrency import run_blocking_io
 
 
 class SpreadsheetTool(Tool):
@@ -103,6 +104,9 @@ class SpreadsheetTool(Tool):
         return True
 
     async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
+        return await run_blocking_io(self._execute_sync, args, ctx)
+
+    def _execute_sync(self, args: dict, ctx: ToolContext) -> ToolResult:
         if ctx.workspace is None:
             return ToolResult.fail("No workspace set")
 
@@ -117,6 +121,7 @@ class SpreadsheetTool(Tool):
                     raw_path,
                     ctx.workspace,
                     ctx.read_roots,
+                    ctx.read_path_map,
                 )
             else:
                 filepath = self._resolve_path(raw_path, ctx.workspace)
@@ -124,21 +129,21 @@ class SpreadsheetTool(Tool):
             return ToolResult.fail(str(e))
 
         if operation == "create":
-            return await self._create(filepath, args, ctx)
+            return self._create(filepath, args, ctx)
         elif operation == "read":
-            return await self._read(filepath)
+            return self._read(filepath)
         elif operation == "add_rows":
-            return await self._add_rows(filepath, args, ctx)
+            return self._add_rows(filepath, args, ctx)
         elif operation == "add_column":
-            return await self._add_column(filepath, args, ctx)
+            return self._add_column(filepath, args, ctx)
         elif operation == "update_cell":
-            return await self._update_cell(filepath, args, ctx)
+            return self._update_cell(filepath, args, ctx)
         elif operation == "summary":
-            return await self._summary(filepath)
+            return self._summary(filepath)
         else:
             return ToolResult.fail(f"Unknown operation: {operation}")
 
-    async def _create(
+    def _create(
         self, filepath: Path, args: dict, ctx: ToolContext,
     ) -> ToolResult:
         headers = args.get("headers", [])
@@ -165,7 +170,7 @@ class SpreadsheetTool(Tool):
             files_changed=[str(rel)],
         )
 
-    async def _read(self, filepath: Path) -> ToolResult:
+    def _read(self, filepath: Path) -> ToolResult:
         if not filepath.exists():
             return ToolResult.fail(f"File not found: {filepath.name}")
         size_err = self._check_file_size(filepath)
@@ -187,7 +192,7 @@ class SpreadsheetTool(Tool):
 
         return ToolResult.ok("\n".join(lines))
 
-    async def _add_rows(
+    def _add_rows(
         self, filepath: Path, args: dict, ctx: ToolContext,
     ) -> ToolResult:
         if not filepath.exists():
@@ -219,7 +224,7 @@ class SpreadsheetTool(Tool):
             return "File too large (max 5 MB)"
         return None
 
-    async def _add_column(
+    def _add_column(
         self, filepath: Path, args: dict, ctx: ToolContext,
     ) -> ToolResult:
         if not filepath.exists():
@@ -259,7 +264,7 @@ class SpreadsheetTool(Tool):
             files_changed=[str(rel)],
         )
 
-    async def _update_cell(
+    def _update_cell(
         self, filepath: Path, args: dict, ctx: ToolContext,
     ) -> ToolResult:
         if not filepath.exists():
@@ -315,7 +320,7 @@ class SpreadsheetTool(Tool):
             files_changed=[str(rel)],
         )
 
-    async def _summary(self, filepath: Path) -> ToolResult:
+    def _summary(self, filepath: Path) -> ToolResult:
         if not filepath.exists():
             return ToolResult.fail(f"File not found: {filepath.name}")
 

@@ -62,6 +62,7 @@ class SearchFilesTool(Tool):
                 args["path"],
                 ctx.workspace,
                 ctx.read_roots,
+                ctx.read_path_map,
             )
 
         if not search_path.exists():
@@ -71,31 +72,42 @@ class SearchFilesTool(Tool):
         matches = []
         max_matches = 200
 
-        rel_base = search_path
-        for root, dirs, files in os.walk(search_path):
-            # Skip excluded directories
-            dirs[:] = [d for d in dirs if d not in EXCLUDED_DIRS]
+        if search_path.is_file():
+            try:
+                with open(search_path, encoding="utf-8", errors="replace") as f:
+                    for line_num, line in enumerate(f, 1):
+                        if regex.search(line):
+                            matches.append(f"{search_path.name}:{line_num}: {line.rstrip()}")
+                            if len(matches) >= max_matches:
+                                break
+            except (OSError, UnicodeDecodeError):
+                return ToolResult.fail(f"Failed reading file: {search_path}")
+        else:
+            rel_base = search_path
+            for root, dirs, files in os.walk(search_path):
+                # Skip excluded directories
+                dirs[:] = [d for d in dirs if d not in EXCLUDED_DIRS]
 
-            for filename in files:
-                if file_pattern and not _glob_match(filename, file_pattern):
-                    continue
+                for filename in files:
+                    if file_pattern and not _glob_match(filename, file_pattern):
+                        continue
 
-                filepath = os.path.join(root, filename)
-                try:
-                    with open(filepath, encoding="utf-8", errors="replace") as f:
-                        for line_num, line in enumerate(f, 1):
-                            if regex.search(line):
-                                rel = os.path.relpath(filepath, rel_base)
-                                matches.append(f"{rel}:{line_num}: {line.rstrip()}")
-                                if len(matches) >= max_matches:
-                                    break
-                except (OSError, UnicodeDecodeError):
-                    continue
+                    filepath = os.path.join(root, filename)
+                    try:
+                        with open(filepath, encoding="utf-8", errors="replace") as f:
+                            for line_num, line in enumerate(f, 1):
+                                if regex.search(line):
+                                    rel = os.path.relpath(filepath, rel_base)
+                                    matches.append(f"{rel}:{line_num}: {line.rstrip()}")
+                                    if len(matches) >= max_matches:
+                                        break
+                    except (OSError, UnicodeDecodeError):
+                        continue
 
+                    if len(matches) >= max_matches:
+                        break
                 if len(matches) >= max_matches:
                     break
-            if len(matches) >= max_matches:
-                break
 
         if not matches:
             return ToolResult.ok(f"No matches found for pattern: {pattern}")
@@ -145,6 +157,7 @@ class ListDirectoryTool(Tool):
                 args["path"],
                 ctx.workspace,
                 ctx.read_roots,
+                ctx.read_path_map,
             )
 
         if not target.exists():

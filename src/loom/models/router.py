@@ -54,6 +54,13 @@ class ModelRouter:
         self._providers[name] = provider
         self._build_role_map()
 
+    def get(self, name: str) -> ModelProvider | None:
+        """Return a configured provider by its registry name."""
+        clean_name = str(name or "").strip()
+        if not clean_name:
+            return None
+        return self._providers.get(clean_name)
+
     def select(self, tier: int = 1, role: str = "executor") -> ModelProvider:
         """Select the best model for the given role and minimum tier.
 
@@ -81,11 +88,17 @@ class ModelRouter:
         """List all registered providers with their metadata."""
         result = []
         for name, provider in self._providers.items():
+            model_id = getattr(provider, "_model", "") or provider.name
             info: dict = {
                 "name": name,
+                "provider": str(getattr(getattr(provider, "_config", None), "provider", "") or ""),
+                "base_url": str(getattr(getattr(provider, "_config", None), "base_url", "") or ""),
                 "model": provider.name,
+                "model_id": model_id,
                 "tier": provider.tier,
                 "roles": provider.roles,
+                "max_tokens": getattr(provider, "configured_max_tokens", None) or 0,
+                "temperature": getattr(provider, "configured_temperature", None) or 0.0,
             }
             # Include capabilities if provider exposes them
             caps = getattr(provider, "_capabilities", None)

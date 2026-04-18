@@ -242,6 +242,7 @@ def validate_deliverable_write_policy(
     allowed_output_prefixes: list[str],
     enforce_deliverable_paths: bool,
     edit_existing_only: bool,
+    already_touched_deliverables: set[str] | None = None,
     normalize_deliverable_paths: Any,
     target_paths_for_policy: Any,
     looks_like_deliverable_variant: Any,
@@ -265,6 +266,11 @@ def validate_deliverable_write_policy(
         return None
     canonical_set = set(canonical)
     forbidden_set = set(forbidden)
+    touched_set = {
+        str(path).strip()
+        for path in (already_touched_deliverables or set())
+        if str(path).strip()
+    }
     variant_candidates = list(dict.fromkeys([*canonical, *forbidden]))
     for path in paths:
         if path in forbidden_set:
@@ -276,6 +282,14 @@ def validate_deliverable_write_policy(
                 f"Forbidden canonical path(s): {blocked}."
             )
         if path in canonical_set:
+            if path in touched_set:
+                return (
+                    "reason_code=forbidden_output_path; "
+                    "Canonical deliverable drafting violation: "
+                    f"'{path}' was already written in this subtask attempt. "
+                    "Gather all required evidence before the first canonical write, "
+                    "then make one in-place update per deliverable."
+                )
             continue
         if any(
             looks_like_deliverable_variant(candidate=path, canonical=item)

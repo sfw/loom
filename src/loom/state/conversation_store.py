@@ -32,6 +32,30 @@ _COWORK_MEMORY_STATUSES = frozenset({
     "resolved",
     "rejected",
 })
+_SESSION_STATE_SEMANTIC_KEYS = frozenset({
+    "session_id",
+    "workspace",
+    "model_name",
+    "turn_count",
+    "total_tokens",
+    "files_touched",
+    "key_decisions",
+    "current_focus",
+    "errors_resolved",
+    "active_decisions",
+    "active_proposals",
+    "recent_research",
+    "open_questions",
+    "memory_index_last_indexed_turn",
+    "memory_index_degraded",
+    "memory_index_failure_count",
+    "memory_index_last_error",
+})
+_SESSION_STATE_NON_SEMANTIC_KEYS = frozenset({
+    "title",
+    "ui_state",
+})
+_UNSET = object()
 
 
 class ConversationStore:
@@ -43,6 +67,49 @@ class ConversationStore:
 
     def __init__(self, db: Database):
         self._db = db
+
+    @staticmethod
+    def _decode_turn_metadata(raw: Any) -> dict[str, Any]:
+        if isinstance(raw, dict):
+            return dict(raw)
+        if not isinstance(raw, str):
+            return {}
+        text = raw.strip()
+        if not text:
+            return {}
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            return {}
+        return dict(parsed) if isinstance(parsed, dict) else {}
+
+    @staticmethod
+    def _decode_session_state_blob(raw: object) -> dict[str, Any]:
+        if isinstance(raw, dict):
+            return dict(raw)
+        if not isinstance(raw, str):
+            return {}
+        text = raw.strip()
+        if not text:
+            return {}
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            return {}
+        return dict(parsed) if isinstance(parsed, dict) else {}
+
+    @staticmethod
+    def _split_session_state_domains(
+        state: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        semantic: dict[str, Any] = {}
+        metadata: dict[str, Any] = {}
+        for key, value in dict(state or {}).items():
+            if key in _SESSION_STATE_SEMANTIC_KEYS:
+                semantic[key] = value
+            else:
+                metadata[key] = value
+        return semantic, metadata
 
     # ------------------------------------------------------------------
     # Session lifecycle
@@ -89,12 +156,50 @@ class ConversationStore:
             tuple(params),
         )
 
+    async def get_sessions_by_ids(self, session_ids: list[str]) -> dict[str, dict]:
+        """Return session rows keyed by session ID."""
+        clean_ids = sorted({
+            str(session_id or "").strip()
+            for session_id in session_ids
+            if str(session_id or "").strip()
+        })
+        if not clean_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in clean_ids)
+        rows = await self._db.query(
+            f"SELECT * FROM cowork_sessions WHERE id IN ({placeholders})",
+            tuple(clean_ids),
+        )
+        return {
+            str(row.get("id", "") or "").strip(): dict(row)
+            for row in rows
+            if str(row.get("id", "") or "").strip()
+        }
+
+    async def delete_session(self, session_id: str) -> None:
+        """Delete a session and all related data."""
+        await self._db.execute(
+            "DELETE FROM cowork_chat_events WHERE session_id = ?", (session_id,),
+        )
+        await self._db.execute(
+            "DELETE FROM conversation_run_links WHERE session_id = ?", (session_id,),
+        )
+        await self._db.execute(
+            "DELETE FROM conversation_turns WHERE session_id = ?", (session_id,),
+        )
+        await self._db.execute(
+            "DELETE FROM cowork_sessions WHERE id = ?", (session_id,),
+        )
+
     async def update_session(
         self,
         session_id: str,
         total_tokens: int | None = None,
         turn_count: int | None = None,
         session_state: dict | None = None,
+        session_state_through_turn: int | None = None,
+        chat_journal_through_turn: int | None = None,
+        chat_journal_through_seq: int | None = None,
         is_active: bool | None = None,
     ) -> None:
         """Update session metadata."""
@@ -110,6 +215,15 @@ class ConversationStore:
         if session_state is not None:
             updates.append("session_state = ?")
             params.append(json.dumps(session_state))
+        if session_state_through_turn is not None:
+            updates.append("session_state_through_turn = ?")
+            params.append(max(0, int(session_state_through_turn)))
+        if chat_journal_through_turn is not None:
+            updates.append("chat_journal_through_turn = ?")
+            params.append(max(0, int(chat_journal_through_turn)))
+        if chat_journal_through_seq is not None:
+            updates.append("chat_journal_through_seq = ?")
+            params.append(max(0, int(chat_journal_through_seq)))
         if is_active is not None:
             updates.append("is_active = ?")
             params.append(int(is_active))
@@ -119,6 +233,134 @@ class ConversationStore:
             f"UPDATE cowork_sessions SET {', '.join(updates)} WHERE id = ?",
             tuple(params),
         )
+
+    async def write_session_checkpoint(
+        self,
+        session_id: str,
+        *,
+        session_state: dict,
+        through_turn: int,
+        is_active: bool | None = None,
+    ) -> None:
+        """Persist a session checkpoint derived from committed canonical turns."""
+        now = datetime.now().isoformat()
+        safe_through_turn = max(0, int(through_turn))
+        safe_is_active = None if is_active is None else int(bool(is_active))
+
+        async def _callback(conn) -> None:
+            session_row = await (
+                await conn.execute(
+                    "SELECT session_state FROM cowork_sessions WHERE id = ?",
+                    (session_id,),
+                )
+            ).fetchone()
+            existing_state = self._decode_session_state_blob(
+                session_row[0] if session_row is not None else "",
+            )
+            _, metadata = self._split_session_state_domains(existing_state)
+            new_semantic, _ = self._split_session_state_domains(session_state or {})
+            merged_state = {
+                **metadata,
+                **new_semantic,
+            }
+
+            metrics_row = await (
+                await conn.execute(
+                    """
+                    SELECT
+                        COALESCE(SUM(token_count), 0) AS total_tokens,
+                        COALESCE(SUM(CASE WHEN role = 'user' THEN 1 ELSE 0 END), 0) AS user_turns,
+                        COALESCE(MAX(turn_number), 0) AS latest_turn
+                    FROM conversation_turns
+                    WHERE session_id = ? AND turn_number <= ?
+                    """,
+                    (session_id, safe_through_turn),
+                )
+            ).fetchone()
+            derived_total_tokens = int((metrics_row[0] if metrics_row is not None else 0) or 0)
+            derived_turn_count = int((metrics_row[1] if metrics_row is not None else 0) or 0)
+            committed_through_turn = int((metrics_row[2] if metrics_row is not None else 0) or 0)
+            merged_state["turn_count"] = derived_turn_count
+            merged_state["total_tokens"] = derived_total_tokens
+            updates = [
+                "last_active_at = ?",
+                "total_tokens = ?",
+                "turn_count = ?",
+                "session_state = ?",
+                "session_state_through_turn = ?",
+            ]
+            params: list[Any] = [
+                now,
+                derived_total_tokens,
+                derived_turn_count,
+                json.dumps(merged_state),
+                committed_through_turn,
+            ]
+            if safe_is_active is not None:
+                updates.append("is_active = ?")
+                params.append(safe_is_active)
+            params.append(session_id)
+            await conn.execute(
+                f"UPDATE cowork_sessions SET {', '.join(updates)} WHERE id = ?",
+                tuple(params),
+            )
+
+        await self._db.run_write_transaction(_callback)
+
+    async def patch_session_state_metadata(
+        self,
+        session_id: str,
+        *,
+        title: str | None | object = _UNSET,
+        ui_state: dict | object = _UNSET,
+        is_active: bool | None = None,
+    ) -> None:
+        """Patch non-semantic session-state metadata without rewriting checkpoints."""
+        now = datetime.now().isoformat()
+        safe_is_active = None if is_active is None else int(bool(is_active))
+
+        async def _callback(conn) -> None:
+            row = await (
+                await conn.execute(
+                    "SELECT session_state FROM cowork_sessions WHERE id = ?",
+                    (session_id,),
+                )
+            ).fetchone()
+            existing_state = self._decode_session_state_blob(row[0] if row is not None else "")
+            semantic, metadata = self._split_session_state_domains(existing_state)
+
+            if title is not _UNSET:
+                clean_title = str(title or "").strip()
+                if clean_title:
+                    metadata["title"] = clean_title
+                else:
+                    metadata.pop("title", None)
+            if ui_state is not _UNSET:
+                metadata["ui_state"] = dict(ui_state) if isinstance(ui_state, dict) else {}
+
+            merged_state = {
+                **metadata,
+                **semantic,
+            }
+
+            updates = [
+                "last_active_at = ?",
+                "session_state = ?",
+            ]
+            params: list[Any] = [
+                now,
+                json.dumps(merged_state),
+            ]
+            if safe_is_active is not None:
+                updates.append("is_active = ?")
+                params.append(safe_is_active)
+            params.append(session_id)
+            await conn.execute(
+                f"UPDATE cowork_sessions SET {', '.join(updates)} WHERE id = ?",
+                tuple(params),
+            )
+
+        await self._db.run_write_transaction(_callback)
 
     # ------------------------------------------------------------------
     # Turn persistence
@@ -130,25 +372,31 @@ class ConversationStore:
         turn_number: int,
         role: str,
         content: str | None = None,
+        metadata: dict[str, Any] | None = None,
         tool_calls: list[dict] | None = None,
         tool_call_id: str | None = None,
         tool_name: str | None = None,
     ) -> int:
         """Append a conversation turn.  Returns the row ID."""
         token_count = _estimate_tokens(content or "")
+        if metadata:
+            token_count += _estimate_tokens(
+                json.dumps(metadata, ensure_ascii=False, default=str),
+            )
         if tool_calls:
             token_count += _estimate_tokens(json.dumps(tool_calls))
 
         row_id = await self._db.execute_returning_id(
             """INSERT INTO conversation_turns
-               (session_id, turn_number, role, content, tool_calls,
+               (session_id, turn_number, role, content, metadata, tool_calls,
                 tool_call_id, tool_name, token_count)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 session_id,
                 turn_number,
                 role,
                 content,
+                json.dumps(metadata, ensure_ascii=False, default=str) if metadata else None,
                 json.dumps(tool_calls) if tool_calls else None,
                 tool_call_id,
                 tool_name,
@@ -173,6 +421,24 @@ class ConversationStore:
             (session_id, limit, offset),
         )
 
+    async def get_turns_before(
+        self,
+        session_id: str,
+        *,
+        before_turn: int,
+        limit: int = 50,
+    ) -> list[dict]:
+        """Get turns older than ``before_turn``, ordered by turn number."""
+        limit = min(limit, self.MAX_QUERY_LIMIT)
+        rows = await self._db.query(
+            """SELECT * FROM conversation_turns
+               WHERE session_id = ? AND turn_number < ?
+               ORDER BY turn_number DESC
+               LIMIT ?""",
+            (session_id, int(before_turn), limit),
+        )
+        return list(reversed(rows))
+
     async def get_recent_turns(
         self,
         session_id: str,
@@ -196,6 +462,142 @@ class ConversationStore:
             (session_id,),
         )
         return row["cnt"] if row else 0
+
+    async def get_last_turn_number(self, session_id: str) -> int:
+        """Return the latest persisted conversation turn number."""
+        row = await self._db.query_one(
+            "SELECT COALESCE(MAX(turn_number), 0) AS max_turn "
+            "FROM conversation_turns WHERE session_id = ?",
+            (session_id,),
+        )
+        return int((row or {}).get("max_turn", 0) or 0)
+
+    async def get_user_turn_count(self, session_id: str) -> int:
+        """Return the number of user-authored turns in a session."""
+        row = await self._db.query_one(
+            "SELECT COUNT(*) AS cnt FROM conversation_turns WHERE session_id = ? AND role = 'user'",
+            (session_id,),
+        )
+        return int((row or {}).get("cnt", 0) or 0)
+
+    async def get_turns_after(
+        self,
+        session_id: str,
+        *,
+        after_turn: int,
+        limit: int = 1000,
+    ) -> list[dict]:
+        """Load persisted turns strictly after a turn boundary."""
+        safe_limit = min(max(1, int(limit)), self.MAX_QUERY_LIMIT)
+        return await self._db.query(
+            """SELECT * FROM conversation_turns
+               WHERE session_id = ? AND turn_number > ?
+               ORDER BY turn_number ASC
+               LIMIT ?""",
+            (session_id, max(0, int(after_turn)), safe_limit),
+        )
+
+    async def link_run(
+        self,
+        session_id: str,
+        run_id: str,
+        *,
+        link_type: str = "origin",
+    ) -> None:
+        """Persist a conversation-to-run linkage for workspace navigation."""
+        clean_session_id = str(session_id or "").strip()
+        clean_run_id = str(run_id or "").strip()
+        clean_link_type = str(link_type or "").strip() or "origin"
+        if not clean_session_id or not clean_run_id:
+            return
+        await self._db.execute(
+            """
+            INSERT INTO conversation_run_links (session_id, run_id, link_type, created_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(session_id, run_id, link_type) DO NOTHING
+            """,
+            (clean_session_id, clean_run_id, clean_link_type, datetime.now().isoformat()),
+        )
+
+    async def list_linked_runs(self, session_id: str) -> list[dict]:
+        """Return run links for a conversation/session."""
+        rows = await self._db.query(
+            """
+            SELECT *
+            FROM conversation_run_links
+            WHERE session_id = ?
+            ORDER BY created_at ASC, id ASC
+            """,
+            (str(session_id or "").strip(),),
+        )
+        return [dict(row) for row in rows]
+
+    async def list_linked_runs_for_sessions(self, session_ids: list[str]) -> dict[str, list[dict]]:
+        """Return run links grouped by session ID."""
+        clean_ids = sorted({
+            str(session_id or "").strip()
+            for session_id in session_ids
+            if str(session_id or "").strip()
+        })
+        if not clean_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in clean_ids)
+        rows = await self._db.query(
+            f"""
+            SELECT *
+            FROM conversation_run_links
+            WHERE session_id IN ({placeholders})
+            ORDER BY created_at ASC, id ASC
+            """,
+            tuple(clean_ids),
+        )
+        grouped: dict[str, list[dict]] = {session_id: [] for session_id in clean_ids}
+        for row in rows:
+            session_id = str(row.get("session_id", "") or "").strip()
+            if not session_id:
+                continue
+            grouped.setdefault(session_id, []).append(dict(row))
+        return grouped
+
+    async def list_linked_conversations(self, run_id: str) -> list[dict]:
+        """Return conversation links for a run."""
+        rows = await self._db.query(
+            """
+            SELECT *
+            FROM conversation_run_links
+            WHERE run_id = ?
+            ORDER BY created_at ASC, id ASC
+            """,
+            (str(run_id or "").strip(),),
+        )
+        return [dict(row) for row in rows]
+
+    async def list_linked_conversations_for_runs(self, run_ids: list[str]) -> dict[str, list[dict]]:
+        """Return conversation links grouped by run/task ID."""
+        clean_ids = sorted({
+            str(run_id or "").strip()
+            for run_id in run_ids
+            if str(run_id or "").strip()
+        })
+        if not clean_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in clean_ids)
+        rows = await self._db.query(
+            f"""
+            SELECT *
+            FROM conversation_run_links
+            WHERE run_id IN ({placeholders})
+            ORDER BY created_at ASC, id ASC
+            """,
+            tuple(clean_ids),
+        )
+        grouped: dict[str, list[dict]] = {run_id: [] for run_id in clean_ids}
+        for row in rows:
+            run_id = str(row.get("run_id", "") or "").strip()
+            if not run_id:
+                continue
+            grouped.setdefault(run_id, []).append(dict(row))
+        return grouped
 
     # ------------------------------------------------------------------
     # Search / retrieval
@@ -710,6 +1112,16 @@ class ConversationStore:
             msg: dict = {"role": row["role"]}
             if row["content"] is not None:
                 msg["content"] = row["content"]
+            metadata = self._decode_turn_metadata(row.get("metadata"))
+            for key in (
+                "workspace_paths",
+                "workspace_files",
+                "workspace_directories",
+                "content_blocks",
+            ):
+                value = metadata.get(key)
+                if isinstance(value, list) and value:
+                    msg[key] = value
             if row["tool_calls"]:
                 msg["tool_calls"] = json.loads(row["tool_calls"])
             if row["tool_call_id"]:
@@ -728,6 +1140,8 @@ class ConversationStore:
         payload: dict | str,
         *,
         seq: int | None = None,
+        journal_through_turn: int | None = None,
+        journal_through_seq: int | None = None,
     ) -> int:
         """Append one chat transcript event and return its sequence number."""
         session_id = str(session_id or "").strip()
@@ -737,41 +1151,89 @@ class ConversationStore:
         if not event_type:
             raise ValueError("event_type is required")
 
+        payload_dict = payload if isinstance(payload, dict) else None
+        if journal_through_turn is not None and isinstance(payload_dict, dict):
+            payload_dict = dict(payload_dict)
+            payload_dict.setdefault("journal_through_turn", max(0, int(journal_through_turn)))
         if isinstance(payload, str):
             payload_json = payload
         else:
-            payload_json = json.dumps(payload, ensure_ascii=False, default=str)
+            payload_json = json.dumps(
+                payload_dict if payload_dict is not None else payload,
+                ensure_ascii=False,
+                default=str,
+            )
 
         now = datetime.now().isoformat()
-        if seq is not None:
-            seq = int(seq)
-            if seq <= 0:
-                raise ValueError("seq must be > 0")
-            await self._db.execute(
-                """INSERT INTO cowork_chat_events
-                   (session_id, seq, event_type, payload, created_at)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (session_id, seq, event_type, payload_json, now),
-            )
-            return seq
 
-        # Allocate sequence in one SQL statement so SELECT(max)+INSERT are
-        # serialized together under SQLite's write lock.
-        row_id = await self._db.execute_returning_id(
-            """INSERT INTO cowork_chat_events
-               (session_id, seq, event_type, payload, created_at)
-               SELECT ?, COALESCE(MAX(seq), 0) + 1, ?, ?, ?
-               FROM cowork_chat_events
-               WHERE session_id = ?""",
-            (session_id, event_type, payload_json, now, session_id),
-        )
-        row = await self._db.query_one(
-            "SELECT seq FROM cowork_chat_events WHERE id = ?",
-            (row_id,),
-        )
-        if not row:
-            raise RuntimeError("Inserted chat event not found.")
-        return int(row.get("seq", 0) or 0)
+        async def _callback(conn) -> int:
+            assigned_seq: int
+            if seq is not None:
+                explicit_seq = int(seq)
+                if explicit_seq <= 0:
+                    raise ValueError("seq must be > 0")
+                await conn.execute(
+                    """INSERT INTO cowork_chat_events
+                       (session_id, seq, event_type, payload, created_at)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (session_id, explicit_seq, event_type, payload_json, now),
+                )
+                assigned_seq = explicit_seq
+            else:
+                cursor = await conn.execute(
+                    """INSERT INTO cowork_chat_events
+                       (session_id, seq, event_type, payload, created_at)
+                       SELECT ?, COALESCE(MAX(seq), 0) + 1, ?, ?, ?
+                       FROM cowork_chat_events
+                       WHERE session_id = ?""",
+                    (session_id, event_type, payload_json, now, session_id),
+                )
+                row = await (
+                    await conn.execute(
+                        "SELECT seq FROM cowork_chat_events WHERE id = ?",
+                        (cursor.lastrowid,),
+                    )
+                ).fetchone()
+                if row is None:
+                    raise RuntimeError("Inserted chat event not found.")
+                assigned_seq = int(row[0] or 0)
+
+            if journal_through_turn is not None:
+                through_turn = max(0, int(journal_through_turn))
+                through_seq = max(
+                    0,
+                    int(
+                        assigned_seq
+                        if journal_through_seq is None
+                        else journal_through_seq
+                    ),
+                )
+                await conn.execute(
+                    """
+                    UPDATE cowork_sessions
+                    SET last_active_at = ?,
+                        chat_journal_through_turn = CASE
+                            WHEN chat_journal_through_turn > ? THEN chat_journal_through_turn
+                            ELSE ?
+                        END,
+                        chat_journal_through_seq = CASE
+                            WHEN chat_journal_through_seq > ? THEN chat_journal_through_seq
+                            ELSE ?
+                        END
+                    WHERE id = ?
+                    """,
+                    (
+                        now,
+                        through_turn,
+                        through_turn,
+                        through_seq,
+                        through_seq,
+                        session_id,
+                    ),
+                )
+            return assigned_seq
+
+        return int(await self._db.run_write_transaction(_callback))
 
     async def get_last_chat_seq(self, session_id: str) -> int:
         """Return the last known chat-event sequence for a session."""
@@ -784,12 +1246,76 @@ class ConversationStore:
             return 0
         return int(row.get("max_seq", 0) or 0)
 
+    async def backfill_chat_journal_coverage(self, session_id: str) -> tuple[int, int]:
+        """Persist explicit journal coverage recovered from durable replay rows."""
+        async def _callback(conn) -> tuple[int, int]:
+            row = await (
+                await conn.execute(
+                    """
+                    SELECT chat_journal_through_turn, chat_journal_through_seq
+                    FROM cowork_sessions
+                    WHERE id = ?
+                    """,
+                    (session_id,),
+                )
+            ).fetchone()
+            if row is None:
+                return (0, 0)
+            current_turn = int(row[0] or 0)
+            current_seq = int(row[1] or 0)
+            if current_turn > 0 and current_seq > 0:
+                return (current_turn, current_seq)
+            rows = await (
+                await conn.execute(
+                    """
+                    SELECT seq, payload
+                    FROM cowork_chat_events
+                    WHERE session_id = ? AND event_type = 'turn_separator'
+                    ORDER BY seq DESC
+                    LIMIT 32
+                    """,
+                    (session_id,),
+                )
+            ).fetchall()
+            recovered_turn = 0
+            recovered_seq = 0
+            for seq, payload_raw in rows:
+                payload = self._decode_session_state_blob(payload_raw)
+                candidate_turn = int(payload.get("journal_through_turn", 0) or 0)
+                if candidate_turn <= 0:
+                    continue
+                recovered_turn = candidate_turn
+                recovered_seq = int(seq or 0)
+                break
+            if recovered_turn <= 0 or recovered_seq <= 0:
+                return (0, 0)
+            await conn.execute(
+                """
+                UPDATE cowork_sessions
+                SET last_active_at = ?,
+                    chat_journal_through_turn = ?,
+                    chat_journal_through_seq = ?
+                WHERE id = ?
+                """,
+                (
+                    datetime.now().isoformat(),
+                    recovered_turn,
+                    recovered_seq,
+                    session_id,
+                ),
+            )
+            return (recovered_turn, recovered_seq)
+
+        result = await self._db.run_write_transaction(_callback)
+        return (int(result[0]), int(result[1]))
+
     async def get_chat_events(
         self,
         session_id: str,
         *,
         before_seq: int | None = None,
         after_seq: int | None = None,
+        through_seq: int | None = None,
         limit: int = 200,
     ) -> list[dict]:
         """Get chat replay events in chronological order."""
@@ -802,6 +1328,9 @@ class ConversationStore:
         if after_seq is not None:
             conditions.append("seq > ?")
             params.append(int(after_seq))
+        if through_seq is not None:
+            conditions.append("seq <= ?")
+            params.append(int(through_seq))
 
         where = " AND ".join(conditions)
         rows = await self._db.query(
@@ -813,6 +1342,164 @@ class ConversationStore:
         )
         rows = list(reversed(rows))
         return [self._normalize_chat_event_row(row) for row in rows]
+
+    async def get_transcript_page(
+        self,
+        session_id: str,
+        *,
+        before_seq: int | None = None,
+        before_turn: int | None = None,
+        after_seq: int = 0,
+        limit: int = 200,
+    ) -> list[dict]:
+        """Load a transcript page using journal coverage rather than journal presence."""
+        safe_limit = max(1, min(int(limit), self.MAX_CHAT_EVENT_LIMIT))
+        session = await self.get_session(session_id)
+        if session is None:
+            return []
+
+        if after_seq > 0 and before_seq is None:
+            # Incremental consumers already have the historical transcript. For
+            # live catch-up, return only durable chat-event rows so a just-sent
+            # turn is not replayed once from the journal and again from
+            # synthesized conversation turns while journal coverage lags.
+            return await self.get_chat_events(
+                session_id,
+                after_seq=max(0, int(after_seq)),
+                limit=safe_limit,
+            )
+
+        covered_turn = max(0, int(session.get("chat_journal_through_turn", 0) or 0))
+        covered_seq = max(0, int(session.get("chat_journal_through_seq", 0) or 0))
+        if covered_turn <= 0 or covered_seq <= 0:
+            covered_turn, covered_seq = await self.backfill_chat_journal_coverage(session_id)
+        latest_turn = await self.get_last_turn_number(session_id)
+
+        if before_turn is not None and before_seq is None:
+            return await self.synthesize_chat_events_from_turns(
+                session_id,
+                before_turn=max(1, int(before_turn)),
+                limit=safe_limit,
+            )
+
+        if covered_turn <= 0 or covered_seq <= 0:
+            if latest_turn <= 0:
+                return await self.get_chat_events(
+                    session_id,
+                    before_seq=before_seq,
+                    after_seq=(None if after_seq <= 0 else after_seq),
+                    limit=safe_limit,
+                )
+            if before_turn is not None:
+                return await self.synthesize_chat_events_from_turns(
+                    session_id,
+                    before_turn=max(1, int(before_turn)),
+                    limit=safe_limit,
+                )
+            if before_seq is not None:
+                return await self.synthesize_chat_events_from_turns(
+                    session_id,
+                    before_turn=max(1, int((int(before_seq) + 99) / 100)),
+                    limit=safe_limit,
+                )
+            if after_seq > 0:
+                return []
+            return await self._synthesized_transcript_suffix(
+                session_id,
+                after_turn=max(0, int(after_seq / 100)),
+                before_turn=before_turn,
+                limit=safe_limit,
+            )
+
+        if before_seq is not None:
+            rows = await self.get_chat_events(
+                session_id,
+                before_seq=min(max(1, int(before_seq)), covered_seq + 1),
+                through_seq=covered_seq,
+                limit=safe_limit,
+            )
+            if rows:
+                return rows
+            synth_before_turn = (
+                max(1, int(before_turn))
+                if before_turn is not None
+                else max(1, int((int(before_seq) + 99) / 100))
+            )
+            return await self.synthesize_chat_events_from_turns(
+                session_id,
+                before_turn=synth_before_turn,
+                limit=safe_limit,
+            )
+
+        if after_seq > 0:
+            journal_rows = await self.get_chat_events(
+                session_id,
+                after_seq=min(max(0, int(after_seq)), covered_seq),
+                through_seq=covered_seq,
+                limit=safe_limit,
+            )
+            if covered_turn >= latest_turn:
+                return journal_rows
+            synth_after_turn = (
+                covered_turn
+                if after_seq <= covered_seq
+                else max(covered_turn, int(after_seq / 100))
+            )
+            synth_rows = await self._synthesized_transcript_suffix(
+                session_id,
+                after_turn=synth_after_turn,
+                limit=safe_limit,
+            )
+            return [*journal_rows, *synth_rows][-safe_limit:]
+
+        if covered_turn >= latest_turn:
+            return await self.get_chat_events(
+                session_id,
+                through_seq=covered_seq,
+                limit=safe_limit,
+            )
+
+        journal_rows = await self.get_chat_events(
+            session_id,
+            through_seq=covered_seq,
+            limit=safe_limit,
+        )
+        synth_rows = await self._synthesized_transcript_suffix(
+            session_id,
+            after_turn=covered_turn,
+            limit=safe_limit,
+        )
+        return [*journal_rows, *synth_rows][-safe_limit:]
+
+    async def _synthesized_transcript_suffix(
+        self,
+        session_id: str,
+        *,
+        after_turn: int = 0,
+        before_turn: int | None = None,
+        limit: int = 200,
+    ) -> list[dict]:
+        safe_limit = max(1, min(int(limit), self.MAX_CHAT_EVENT_LIMIT))
+        conditions = ["session_id = ?"]
+        params: list[Any] = [session_id]
+        if after_turn > 0:
+            conditions.append("turn_number > ?")
+            params.append(int(after_turn))
+        if before_turn is not None:
+            conditions.append("turn_number < ?")
+            params.append(int(before_turn))
+        where = " AND ".join(conditions)
+        rows = await self._db.query(
+            f"""SELECT * FROM conversation_turns
+                WHERE {where}
+                ORDER BY turn_number DESC
+                LIMIT ?""",
+            tuple([*params, safe_limit]),
+        )
+        if not rows:
+            return []
+        rows = list(reversed(rows))
+        return self._synthesize_chat_events_from_turn_rows(session_id, rows)
 
     @staticmethod
     def _normalize_chat_event_row(row: dict) -> dict:
@@ -862,61 +1549,73 @@ class ConversationStore:
         if not rows:
             return []
         rows = list(reversed(rows))
+        return self._synthesize_chat_events_from_turn_rows(session_id, rows)
 
+    def _synthesize_chat_events_from_turn_rows(
+        self,
+        session_id: str,
+        rows: list[dict],
+    ) -> list[dict]:
         events: list[dict] = []
         for row in rows:
             role = str(row.get("role", "") or "").strip().lower()
             turn_number = int(row.get("turn_number", 0) or 0)
             created_at = row.get("created_at")
+            seq_base = turn_number * 100
+            seq_index = 0
 
-            if role == "user":
-                text = str(row.get("content", "") or "")
+            def _append(event_type: str, payload: dict[str, Any]) -> None:
+                nonlocal seq_index
                 events.append({
-                    "event_type": "user_message",
-                    "payload": {"text": text},
+                    "id": 0,
+                    "session_id": session_id,
+                    "seq": seq_base + seq_index,
+                    "event_type": event_type,
+                    "payload": payload,
+                    "payload_parse_error": False,
                     "turn_number": turn_number,
                     "created_at": created_at,
                 })
+                seq_index += 1
+
+            if role == "user":
+                text = str(row.get("content", "") or "")
+                metadata = self._decode_turn_metadata(row.get("metadata"))
+                payload: dict[str, Any] = {"text": text}
+                attachment_payload = {
+                    key: metadata.get(key)
+                    for key in (
+                        "workspace_paths",
+                        "workspace_files",
+                        "workspace_directories",
+                        "content_blocks",
+                    )
+                    if isinstance(metadata.get(key), list) and metadata.get(key)
+                }
+                payload.update(attachment_payload)
+                _append("user_message", payload)
+                if attachment_payload:
+                    _append("content_indicator", attachment_payload)
                 continue
 
             if role == "assistant":
                 content = str(row.get("content", "") or "")
                 tool_calls = self._decode_tool_calls(row.get("tool_calls"))
                 if content:
-                    events.append({
-                        "event_type": "assistant_text",
-                        "payload": {"text": content, "markup": False},
-                        "turn_number": turn_number,
-                        "created_at": created_at,
-                    })
+                    _append("assistant_text", {"text": content, "markup": False})
                 for call in tool_calls:
                     payload = self._payload_for_tool_call_start(call)
                     if payload is None:
                         continue
-                    events.append({
-                        "event_type": "tool_call_started",
-                        "payload": payload,
-                        "turn_number": turn_number,
-                        "created_at": created_at,
-                    })
+                    _append("tool_call_started", payload)
                 continue
 
             if role == "tool":
                 payload = self._payload_for_tool_completion(row)
-                events.append({
-                    "event_type": "tool_call_completed",
-                    "payload": payload,
-                    "turn_number": turn_number,
-                    "created_at": created_at,
-                })
+                _append("tool_call_completed", payload)
                 blocks = payload.get("content_blocks")
                 if isinstance(blocks, list) and blocks:
-                    events.append({
-                        "event_type": "content_indicator",
-                        "payload": {"content_blocks": blocks},
-                        "turn_number": turn_number,
-                        "created_at": created_at,
-                    })
+                    _append("content_indicator", {"content_blocks": blocks})
                 continue
 
             # Skip most persisted system messages from model context hints.
@@ -968,6 +1667,26 @@ class ConversationStore:
         }
 
     @staticmethod
+    def _ask_user_question_payload(result: object) -> dict | None:
+        from loom.tools.ask_user import normalize_ask_user_args
+        from loom.tools.registry import ToolResult
+
+        if not isinstance(result, ToolResult):
+            return None
+        data = result.data
+        if not isinstance(data, dict):
+            return None
+        candidate = dict(data)
+        options_v2 = candidate.get("options_v2")
+        if isinstance(options_v2, list) and options_v2:
+            candidate["options"] = options_v2
+        normalized = normalize_ask_user_args(candidate)
+        question = str(normalized.get("question", "") or "").strip()
+        if not question:
+            return None
+        return normalized
+
+    @staticmethod
     def _payload_for_tool_completion(row: dict) -> dict:
         from loom.tools.registry import ToolResult
 
@@ -1001,6 +1720,12 @@ class ConversationStore:
             "output": output,
             "error": error,
         }
+        if isinstance(result.data, dict):
+            payload["data"] = dict(result.data)
+        if payload["tool_name"] == "ask_user":
+            question_payload = ConversationStore._ask_user_question_payload(result)
+            if question_payload is not None:
+                payload["question_payload"] = question_payload
         if blocks:
             payload["content_blocks"] = blocks
         return payload

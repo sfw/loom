@@ -42,6 +42,7 @@ _TS_LANG_MAP: dict[str, str] = {
     "typescript": "typescript",
     "go": "go",
     "rust": "rust",
+    "html": "html",
 }
 
 
@@ -397,12 +398,85 @@ def _rust_function(node, structure) -> None:
         structure.functions.append(name_node.text.decode())
 
 
+_HTML_SKIPPED_TAGS = {"html", "head", "body"}
+
+
+def _append_unique(items: list[str], value: str) -> None:
+    value = value.strip()
+    if value and value not in items:
+        items.append(value)
+
+
+def _extract_html(root, structure) -> None:
+    """Walk an HTML tree and populate *structure*."""
+    _html_walk(root, structure)
+
+
+def _html_walk(node, structure) -> None:
+    if node.type in ("element", "script_element", "style_element"):
+        _html_capture_element(node, structure)
+    for child in node.children:
+        _html_walk(child, structure)
+
+
+def _html_capture_element(node, structure) -> None:
+    start_tag = None
+    for child in node.children:
+        if child.type == "start_tag":
+            start_tag = child
+            break
+    if start_tag is None:
+        return
+
+    tag_name = _html_tag_name(start_tag)
+    if tag_name and tag_name not in _HTML_SKIPPED_TAGS:
+        _append_unique(structure.elements, tag_name)
+
+    for child in start_tag.children:
+        if child.type != "attribute":
+            continue
+        attr_name, attr_value = _html_attribute(child)
+        if not attr_name or not attr_value:
+            continue
+        if attr_name in {"src", "href"}:
+            _append_unique(structure.imports, attr_value)
+        elif attr_name == "id":
+            _append_unique(structure.ids, attr_value)
+        elif attr_name == "class":
+            for class_name in attr_value.split():
+                _append_unique(structure.classes, class_name)
+
+
+def _html_tag_name(start_tag) -> str:
+    for child in start_tag.children:
+        if child.type == "tag_name":
+            return child.text.decode().strip().lower()
+    return ""
+
+
+def _html_attribute(node) -> tuple[str, str]:
+    name = ""
+    value = ""
+    for child in node.children:
+        if child.type == "attribute_name":
+            name = child.text.decode().strip().lower()
+        elif child.type == "quoted_attribute_value":
+            for grandchild in child.children:
+                if grandchild.type == "attribute_value":
+                    value = grandchild.text.decode().strip()
+                    break
+        elif child.type == "attribute_value" and not value:
+            value = child.text.decode().strip()
+    return name, value
+
+
 _EXTRACTORS = {
     "python": _extract_python,
     "javascript": _extract_javascript,
     "typescript": _extract_javascript,
     "go": _extract_go,
     "rust": _extract_rust,
+    "html": _extract_html,
 }
 
 
@@ -529,10 +603,22 @@ def _rust_candidates(root, ranges: list[tuple[int, int]]) -> None:
             ranges.append((node.start_byte, node.end_byte))
 
 
+def _html_candidates(root, ranges: list[tuple[int, int]]) -> None:
+    _html_candidates_walk(root, ranges)
+
+
+def _html_candidates_walk(node, ranges: list[tuple[int, int]]) -> None:
+    for child in node.children:
+        if child.type in ("element", "script_element", "style_element"):
+            ranges.append((child.start_byte, child.end_byte))
+        _html_candidates_walk(child, ranges)
+
+
 _CANDIDATE_FINDERS = {
     "python": _python_candidates,
     "javascript": _js_candidates,
     "typescript": _js_candidates,
     "go": _go_candidates,
     "rust": _rust_candidates,
+    "html": _html_candidates,
 }

@@ -1,0 +1,47 @@
+{
+  "name": "@loom/desktop",
+  "private": true,
+  "version": "0.3.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 1420",
+    "build": "tsc && vite build",
+    "bundle:python": "env UV_CACHE_DIR=../../.uv-cache uv run python ../../scripts/build_macos_desktop_bundle_resources.py --python-version 3.11.14 --output-dir src-tauri/target/macos-bundle-resources",
+    "bundle:dmg": "bash ../../scripts/build_macos_desktop_dmg.sh --app-bundle \"src-tauri/target/release/bundle/macos/Loom Desktop.app\" --output \"src-tauri/target/release/bundle/dmg/Loom Desktop.dmg\" --volume-name \"Loom Desktop\"",
+    "bundle:dmg:open": "bash ../../scripts/build_macos_desktop_dmg.sh --app-bundle \"src-tauri/target/release/bundle/macos/Loom Desktop.app\" --output \"src-tauri/target/release/bundle/dmg/Loom Desktop.dmg\" --volume-name \"Loom Desktop\" --open",
+    "icons:sync": "tauri icon src-tauri/icons/source/loom-iOS-Default-1024x1024@2x.png --output src-tauri/icons",
+    "package:macos": "pnpm exec tauri build --bundles app --ci --no-sign && pnpm bundle:dmg:open",
+    "test": "vitest run",
+    "preview": "vite preview --host 127.0.0.1 --port 1420",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build --bundles app"
+  },
+  "dependencies": {
+    "@tailwindcss/typography": "^0.5.19",
+    "@tailwindcss/vite": "^4.2.2",
+    "@tauri-apps/api": "^2.0.0",
+    "@tauri-apps/plugin-dialog": "^2.6.0",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "lucide-react": "^1.0.1",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1",
+    "tailwind-merge": "^3.5.0",
+    "tailwindcss": "^4.2.2"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0",
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.0",
+    "@testing-library/user-event": "^14.6.1",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4.0.0",
+    "jsdom": "^26.1.0",
+    "typescript": "^5.7.0",
+    "vite": "^6.0.0",
+    "vitest": "^2.1.8"
+  }
+}

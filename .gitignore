@@ -6,6 +6,7 @@ __pycache__/
 dist/
 build/
 *.egg
+target/
 
 # Virtual environments
 .venv/
@@ -45,3 +46,6 @@ coverage.xml
 
 # Local tool caches
 .uv-cache/
+.pnpm-home/
+node_modules/
+pnpm-debug.log*

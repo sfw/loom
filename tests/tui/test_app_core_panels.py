@@ -609,6 +609,8 @@ class TestSidebarWidget:
 
 class TestChatLogStreaming:
     def test_flush_stream_buffer_uses_internal_text(self):
+        from rich.markdown import Markdown as RichMarkdown
+
         from loom.tui.widgets.chat_log import ChatLog
 
         log = ChatLog()
@@ -619,7 +621,8 @@ class TestChatLogStreaming:
 
         log._flush_stream_buffer()
 
-        widget.update.assert_called_once_with("hello world")
+        widget.update.assert_called_once()
+        assert isinstance(widget.update.call_args.args[0], RichMarkdown)
         assert log._stream_text == "hello world"
         assert log._stream_buffer == []
 
@@ -637,7 +640,7 @@ class TestChatLogStreaming:
         log._flush_and_reset_stream()
 
         assert widget.update.call_count == 2
-        assert widget.update.call_args_list[0].args[0] == "chunk!"
+        assert isinstance(widget.update.call_args_list[0].args[0], RichMarkdown)
         assert isinstance(widget.update.call_args_list[1].args[0], RichMarkdown)
         assert log._stream_widget is None
         assert log._stream_text == ""
@@ -737,7 +740,7 @@ class TestChatLogStreaming:
         assert str(rendered) == "Error"
 
     def test_streaming_widget_expands_to_available_width(self):
-        from loom.tui.widgets.chat_log import ChatLog
+        from loom.tui.widgets.chat_log import ChatLog, LiveMarkdownWidget
 
         log = ChatLog()
         mounted: list = []
@@ -747,8 +750,49 @@ class TestChatLogStreaming:
         log.add_streaming_text("hello")
 
         assert log._stream_widget is not None
+        assert isinstance(log._stream_widget, LiveMarkdownWidget)
         assert log._stream_widget.expand is True
         assert mounted == [log._stream_widget]
+
+    def test_live_feedback_chunks_are_grouped_only_for_distinct_messages(self):
+        from loom.tui.widgets.chat_log import ChatLog, LiveMarkdownWidget
+
+        log = ChatLog()
+        mounted: list = []
+        log.mount = lambda widget, *_args, **_kwargs: mounted.append(widget)
+        log._scroll_to_end = lambda: None
+
+        log.add_live_feedback("step one")
+        log.add_live_feedback(" and step two")
+        log.add_live_feedback("Let me try a broader search.")
+
+        assert isinstance(log._feedback_widget, LiveMarkdownWidget)
+        assert mounted == [log._feedback_widget]
+        assert "\n\n" in log._feedback_text
+        assert "step one and step two" in log._feedback_text
+        assert log._feedback_widget.border_title == "Live Feedback"
+        body = log._feedback_widget._body.render()
+        assert type(body).__name__ == "RichVisual"
+
+    def test_live_feedback_finalizes_before_next_message(self):
+        from loom.tui.widgets.chat_log import ChatLog
+
+        log = ChatLog()
+        mounted: list = []
+        log.mount = lambda widget, *_args, **_kwargs: mounted.append(widget)
+        log._scroll_to_end = lambda: None
+
+        log.add_live_feedback("Planning the next search.")
+        feedback_widget = log._feedback_widget
+
+        log.add_model_text("Final answer.")
+
+        assert feedback_widget is not None
+        assert feedback_widget.border_title == "Feedback"
+        assert "is-live" not in feedback_widget.classes
+        assert log._feedback_widget is None
+        assert len(mounted) == 2
+        assert mounted[0] is feedback_widget
 
     def test_streaming_scrolls_on_mount_and_flush_only(self):
         from loom.tui.widgets.chat_log import ChatLog
@@ -768,6 +812,37 @@ class TestChatLogStreaming:
         log.add_streaming_text("e")
 
         assert log._scroll_to_end.call_count == 2
+
+    def test_streaming_markdown_state_keeps_stable_prefix_between_updates(self):
+        from rich.console import Group
+
+        from loom.tui.widgets.chat_log import StreamingMarkdownState
+
+        state = StreamingMarkdownState()
+
+        first = state.render("First paragraph.\n\nSecond")
+        assert state.stable_prefix == "First paragraph.\n\n"
+        assert isinstance(first, Group)
+
+        second = state.render("First paragraph.\n\nSecond line")
+        assert state.stable_prefix == "First paragraph.\n\n"
+        assert isinstance(second, Group)
+
+        state.render("Replacement text")
+        assert state.stable_prefix == ""
+
+    def test_add_thinking_text_mounts_transcript_block(self):
+        from loom.tui.widgets.chat_log import ChatLog
+
+        log = ChatLog()
+        mounted: list = []
+        log.mount = lambda widget, *_args, **_kwargs: mounted.append(widget)
+        log._scroll_to_end = lambda: None
+
+        log.add_thinking_text("Checking the transcript.")
+
+        assert len(mounted) == 1
+        assert "thinking-msg" in mounted[0].classes
 
     def test_scroll_to_end_is_coalesced_per_refresh(self):
         from loom.tui.widgets.chat_log import ChatLog
@@ -863,6 +938,35 @@ class TestChatLogStreaming:
         log.reset_runtime_state()
         assert log.has_delegate_progress_section("call_1") is False
 
+    def test_tool_call_completion_reuses_existing_widget(self):
+        from loom.tui.widgets.chat_log import ChatLog
+
+        log = ChatLog()
+        mounted: list = []
+        log.mount = lambda widget, *_args, **_kwargs: mounted.append(widget)
+        log._scroll_to_end = lambda: None
+
+        log.add_tool_call(
+            "web_search",
+            {"query": "blink49 canada"},
+            tool_call_id="call_1",
+        )
+        log.add_tool_call(
+            "web_search",
+            {"query": "blink49 canada"},
+            tool_call_id="call_1",
+            success=True,
+            elapsed_ms=420,
+            output="1. Blink49\n   https://blink49.com",
+        )
+
+        assert len(mounted) == 1
+        widget = mounted[0]
+        assert getattr(widget, "_success", None) is True
+        assert getattr(widget, "_elapsed_ms", 0) == 420
+        assert getattr(widget, "_output", "") == "1. Blink49\n   https://blink49.com"
+        assert log._tool_call_widgets["call_1"] is widget
+
 class TestCoworkSessionTokens:
     def test_initial_total_tokens(self):
         from unittest.mock import MagicMock
@@ -888,17 +992,14 @@ class TestQuitConfirmation:
             workspace=Path("/tmp"),
         )
         app._confirm_exit = AsyncMock(return_value=True)
-        app._store = MagicMock()
-        app._store.update_session = AsyncMock()
+        app._persist_process_run_ui_state = AsyncMock()
         app._session = SimpleNamespace(session_id="sess-123")
         app.exit = MagicMock()
 
         await app.action_quit()
 
         app._confirm_exit.assert_awaited_once()
-        app._store.update_session.assert_awaited_once_with(
-            "sess-123", is_active=False,
-        )
+        app._persist_process_run_ui_state.assert_awaited_once_with(is_active=False)
         app.exit.assert_called_once()
 
     @pytest.mark.asyncio
@@ -911,15 +1012,14 @@ class TestQuitConfirmation:
             workspace=Path("/tmp"),
         )
         app._confirm_exit = AsyncMock(return_value=False)
-        app._store = MagicMock()
-        app._store.update_session = AsyncMock()
+        app._persist_process_run_ui_state = AsyncMock()
         app._session = SimpleNamespace(session_id="sess-123")
         app.exit = MagicMock()
 
         await app.action_quit()
 
         app._confirm_exit.assert_awaited_once()
-        app._store.update_session.assert_not_called()
+        app._persist_process_run_ui_state.assert_not_awaited()
         app.exit.assert_not_called()
 
     @pytest.mark.asyncio

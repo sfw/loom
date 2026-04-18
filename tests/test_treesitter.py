@@ -246,6 +246,42 @@ class TestExtractRust:
         assert "load" in result.functions
 
 
+# --- HTML ---
+
+
+class TestExtractHtml:
+    def test_html_elements_ids_classes_and_imports(self):
+        source = (
+            "<!DOCTYPE html>"
+            "<html><head><link rel='stylesheet' href='/styles.css'></head>"
+            "<body>"
+            "<header id='hero' class='hero shell'></header>"
+            "<main><script src='/app.js'></script><my-card></my-card></main>"
+            "</body></html>"
+        )
+        result = extract_with_treesitter(source, "html")
+        assert result is not None
+        assert "header" in result.elements
+        assert "main" in result.elements
+        assert "my-card" in result.elements
+        assert "hero" in result.ids
+        assert "hero" in result.classes
+        assert "shell" in result.classes
+        assert "/styles.css" in result.imports
+        assert "/app.js" in result.imports
+
+    def test_skips_html_shell_tags(self):
+        result = extract_with_treesitter(
+            "<html><head></head><body><main></main></body></html>",
+            "html",
+        )
+        assert result is not None
+        assert "html" not in result.elements
+        assert "head" not in result.elements
+        assert "body" not in result.elements
+        assert "main" in result.elements
+
+
 # --- Python edge cases ---
 
 
@@ -351,6 +387,16 @@ class TestAnalyzeFileWithTreeSitter:
         assert "foo" in result.functions
         assert "mod" in result.imports
 
+    def test_html_through_analyze_file(self):
+        from loom.tools.code_analysis import analyze_file
+
+        source = "<html><body><main id='app'><script src='/app.js'></script></main></body></html>"
+        result = analyze_file("index.html", source)
+        assert result.language == "html"
+        assert "main" in result.elements
+        assert "app" in result.ids
+        assert "/app.js" in result.imports
+
 
 # ============================================================================
 # Phase B: Structural candidate finding
@@ -401,6 +447,22 @@ class TestStructuralCandidates:
         )
         candidates = find_structural_candidates(source, "rust")
         assert len(candidates) >= 2
+
+    def test_html_candidates(self):
+        source = (
+            "<html><body>\n"
+            "  <section id='hero'>\n"
+            "    <h1>Welcome</h1>\n"
+            "  </section>\n"
+            "  <section id='features'>\n"
+            "    <p>Fast</p>\n"
+            "  </section>\n"
+            "</body></html>\n"
+        )
+        candidates = find_structural_candidates(source, "html")
+        assert len(candidates) >= 4
+        for start, end in candidates:
+            assert start < end
 
     def test_unsupported_language_empty(self):
         assert find_structural_candidates("some text", "unknown") == []
@@ -495,3 +557,46 @@ class TestStructuralFuzzyMatch:
         )
         assert result.success
         assert "new_value" in (workspace / "config.txt").read_text()
+
+    async def test_structural_match_html_section(self, ctx, workspace: Path):
+        """HTML files should use structural matching to target the right element."""
+        from loom.tools.file_ops import EditFileTool
+
+        (workspace / "index.html").write_text(
+            "<html>\n"
+            "  <body>\n"
+            "    <section id=\"hero\">\n"
+            "      <h1>Welcome</h1>\n"
+            "      <p>Ship faster</p>\n"
+            "    </section>\n"
+            "    <section id=\"features\">\n"
+            "      <h2>Features</h2>\n"
+            "      <p>Reliable</p>\n"
+            "    </section>\n"
+            "  </body>\n"
+            "</html>\n",
+        )
+        tool = EditFileTool()
+        result = await tool.execute(
+            {
+                "path": "index.html",
+                "old_str": (
+                    "<section id=\"features\">\n"
+                    "  <h2>Features</h2>\n"
+                    "  <p>Reliable</p>\n"
+                    "</section>"
+                ),
+                "new_str": (
+                    "    <section id=\"features\">\n"
+                    "      <h2>Features</h2>\n"
+                    "      <p>Fast and reliable</p>\n"
+                    "    </section>"
+                ),
+            },
+            ctx,
+        )
+        assert result.success
+        assert "fuzzy" in result.output.lower()
+        content = (workspace / "index.html").read_text()
+        assert "Fast and reliable" in content
+        assert "Ship faster" in content

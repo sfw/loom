@@ -69,6 +69,7 @@ class GlobFindTool(Tool):
                 str(raw_path),
                 ctx.workspace,
                 ctx.read_roots,
+                ctx.read_path_map,
             )
         else:
             search_path = ctx.workspace
@@ -86,6 +87,7 @@ class GlobFindTool(Tool):
                     search_path,
                     ctx.workspace,
                     ctx.read_roots,
+                    read_path_map=ctx.read_path_map,
                 )
             except Exception:
                 return ToolResult(

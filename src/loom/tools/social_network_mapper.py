@@ -261,7 +261,12 @@ def _load_nodes_and_edges(
     if (extract_from_text or (not edges and (text or text_path))) and (text or text_path):
         text_blob = text
         if text_path and ctx.workspace is not None:
-            path = tool._resolve_read_path(text_path, ctx.workspace, ctx.read_roots)
+            path = tool._resolve_read_path(
+                text_path,
+                ctx.workspace,
+                ctx.read_roots,
+                ctx.read_path_map,
+            )
             if path.exists() and path.is_file():
                 text_blob = path.read_text(encoding="utf-8")
         extracted = _extract_edges_from_text(text_blob)

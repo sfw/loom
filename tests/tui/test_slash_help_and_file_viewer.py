@@ -112,6 +112,70 @@ class TestSlashHelp:
         app._load_older_chat_history.assert_awaited_once()
         chat.add_info.assert_called_once_with("Loaded older chat history.")
 
+    @pytest.mark.asyncio
+    async def test_history_search_routes_to_transcript_search(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._search_chat_history = MagicMock(return_value=3)
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+
+        handled = await app._handle_slash_command("/history search render cap")
+
+        assert handled is True
+        app._search_chat_history.assert_called_once_with("render cap")
+        chat.add_info.assert_called_once_with(
+            "Found 3 transcript match(es) for 'render cap'."
+        )
+
+    @pytest.mark.asyncio
+    async def test_history_next_reports_missing_search(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._step_chat_history_search = MagicMock(return_value=(False, 0, 0))
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+
+        handled = await app._handle_slash_command("/history next")
+
+        assert handled is True
+        app._step_chat_history_search.assert_called_once_with(1)
+        chat.add_info.assert_called_once_with("No active transcript search.")
+
+    @pytest.mark.asyncio
+    async def test_history_transcript_and_thinking_controls_toggle_flags(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._set_chat_transcript_mode = MagicMock(return_value=True)
+        app._set_chat_transcript_show_thinking = MagicMock(return_value=True)
+        chat = MagicMock()
+        app.query_one = MagicMock(return_value=chat)
+
+        handled_transcript = await app._handle_slash_command("/history transcript on")
+        handled_thinking = await app._handle_slash_command("/history thinking show")
+
+        assert handled_transcript is True
+        assert handled_thinking is True
+        app._set_chat_transcript_mode.assert_called_once_with(True)
+        app._set_chat_transcript_show_thinking.assert_called_once_with(True)
+        assert chat.add_info.call_args_list[0].args[0] == "Transcript mode enabled."
+        assert chat.add_info.call_args_list[1].args[0] == "Transcript thinking shown."
+
 class TestFileViewer:
     def test_renderer_registry_supports_common_types(self):
         from loom.tui.screens.file_viewer import resolve_file_renderer

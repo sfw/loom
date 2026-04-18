@@ -51,6 +51,7 @@ class StreamChunk:
     """A single chunk from a streaming model response."""
 
     text: str = ""
+    thinking: str = ""
     done: bool = False
     tool_calls: list[ToolCall] | None = None
     usage: TokenUsage | None = None

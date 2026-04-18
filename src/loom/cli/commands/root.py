@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import platform
 import sys
 from pathlib import Path
 
@@ -19,6 +21,11 @@ from loom.cli.context import (
 from loom.cli.http_tasks import _cancel_task, _check_status, _run_task
 from loom.cli.persistence import PersistenceInitError, _init_persistence
 from loom.config import Config, ConfigError, load_config
+from loom.runtime.capabilities import (
+    optional_addon_status_by_key,
+    optional_addon_statuses,
+)
+from loom.tools import create_default_registry
 
 
 @click.group(invoke_without_command=True)
@@ -99,8 +106,8 @@ def cli(
         )
         ctx.obj["allow_ephemeral"] = bool(allow_ephemeral)
     except ConfigError as e:
-        if ctx.invoked_subcommand == "setup":
-            # Let setup proceed even with broken/missing config.
+        if ctx.invoked_subcommand in {"setup", "doctor"}:
+            # Let setup/doctor proceed even with broken/missing config.
             ctx.obj["config"] = Config()
             ctx.obj["base_config"] = ctx.obj["config"]
             ctx.obj["config_path"] = resolved_config_path
@@ -112,6 +119,7 @@ def cli(
                 auth_config_path.expanduser().resolve() if auth_config_path else None
             )
             ctx.obj["allow_ephemeral"] = bool(allow_ephemeral)
+            ctx.obj["config_error"] = str(e)
         else:
             click.echo(f"Configuration error: {e}", err=True)
             sys.exit(1)
@@ -247,6 +255,279 @@ def cowork(
         ctx.obj.get("explicit_auth_path"),
         bool(allow_ephemeral or ctx.obj.get("allow_ephemeral", False)),
     )
+
+
+@cli.command()
+@click.option(
+    "--require-addon",
+    "required_addons",
+    multiple=True,
+    help="Require one optional runtime addon by key; exits non-zero when missing.",
+)
+@click.pass_context
+def doctor(ctx: click.Context, required_addons: tuple[str, ...]) -> None:
+    """Report Loom runtime health, configuration, and addon availability."""
+    from loom.auth.config import AuthConfigError, load_merged_auth_config
+    from loom.mcp.config import MCPConfigManagerError, load_merged_mcp_config
+    from loom.models.base import ModelNotAvailableError
+    from loom.models.router import ModelRouter
+
+    statuses = optional_addon_statuses()
+    status_by_key = {status.key: status for status in statuses}
+    warnings: list[str] = []
+    errors: list[str] = []
+    config_error = str(ctx.obj.get("config_error", "") or "").strip()
+    config = ctx.obj.get("config") or Config()
+    workspace = (ctx.obj.get("workspace") or Path.cwd()).resolve()
+    config_path = ctx.obj.get("config_path")
+    explicit_mcp_path = ctx.obj.get("explicit_mcp_path")
+    explicit_auth_path = ctx.obj.get("explicit_auth_path")
+
+    click.echo("Runtime doctor")
+
+    click.echo()
+    click.echo("Environment")
+    click.echo(f"- Loom version: {__version__}")
+    click.echo(f"- Python: {platform.python_version()}")
+    click.echo(f"- Platform: {platform.system()} {platform.release()}")
+    click.echo(f"- Workspace: {workspace}")
+    click.echo(f"- Config path: {config_path or '(built-in defaults only)'}")
+    click.echo(f"- Explicit MCP config: {explicit_mcp_path or '(none)'}")
+    click.echo(f"- Explicit auth config: {explicit_auth_path or '(none)'}")
+
+    click.echo()
+    click.echo("Configuration")
+    if config_error:
+        click.echo("- Status: invalid")
+        click.echo(f"  Detail: {config_error}")
+        errors.append(f"Invalid Loom config: {config_error}")
+        click.echo("- Models: skipped because configuration is invalid")
+    else:
+        source_label = config.source_path or "(built-in defaults)"
+        click.echo("- Status: ok")
+        click.echo(f"  Source: {source_label}")
+        click.echo(f"- Server: {config.server.host}:{config.server.port}")
+        click.echo(f"- Models configured: {len(config.models)}")
+        if not config.models:
+            warnings.append(
+                "No models are configured; `loom setup` or a populated loom.toml is still needed."
+            )
+            click.echo("  Detail: no configured model providers")
+        else:
+            router = ModelRouter.from_config(config)
+            for role in ("executor", "planner", "verifier"):
+                try:
+                    provider = router.select(role=role)
+                    provider_name = str(getattr(provider, "name", "") or "<unnamed>")
+                    click.echo(f"- Model role {role}: {provider_name}")
+                except ModelNotAvailableError as e:
+                    click.echo(f"- Model role {role}: missing")
+                    warnings.append(str(e))
+        click.echo(f"- Scratch path: {config.scratch_path}")
+        click.echo(f"- Log path: {config.log_path}")
+
+    click.echo()
+    click.echo("Persistence")
+    if config_error:
+        click.echo("- Status: skipped because configuration is invalid")
+    else:
+        db_path = config.database_path
+        click.echo(f"- Database path: {db_path}")
+        parent = db_path.parent
+        if parent.exists():
+            parent_state = "writable" if os.access(parent, os.W_OK) else "not writable"
+        else:
+            parent_state = "missing (will be created on first run)"
+        click.echo(f"- Database parent: {parent} ({parent_state})")
+        if parent.exists() and not parent.is_dir():
+            errors.append(f"Database parent is not a directory: {parent}")
+            click.echo("- Status: failed")
+            click.echo("  Detail: database parent path exists but is not a directory")
+        elif parent.exists() and not os.access(parent, os.W_OK):
+            errors.append(f"Database parent directory is not writable: {parent}")
+            click.echo("- Status: failed")
+            click.echo("  Detail: database parent directory is not writable")
+        elif not db_path.exists():
+            click.echo("- Status: missing (will initialize on first run)")
+        else:
+            async def _inspect_db() -> tuple[dict[str, object], str]:
+                import aiosqlite
+
+                from loom.state.migrations import MIGRATIONS, migration_status, verify_schema
+
+                async with aiosqlite.connect(db_path) as conn:
+                    payload = await migration_status(conn, steps=MIGRATIONS)
+                    await verify_schema(conn, steps=MIGRATIONS)
+                    return payload, "ok"
+
+            try:
+                payload, _health = asyncio.run(_inspect_db())
+            except Exception as e:
+                click.echo("- Status: failed")
+                click.echo(f"  Detail: {e}")
+                errors.append(f"Database schema check failed: {e}")
+            else:
+                applied_ids = list(payload.get("applied_ids", []))
+                pending_ids = list(payload.get("pending_ids", []))
+                click.echo("- Status: ok")
+                click.echo(f"  Applied migrations: {len(applied_ids)}")
+                click.echo(f"  Pending migrations: {len(pending_ids)}")
+
+    click.echo()
+    click.echo("Auth")
+    try:
+        auth = load_merged_auth_config(
+            workspace=workspace,
+            explicit_path=explicit_auth_path,
+        )
+    except AuthConfigError as e:
+        click.echo("- Status: failed")
+        click.echo(f"  Detail: {e}")
+        errors.append(f"Auth config invalid: {e}")
+    else:
+        click.echo("- Status: ok")
+        click.echo(
+            f"  User config: {auth.user_path} "
+            f"({'present' if auth.user_path.exists() else 'missing'})"
+        )
+        if auth.explicit_path is not None:
+            click.echo(
+                f"  Explicit overlay: {auth.explicit_path} "
+                f"({'present' if auth.explicit_path.exists() else 'missing'})"
+            )
+        if auth.workspace_defaults_path is not None:
+            click.echo(
+                f"  Workspace defaults: {auth.workspace_defaults_path} "
+                f"({'present' if auth.workspace_defaults_path.exists() else 'missing'})"
+            )
+        click.echo(f"- Profiles: {len(auth.config.profiles)}")
+        click.echo(f"- User defaults: {len(auth.config.defaults)}")
+        click.echo(f"- Resource defaults: {len(auth.config.resource_defaults)}")
+        click.echo(f"- Workspace defaults: {len(auth.workspace_defaults)}")
+
+    click.echo()
+    click.echo("MCP")
+    if config_error:
+        click.echo("- Status: skipped legacy loom.toml MCP layer because configuration is invalid")
+        click.echo("- Detail: user/workspace/explicit MCP files were not merged")
+    else:
+        try:
+            merged_mcp = load_merged_mcp_config(
+                config=config,
+                workspace=workspace,
+                explicit_path=explicit_mcp_path,
+                legacy_config_path=config_path,
+            )
+        except MCPConfigManagerError as e:
+            click.echo("- Status: failed")
+            click.echo(f"  Detail: {e}")
+            errors.append(f"MCP config invalid: {e}")
+        else:
+            servers = merged_mcp.as_views()
+            enabled_count = sum(1 for view in servers if view.server.enabled)
+            oauth_count = sum(1 for view in servers if view.server.oauth.enabled)
+            remote_count = sum(1 for view in servers if view.server.type == "remote")
+            click.echo("- Status: ok")
+            click.echo(
+                f"  User config: {merged_mcp.user_path} "
+                f"({'present' if merged_mcp.user_path.exists() else 'missing'})"
+            )
+            click.echo(
+                f"  Workspace config: {merged_mcp.workspace_path} "
+                f"({'present' if merged_mcp.workspace_path.exists() else 'missing'})"
+            )
+            if merged_mcp.explicit_path is not None:
+                click.echo(
+                    f"  Explicit overlay: {merged_mcp.explicit_path} "
+                    f"({'present' if merged_mcp.explicit_path.exists() else 'missing'})"
+                )
+            if merged_mcp.legacy_config_path is not None:
+                click.echo(f"  Legacy layer: {merged_mcp.legacy_config_path}")
+            click.echo(f"- Servers: {len(servers)} total, {enabled_count} enabled")
+            click.echo(f"- Remote servers: {remote_count}")
+            click.echo(f"- OAuth-enabled servers: {oauth_count}")
+            if enabled_count and not status_by_key.get("mcp", None):
+                warnings.append("MCP addon status could not be resolved.")
+            elif enabled_count and not status_by_key["mcp"].installed:
+                warnings.append(
+                    "MCP servers are configured but the MCP addon is missing."
+                )
+
+    click.echo()
+    click.echo("Optional Addons")
+    if statuses:
+        for status in statuses:
+            state = "installed" if status.installed else "missing"
+            click.echo(f"- {status.label} ({status.key}): {state}")
+            click.echo(f"  Required for: {status.required_for}")
+            click.echo(f"  Install: {status.install_hint}")
+            if status.detail:
+                click.echo(f"  Detail: {status.detail}")
+    else:
+        click.echo("No optional addons registered.")
+
+    click.echo()
+    click.echo("Tool Availability")
+    if config_error:
+        click.echo("- Status: skipped because configuration is invalid")
+    else:
+        registry = create_default_registry(config)
+        availability_rows = registry.availability_rows(execution_surface="cli")
+        unavailable_rows = [
+            row for row in availability_rows if not bool(row.get("runnable", False))
+        ]
+        degraded_rows = [
+            row
+            for row in availability_rows
+            if str(row.get("state", "") or "").strip().lower() == "degraded"
+        ]
+        click.echo(f"- Registered tools: {len(availability_rows)}")
+        click.echo(f"- Runnable tools: {len(availability_rows) - len(unavailable_rows)}")
+        click.echo(f"- Degraded tools: {len(degraded_rows)}")
+        click.echo(f"- Unavailable tools: {len(unavailable_rows)}")
+        for row in unavailable_rows[:12]:
+            name = str(row.get("name", "") or "").strip()
+            reasons = row.get("reasons", [])
+            detail = ""
+            if isinstance(reasons, list) and reasons:
+                first = reasons[0] if isinstance(reasons[0], dict) else {}
+                detail = str(first.get("message", "") or "").strip()
+            click.echo(f"  - {name}: {detail or 'unavailable'}")
+
+    missing_required: list[str] = []
+    for raw_key in required_addons:
+        key = str(raw_key or "").strip().lower()
+        status = optional_addon_status_by_key(key)
+        if status is None:
+            errors.append(f"Unknown addon key: {raw_key}")
+            continue
+        if not status.installed:
+            missing_required.append(key)
+
+    if warnings:
+        click.echo()
+        click.echo("Warnings")
+        for item in warnings:
+            click.echo(f"- {item}")
+
+    if missing_required:
+        rendered = ", ".join(sorted(missing_required))
+        errors.append(f"Missing required addon(s): {rendered}")
+
+    if errors:
+        click.echo()
+        click.echo("Errors")
+        for item in errors:
+            click.echo(f"- {item}")
+        click.echo("Doctor failed", err=True)
+        sys.exit(1)
+
+    if warnings:
+        click.echo()
+        click.echo("Doctor passed with warnings")
+        return
+
+    click.echo("Doctor passed")
 
 
 @cli.command()

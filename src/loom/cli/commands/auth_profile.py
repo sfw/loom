@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
+from dataclasses import replace
 
 import click
 
@@ -430,6 +431,18 @@ def attach_auth_profile_commands(
                     err=True,
                 )
             sys.exit(1)
+        if str(getattr(profile, "status", "ready") or "ready").strip().lower() == "draft":
+            try:
+                upsert_auth_profile(
+                    _auth_write_path(ctx),
+                    replace(profile, status="ready"),
+                    must_exist=True,
+                )
+            except AuthConfigError as e:
+                click.echo(
+                    f"Auth profile login warning: failed to promote draft to ready: {e}",
+                    err=True,
+                )
         click.echo(
             f"Stored OAuth token for auth profile '{clean_profile_id}' in {result.token_ref}"
         )
@@ -573,6 +586,18 @@ def attach_auth_profile_commands(
         except OAuthProfileError as e:
             click.echo(f"Auth profile refresh failed ({e.reason_code}): {e}", err=True)
             sys.exit(1)
+        if str(getattr(profile, "status", "ready") or "ready").strip().lower() == "draft":
+            try:
+                upsert_auth_profile(
+                    _auth_write_path(ctx),
+                    replace(profile, status="ready"),
+                    must_exist=True,
+                )
+            except AuthConfigError as e:
+                click.echo(
+                    f"Auth profile refresh warning: failed to promote draft to ready: {e}",
+                    err=True,
+                )
 
         payload = {
             "profile_id": clean_profile_id,

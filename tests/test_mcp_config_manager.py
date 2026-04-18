@@ -12,6 +12,7 @@ from loom.mcp.config import (
     MCPConfigManager,
     MCPConfigManagerError,
     apply_mcp_overrides,
+    load_mcp_approvals,
     load_mcp_file,
     load_merged_mcp_config,
     redact_server_env,
@@ -373,3 +374,67 @@ command = "legacy"
     view = manager.get_view("legacy_demo")
     assert view is not None
     assert view.source == "explicit"
+
+
+def test_workspace_remote_server_requires_explicit_approval(tmp_path: Path):
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    workspace_mcp = workspace / ".loom" / "mcp.toml"
+    workspace_mcp.parent.mkdir(parents=True)
+    workspace_mcp.write_text(
+        """
+[mcp.servers.remote_demo]
+type = "remote"
+url = "https://example.com/mcp"
+"""
+    )
+    explicit_mcp = tmp_path / "explicit.toml"
+    approvals_path = tmp_path / "mcp.approvals.toml"
+
+    merged = load_merged_mcp_config(
+        config=Config(),
+        workspace=workspace,
+        explicit_path=explicit_mcp,
+        user_path=tmp_path / "user.toml",
+        approvals_path=approvals_path,
+    )
+
+    view = merged.get("remote_demo")
+    assert view is not None
+    assert view.server.approval_required is True
+    assert view.server.approval_state == "pending"
+    assert merged.approvals_path == approvals_path
+
+
+def test_manager_set_server_approval_persists_by_fingerprint(tmp_path: Path):
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    workspace_mcp = workspace / ".loom" / "mcp.toml"
+    workspace_mcp.parent.mkdir(parents=True)
+    workspace_mcp.write_text(
+        """
+[mcp.servers.remote_demo]
+type = "remote"
+url = "https://example.com/mcp"
+"""
+    )
+    approvals_path = tmp_path / "mcp.approvals.toml"
+    manager = MCPConfigManager(
+        config=Config(),
+        workspace=workspace,
+        explicit_path=tmp_path / "explicit.toml",
+        user_path=tmp_path / "user.toml",
+        approvals_path=approvals_path,
+    )
+
+    saved_path = manager.set_server_approval("remote_demo", status="approved")
+
+    assert saved_path == approvals_path
+    approvals = load_mcp_approvals(approvals_path)
+    view = manager.get_view("remote_demo")
+    assert view is not None
+    assert view.server.server_fingerprint in approvals
+    assert approvals[view.server.server_fingerprint].status == "approved"
+    refreshed = manager.get_view("remote_demo")
+    assert refreshed is not None
+    assert refreshed.server.approval_state == "approved"

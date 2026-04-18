@@ -44,7 +44,7 @@ class TestDefaultConfig:
         assert config.execution.sealed_artifact_post_call_guard == "warn"
         assert config.execution.planner_degraded_mode == "allow"
         assert config.execution.enable_sqlite_remediation_queue is False
-        assert config.execution.enable_durable_task_runner is False
+        assert config.execution.enable_durable_task_runner is True
         assert config.execution.enable_mutation_idempotency is False
         assert config.execution.enable_slo_metrics is False
         assert config.execution.delegate_task_timeout_seconds == 14400
@@ -464,6 +464,7 @@ enable_agent_tools = true
 enable_wp_tools = true
 wp_high_risk_requires_confirmation = false
 agent_tools_allowed_providers = ["codex", "opencode"]
+tool_binary_overrides = { codex = "/opt/homebrew/bin/codex", wp = "/usr/local/bin/wp" }
 agent_tools_max_timeout_seconds = 2400
 agent_tools_default_network_mode = "off"
 """)
@@ -473,6 +474,10 @@ agent_tools_default_network_mode = "off"
         assert config.execution.enable_wp_tools is True
         assert config.execution.wp_high_risk_requires_confirmation is False
         assert config.execution.agent_tools_allowed_providers == ["codex", "opencode"]
+        assert config.execution.tool_binary_overrides == {
+            "codex": "/opt/homebrew/bin/codex",
+            "wp": "/usr/local/bin/wp",
+        }
         assert config.execution.agent_tools_max_timeout_seconds == 2400
         assert config.execution.agent_tools_default_network_mode == "off"
 

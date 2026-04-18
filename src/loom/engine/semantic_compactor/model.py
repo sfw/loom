@@ -11,7 +11,11 @@ from loom.models.request_diagnostics import (
     collect_request_diagnostics,
     collect_response_diagnostics,
 )
-from loom.models.retry import ModelRetryPolicy, call_with_model_retry
+from loom.models.retry import (
+    ModelRetryPolicy,
+    build_model_retry_event_payload,
+    call_with_model_retry,
+)
 from loom.models.router import ModelRouter
 
 
@@ -183,12 +187,53 @@ async def invoke_compactor_model(
             },
         )
 
+    def _on_retry_scheduled(
+        attempt: int,
+        max_attempts: int,
+        error: BaseException,
+        remaining: int,
+        delay_seconds: float,
+    ) -> None:
+        elapsed = (
+            time.monotonic() - attempt_started_at if attempt_started_at > 0 else 0.0
+        )
+        emit_model_event(
+            model_name=model.name,
+            phase="done",
+            details={
+                "operation": "complete",
+                "origin": request_diag.origin,
+                "invocation_attempt": attempt,
+                "invocation_max_attempts": max_attempts,
+                "retry_queue_remaining": remaining,
+                "compactor_label": label,
+                "compactor_requested_max_chars": requested_max_chars,
+                "compactor_target_chars": target_chars,
+                "compactor_hard_limit_chars": hard_limit,
+                "compactor_limit_chars": hard_limit,
+                "compactor_token_budget_chars": hard_limit,
+                "compactor_max_tokens": max_tokens,
+                "compactor_strict": bool(strict),
+                "compactor_validation_attempt": int(validation_attempt),
+                "compactor_retry_count": max(0, int(validation_attempt) - 1),
+                "duration_seconds": round(elapsed, 6),
+                "compactor_response_chars": 0,
+                "error_type": type(error).__name__,
+                "error": str(error),
+                **build_model_retry_event_payload(
+                    error,
+                    delay_seconds=delay_seconds,
+                ),
+            },
+        )
+
     try:
         response = await call_with_model_retry(
             _invoke_model,
             policy=policy,
             should_retry=should_retry,
             on_failure=_on_failure,
+            on_retry_scheduled=_on_retry_scheduled,
         )
         elapsed = (
             time.monotonic() - attempt_started_at if attempt_started_at > 0 else 0.0

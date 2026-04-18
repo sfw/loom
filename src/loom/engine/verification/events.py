@@ -23,6 +23,7 @@ from loom.events.types import (
     VERIFICATION_STARTED,
 )
 
+from .development import event_safe_development_summary
 from .policy import classify_shadow_diff
 from .types import VerificationResult
 
@@ -113,19 +114,26 @@ def emit_verification_outcome(
 ) -> None:
     if not event_bus or not task_id:
         return
+    metadata = result.metadata if isinstance(result.metadata, dict) else {}
+    dev_summary = event_safe_development_summary(
+        metadata.get("dev_verification_summary", {}),
+    )
+    data: dict[str, object] = {
+        "subtask_id": subtask_id,
+        "tier": result.tier,
+        "passed": result.passed,
+        "outcome": result.outcome,
+        "reason_code": result.reason_code,
+        "severity_class": result.severity_class,
+        "confidence": result.confidence,
+        "source_component": "verification",
+    }
+    if dev_summary:
+        data["dev_verification_summary"] = dev_summary
     event_bus.emit(Event(
         event_type=VERIFICATION_OUTCOME,
         task_id=task_id,
-        data={
-            "subtask_id": subtask_id,
-            "tier": result.tier,
-            "passed": result.passed,
-            "outcome": result.outcome,
-            "reason_code": result.reason_code,
-            "severity_class": result.severity_class,
-            "confidence": result.confidence,
-            "source_component": "verification",
-        },
+        data=data,
     ))
 
 
@@ -159,18 +167,29 @@ def emit_verification_terminal(
     if not event_bus or not task_id:
         return
     terminal_type = VERIFICATION_PASSED if bool(result.passed) else VERIFICATION_FAILED
+    outcome = str(result.outcome or "").strip() or ("pass" if result.passed else "fail")
+    reason_code = str(result.reason_code or "").strip()
+    if not reason_code:
+        reason_code = "verification_passed" if result.passed else "verification_failed"
+    metadata = result.metadata if isinstance(result.metadata, dict) else {}
+    dev_summary = event_safe_development_summary(
+        metadata.get("dev_verification_summary", {}),
+    )
+    data: dict[str, object] = {
+        "subtask_id": subtask_id,
+        "tier": int(result.tier),
+        "outcome": outcome,
+        "reason_code": reason_code,
+        "severity_class": str(result.severity_class or ""),
+        "confidence": float(result.confidence),
+        "source_component": "verification",
+    }
+    if dev_summary:
+        data["dev_verification_summary"] = dev_summary
     event_bus.emit(Event(
         event_type=terminal_type,
         task_id=task_id,
-        data={
-            "subtask_id": subtask_id,
-            "tier": int(result.tier),
-            "outcome": str(result.outcome or ""),
-            "reason_code": str(result.reason_code or ""),
-            "severity_class": str(result.severity_class or ""),
-            "confidence": float(result.confidence),
-            "source_component": "verification",
-        },
+        data=data,
     ))
 
 

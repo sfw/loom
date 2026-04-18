@@ -13,6 +13,7 @@ from loom.auth.config import (
     default_workspace_auth_defaults_path,
     set_workspace_auth_default,
 )
+from loom.auth.oauth_profiles import oauth_state_for_profile
 from loom.auth.resources import (
     audit_auth_state,
     bind_resource_to_profile,
@@ -21,6 +22,7 @@ from loom.auth.resources import (
     has_active_binding,
     load_workspace_auth_resources,
     migrate_legacy_auth,
+    profile_bindings_map,
     repair_auth_state,
     resolve_resource,
     restore_auth_snapshot,
@@ -39,6 +41,75 @@ from loom.tools import create_default_registry
 @click.group()
 def auth() -> None:
     """Manage auth profile configuration."""
+
+
+def _auth_profile_state_summary(profile: AuthProfile) -> tuple[str, str]:
+    status = str(getattr(profile, "status", "ready") or "ready").strip().lower()
+    if status == "archived":
+        return "archived", "This account is archived and will not be selected."
+    if status == "draft":
+        return "draft", "Complete this draft account before Loom can use it."
+
+    mode = str(getattr(profile, "mode", "") or "").strip().lower()
+    if mode in {"oauth2_pkce", "oauth2_device"}:
+        oauth_state = oauth_state_for_profile(profile)
+        return oauth_state.state, oauth_state.reason
+    if mode == "api_key":
+        return (
+            ("configured", "") if str(getattr(profile, "secret_ref", "") or "").strip()
+            else ("missing", "secret_ref is missing.")
+        )
+    if mode == "env_passthrough":
+        return (
+            ("configured", "") if bool(getattr(profile, "env", {}) or {})
+            else ("missing", "No env passthrough keys are configured.")
+        )
+    if mode == "cli_passthrough":
+        return (
+            ("configured", "") if str(getattr(profile, "command", "") or "").strip()
+            else ("missing", "No auth command is configured.")
+        )
+    return "unsupported", f"Unsupported auth mode {profile.mode!r}."
+
+
+def _profile_linked_resources(
+    ctx: click.Context,
+    *,
+    profile_id: str,
+) -> tuple[list[str], list[str], list[str]]:
+    workspace = ctx.obj.get("workspace")
+    resources_path = default_workspace_auth_resources_path(workspace.resolve())
+    try:
+        resource_store = load_workspace_auth_resources(resources_path)
+    except Exception:
+        return [], [], []
+
+    linked_resource_refs: list[str] = []
+    linked_mcp_aliases: list[str] = []
+    by_profile = profile_bindings_map(resource_store)
+    resource_id = by_profile.get(profile_id, "")
+    if resource_id:
+        resource = resource_store.resources.get(resource_id)
+        if resource is not None:
+            ref = str(getattr(resource, "resource_ref", "") or "").strip()
+            if ref:
+                linked_resource_refs.append(ref)
+            if str(getattr(resource, "resource_kind", "") or "").strip() == "mcp":
+                alias = str(getattr(resource, "resource_key", "") or "").strip()
+                if alias:
+                    linked_mcp_aliases.append(alias)
+
+    merged = _merged_auth_config(ctx)
+    default_selectors = sorted({
+        selector
+        for selector, selected_profile_id in {
+            **merged.config.defaults,
+            **merged.workspace_defaults,
+            **merged.config.resource_defaults,
+        }.items()
+        if selected_profile_id == profile_id
+    })
+    return linked_resource_refs, linked_mcp_aliases, default_selectors
 
 
 @auth.command(name="list")
@@ -201,19 +272,109 @@ def auth_show(ctx: click.Context, profile_id: str, as_json: bool) -> None:
         click.echo(json.dumps(payload, indent=2, sort_keys=True))
         return
 
+    state, state_reason = _auth_profile_state_summary(profile)
+    linked_resource_refs, linked_mcp_aliases, default_selectors = _profile_linked_resources(
+        ctx,
+        profile_id=profile_id,
+    )
     click.echo(f"Profile: {payload['id']}")
+    click.echo(f"Status: {state}")
     click.echo(f"Provider: {payload['provider']}")
     click.echo(f"Mode: {payload['mode']}")
     click.echo(f"Label: {payload['account_label'] or '-'}")
     click.echo(f"MCP server: {payload['mcp_server'] or '-'}")
+    click.echo(
+        "Linked MCP aliases: "
+        f"{', '.join(linked_mcp_aliases) if linked_mcp_aliases else '-'}"
+    )
+    click.echo(
+        "Linked resources: "
+        f"{', '.join(linked_resource_refs) if linked_resource_refs else '-'}"
+    )
+    click.echo(
+        "Default selectors: "
+        f"{', '.join(default_selectors) if default_selectors else '-'}"
+    )
     click.echo(f"Secret ref: {payload['secret_ref'] or '-'}")
     click.echo(f"Token ref: {payload['token_ref'] or '-'}")
     click.echo(f"Scopes: {', '.join(payload['scopes']) or '-'}")
     click.echo(f"Command: {payload['command'] or '-'}")
+    if state_reason:
+        click.echo(f"Reason: {state_reason}")
     if payload["env"]:
         click.echo("Env keys:")
         for key in sorted(payload["env"]):
             click.echo(f"  - {key}")
+
+
+@auth.command(name="explain")
+@click.argument("profile_id")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit JSON.")
+@click.pass_context
+def auth_explain(ctx: click.Context, profile_id: str, as_json: bool) -> None:
+    """Explain where an account is used, its status, and the next action."""
+    merged = _merged_auth_config(ctx)
+    profile = merged.config.profiles.get(profile_id)
+    if profile is None:
+        click.echo(f"Auth profile not found: {profile_id}", err=True)
+        sys.exit(1)
+
+    state, state_reason = _auth_profile_state_summary(profile)
+    linked_resource_refs, linked_mcp_aliases, default_selectors = _profile_linked_resources(
+        ctx,
+        profile_id=profile_id,
+    )
+    next_actions: list[str] = []
+    if state == "draft":
+        next_actions.append("Connect or complete this draft account before using it.")
+    elif state == "missing":
+        next_actions.append(f"Run `loom auth profile login {profile_id}` to connect it.")
+    elif state == "expired":
+        next_actions.append(f"Run `loom auth profile refresh {profile_id}` to refresh it.")
+    elif state == "archived":
+        next_actions.append("Restore or replace this archived account.")
+    elif state == "invalid":
+        next_actions.append("Repair this account's stored credentials.")
+    if not linked_resource_refs and not linked_mcp_aliases:
+        next_actions.append("Bind this account to a resource or select it as a default.")
+
+    payload = {
+        "profile_id": profile.profile_id,
+        "provider": profile.provider,
+        "mode": profile.mode,
+        "account_label": profile.account_label,
+        "status": state,
+        "reason": state_reason,
+        "linked_mcp_aliases": linked_mcp_aliases,
+        "linked_resource_refs": linked_resource_refs,
+        "default_selectors": default_selectors,
+        "next_actions": next_actions,
+    }
+    if as_json:
+        click.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+
+    click.echo(f"Profile: {profile.profile_id}")
+    click.echo(f"Status: {state}")
+    click.echo(f"Why: {state_reason or 'This account is ready for use.'}")
+    click.echo(f"Provider: {profile.provider}")
+    click.echo(f"Mode: {profile.mode}")
+    click.echo(
+        "Linked MCP aliases: "
+        f"{', '.join(linked_mcp_aliases) if linked_mcp_aliases else '-'}"
+    )
+    click.echo(
+        "Linked resources: "
+        f"{', '.join(linked_resource_refs) if linked_resource_refs else '-'}"
+    )
+    click.echo(
+        "Default selectors: "
+        f"{', '.join(default_selectors) if default_selectors else '-'}"
+    )
+    if next_actions:
+        click.echo("Next actions:")
+        for item in next_actions:
+            click.echo(f"  - {item}")
 
 
 @auth.command(name="check")

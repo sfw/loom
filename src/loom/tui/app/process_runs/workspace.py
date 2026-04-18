@@ -6,6 +6,12 @@ import asyncio
 import logging
 from pathlib import Path
 
+from loom.processes.run_workspace import (
+    materialize_process_run_workspace,
+)
+from loom.processes.run_workspace import (
+    next_available_process_run_folder_name as shared_next_available_process_run_folder_name,
+)
 from loom.tui.screens import ProcessRunWorkspaceScreen
 from loom.tui.widgets import ChatLog
 
@@ -104,17 +110,11 @@ async def prepare_process_run_workspace(
     if not slug:
         slug = self._fallback_process_run_folder_name(process_name, goal)
 
-    for suffix in range(1, 1000):
-        candidate_name = slug if suffix == 1 else f"{slug}-{suffix}"
-        candidate = root / candidate_name
-        try:
-            candidate.mkdir(parents=True, exist_ok=False)
-            return candidate
-        except FileExistsError:
-            continue
-        except OSError as e:
-            logger.warning("Failed to create run workspace %s: %s", candidate, e)
-            break
+    try:
+        candidate_name = shared_next_available_process_run_folder_name(root, slug)
+        return materialize_process_run_workspace(root, candidate_name)
+    except OSError as e:
+        logger.warning("Failed to create run workspace under %s: %s", root, e)
 
     return self._workspace
 
@@ -122,35 +122,12 @@ async def prepare_process_run_workspace(
 def next_available_process_run_folder_name(self, base_slug: str) -> str:
     """Return the first non-existing run folder name for a base slug."""
     root = self._workspace.resolve()
-    slug = self._slugify_process_run_folder(base_slug) or "process-run"
-    for suffix in range(1, 1000):
-        candidate_name = slug if suffix == 1 else f"{slug}-{suffix}"
-        candidate = root / candidate_name
-        if not candidate.exists():
-            return candidate_name
-    return slug
+    return shared_next_available_process_run_folder_name(root, base_slug)
 
 
 def materialize_process_run_workspace_selection(self, relative_path: str) -> Path:
     """Create or reuse selected run workspace path under the active workspace root."""
-    root = self._workspace.resolve()
-    clean = str(relative_path or "").strip()
-    if not clean:
-        return root
-
-    candidate = (root / clean).resolve()
-    try:
-        candidate.relative_to(root)
-    except ValueError as e:
-        raise ValueError("Folder must stay inside workspace root.") from e
-
-    if candidate.exists():
-        if candidate.is_dir():
-            return candidate
-        raise ValueError("Selected folder path exists but is not a directory.")
-
-    candidate.mkdir(parents=True, exist_ok=False)
-    return candidate
+    return materialize_process_run_workspace(self._workspace.resolve(), relative_path)
 
 
 async def prompt_process_run_workspace_choice(

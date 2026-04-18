@@ -6,6 +6,24 @@ This changelog is generated directly from git commit history (non-merge commits)
 
 ## [Unreleased]
 
+- Add DB migration `20260416_007_conversation_turn_metadata_v1` so thread user turns can durably persist explicit attachment/context metadata across resumes
+- Add explicit conversation-turn attachment metadata plumbing for desktop thread file mentions and pasted-image attachments
+- Refactor MCP + auth usability around a shared account authority: new MCP OAuth writes now use Loom secret refs with fingerprinted server identity, workspace-defined remote servers expose approval/trust state, and the desktop app now has a dedicated Integrations tab with management-grade MCP/account state plus guided account connect/routing actions
+
+## [0.3.0] - 2026-04-07
+
+- Add DB migration `20260403_006_search_provider_state_v1` for authoritative auth-free search provider pacing/cooldown state
+- Refactor `web_search` around shared SQLite-backed provider authority: `DuckDuckGo` is now the primary auth-free provider, provider pacing is coordinated across Loom runs, and DDG waits are skipped when they would violate the tool runtime budget
+- Unify task/cowork data authority boundaries: canonical task snapshots now gate run-control writes, cowork semantics come from `conversation_turns`, transcript replay is journal-coverage-aware, and cowork session checkpoints record the turn boundary they cover
+- Add DB migration `20260402_005_data_authority_unification` for task snapshot freshness plus cowork checkpoint/journal coverage metadata
+- Tighten cowork projection discipline: session checkpoints now derive counters from committed turns, non-semantic session metadata patches no longer rewrite checkpoint state, and `loom db doctor` warns on uncovered legacy transcript journals
+- Refactor `loomd` desktop/runtime hot paths around SQLite: long-lived governed connections, governed durable-run lease writes, bounded durable event backpressure, direct live run/notification SSE delivery, and reduced frontend polling overlap
+- Add desktop hot-path latency diagnostics and a synthetic active-run API smoke benchmark (`scripts/active_run_latency_smoke.py`)
+- Add `loomd` sidecar entrypoint and runtime status contract for workspace-first desktop bootstrapping
+- Add workspace registry, workspace settings, and conversation/run link schema with migration coverage
+- Add workspace-first API surfaces: `/runtime`, `/workspaces`, `/conversations`, `/runs`, and grouped `/settings`
+- Scaffold `apps/desktop` monorepo workspace with Tauri 2 + React + Vite overview shell
+
 ## [0.2.2] - 2026-03-16
 
 - 2026-03-16 `24a6ea4` Fix tests for new streaming and cowork defaults

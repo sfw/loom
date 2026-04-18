@@ -1496,6 +1496,13 @@ class MCPManagerScreen(Vertical):
                 severity="warning",
             )
             return
+        if view.server.approval_required and view.server.approval_state != "approved":
+            self.notify(
+                "Approve this workspace-defined remote server before storing credentials.",
+                severity="warning",
+                timeout=7,
+            )
+            return
         access_token = self.query_one("#mcp-oauth-access-token", Input).value.strip()
         refresh_token = self.query_one("#mcp-oauth-refresh-token", Input).value.strip()
         expires_in_raw = self.query_one("#mcp-oauth-expires-in", Input).value.strip()
@@ -1524,6 +1531,7 @@ class MCPManagerScreen(Vertical):
             await asyncio.to_thread(
                 upsert_mcp_oauth_token,
                 alias=clean_alias,
+                server=view.server,
                 access_token=access_token,
                 refresh_token=refresh_token,
                 scopes=scopes,
@@ -1570,6 +1578,13 @@ class MCPManagerScreen(Vertical):
                 self.notify(
                     "OAuth login is only available for remote MCP aliases.",
                     severity="warning",
+                )
+                return
+            if view.server.approval_required and view.server.approval_state != "approved":
+                self.notify(
+                    "Approve this workspace-defined remote server before browser login.",
+                    severity="warning",
+                    timeout=7,
                 )
                 return
             if not view.server.oauth.enabled:
@@ -1751,6 +1766,12 @@ class MCPManagerScreen(Vertical):
                 if str(scope).strip()
             )
         )
+        view = await asyncio.to_thread(self._manager.get_view, alias)
+        if view is None:
+            self.notify(f"Alias not found: {alias}", severity="error")
+            self._clear_oauth_pending_if_current(alias=alias, state=pending_state)
+            await self._oauth_show_status(notify=False, quiet=True)
+            return
 
         try:
             client_secret = str(
@@ -1759,6 +1780,7 @@ class MCPManagerScreen(Vertical):
             await asyncio.to_thread(
                 upsert_mcp_oauth_token,
                 alias=alias,
+                server=view.server,
                 access_token=access_token,
                 refresh_token=str(token_payload.get("refresh_token", "")).strip(),
                 token_type=str(token_payload.get("token_type", "")).strip() or "Bearer",
@@ -1800,7 +1822,11 @@ class MCPManagerScreen(Vertical):
                 if not quiet:
                     self.notify(f"Alias not found: {clean_alias}", severity="error")
                 return
-            state = await asyncio.to_thread(oauth_state_for_alias, clean_alias)
+            state = await asyncio.to_thread(
+                oauth_state_for_alias,
+                clean_alias,
+                server=view.server,
+            )
         except Exception as e:
             if not quiet:
                 self.notify(f"OAuth status failed: {e}", severity="error")
@@ -1849,7 +1875,11 @@ class MCPManagerScreen(Vertical):
                     state=pending_state,
                 )
                 self._clear_oauth_pending_if_current(alias=clean_alias, state=pending_state)
-            await asyncio.to_thread(remove_mcp_oauth_token, clean_alias)
+            await asyncio.to_thread(
+                remove_mcp_oauth_token,
+                clean_alias,
+                server=view.server,
+            )
         except MCPOAuthStoreError as e:
             self.notify(f"OAuth clear failed: {e}", severity="error")
             return

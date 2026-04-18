@@ -5,7 +5,15 @@ from __future__ import annotations
 import hashlib
 
 from loom.state.migrations.runner import MigrationStep
-from loom.state.migrations.steps import events_v2, task_questions, validity_lineage
+from loom.state.migrations.steps import (
+    conversation_turn_metadata_v1,
+    data_authority_unification,
+    events_v2,
+    search_provider_state_v1,
+    task_questions,
+    validity_lineage,
+    workspaces_v1,
+)
 
 
 def _checksum(payload: str) -> str:
@@ -33,5 +41,33 @@ MIGRATIONS: tuple[MigrationStep, ...] = (
         checksum=_checksum("20260306_003_validity_lineage/validity_lineage"),
         apply=validity_lineage.apply,
         verify=validity_lineage.verify,
+    ),
+    MigrationStep(
+        id="20260323_004_workspaces_v1",
+        description="Add workspace registry/settings tables and conversation-run links.",
+        checksum=_checksum("20260323_004_workspaces_v1/workspaces_v1"),
+        apply=workspaces_v1.apply,
+        verify=workspaces_v1.verify,
+    ),
+    MigrationStep(
+        id="20260402_005_data_authority_unification",
+        description="Add task snapshot freshness and cowork checkpoint/journal coverage columns.",
+        checksum=_checksum("20260402_005_data_authority_unification/data_authority_unification"),
+        apply=data_authority_unification.apply,
+        verify=data_authority_unification.verify,
+    ),
+    MigrationStep(
+        id="20260403_006_search_provider_state_v1",
+        description="Add authoritative auth-free search provider pacing state table.",
+        checksum=_checksum("20260403_006_search_provider_state_v1/search_provider_state_v1"),
+        apply=search_provider_state_v1.apply,
+        verify=search_provider_state_v1.verify,
+    ),
+    MigrationStep(
+        id="20260416_007_conversation_turn_metadata_v1",
+        description="Add durable attachment metadata to persisted conversation turns.",
+        checksum=_checksum("20260416_007_conversation_turn_metadata_v1/conversation_turn_metadata_v1"),
+        apply=conversation_turn_metadata_v1.apply,
+        verify=conversation_turn_metadata_v1.verify,
     ),
 )

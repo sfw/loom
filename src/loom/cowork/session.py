@@ -30,6 +30,7 @@ from loom.cowork.approval import ApprovalDecision, ToolApprover
 from loom.cowork.memory_indexer import CoworkMemoryIndexer
 from loom.cowork.session_state import SessionState, extract_state_from_tool_events
 from loom.engine.semantic_compactor import SemanticCompactor
+from loom.engine.verification.development import development_helper_tool_guidance
 from loom.models.base import ModelProvider, TokenUsage, ToolCall
 from loom.models.retry import (
     ModelRetryPolicy,
@@ -139,6 +140,11 @@ REPEATED_TOOL_BATCH_SYSTEM_HINT = (
     "existing tool outputs. Only call another tool if arguments change and you "
     "briefly justify why.]"
 )
+MISSING_FINAL_ANSWER_SYSTEM_HINT = (
+    "[System: You have already completed tool work for this turn. Do not end the "
+    "turn silently. Give the user a direct answer now using the tool results you "
+    "already have. Do not call more tools unless absolutely necessary.]"
+)
 DEFAULT_TOOL_RESULT_OUTPUT_CHARS = 3_000
 HEAVY_TOOL_RESULT_OUTPUT_CHARS = 1_200
 _HEAVY_OUTPUT_TOOLS = frozenset({
@@ -152,6 +158,13 @@ _HEAVY_OUTPUT_TOOLS = frozenset({
     "glob_find",
     "conversation_recall",
 })
+_PARALLEL_BATCH_TOOL_NAMES = frozenset({
+    "archive_access",
+    "web_fetch",
+    "web_fetch_html",
+    "web_search",
+})
+MAX_PARALLEL_TOOL_BATCH_SIZE = 4
 
 # Phrases that suggest the user is referencing earlier context.
 _DANGLING_REF_INDICATORS = [
@@ -407,8 +420,39 @@ def _estimate_message_tokens(msg: dict) -> int:
     content = msg.get("content") or ""
     total = _estimate_tokens(content)
 
+    workspace_paths = msg.get("workspace_paths")
+    if isinstance(workspace_paths, list) and workspace_paths:
+        total += _estimate_tokens("\n".join(str(path or "") for path in workspace_paths))
+
     if msg.get("tool_calls"):
         total += _estimate_tokens(json.dumps(msg["tool_calls"]))
+
+    content_blocks = msg.get("content_blocks")
+    if isinstance(content_blocks, list) and content_blocks:
+        for block in content_blocks:
+            if not isinstance(block, dict):
+                continue
+            btype = str(block.get("type", "") or "").strip().lower()
+            if btype == "text":
+                total += _estimate_tokens(str(block.get("text", "") or ""))
+            elif btype == "image":
+                w = int(block.get("width", 0) or 0)
+                h = int(block.get("height", 0) or 0)
+                if w > 0 and h > 0:
+                    total += min((w * h) // 750, 200_000)
+                else:
+                    total += max(1, _estimate_tokens(str(block.get("text_fallback", "") or "")))
+            elif btype == "document":
+                pages = int(block.get("page_count", 1) or 1)
+                pr = block.get("page_range")
+                if isinstance(pr, list) and len(pr) == 2:
+                    try:
+                        pages = max(0, int(pr[1]) - int(pr[0]))
+                    except (TypeError, ValueError):
+                        pages = max(1, pages)
+                total += min(max(1, pages) * 1500, 200_000)
+            else:
+                total += _estimate_tokens(str(block.get("text_fallback", "") or ""))
 
     # Account for multimodal content blocks in tool results
     if msg.get("role") == "tool" and content:
@@ -461,6 +505,32 @@ def _tokens_per_second(tokens_used: int, total_time_ms: int) -> float:
     return float(tokens_used) / (float(total_time_ms) / 1000.0)
 
 
+def _normalize_user_turn_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(metadata, dict):
+        return {}
+
+    normalized: dict[str, Any] = {}
+    for key in ("workspace_paths", "workspace_files", "workspace_directories"):
+        value = metadata.get(key)
+        if not isinstance(value, list):
+            continue
+        cleaned = [
+            str(item or "").strip()
+            for item in value
+            if str(item or "").strip()
+        ]
+        if cleaned:
+            normalized[key] = cleaned
+
+    blocks = metadata.get("content_blocks")
+    if isinstance(blocks, list):
+        cleaned_blocks = [block for block in blocks if isinstance(block, dict)]
+        if cleaned_blocks:
+            normalized["content_blocks"] = cleaned_blocks
+
+    return normalized
+
+
 def _compact_preview(text: Any, limit: int) -> tuple[str, bool]:
     """Normalize and truncate text for compact context hints."""
     normalized = " ".join(str(text or "").split())
@@ -473,6 +543,12 @@ def _compact_preview(text: Any, limit: int) -> tuple[str, bool]:
         return normalized[:limit], True
     keep = max(0, limit - len(marker))
     return f"{normalized[:keep]}{marker}", True
+
+
+def _tool_result_preview(text: Any, limit: int) -> str:
+    """Return a fast deterministic preview for hot-path tool context."""
+    preview, _ = _compact_preview(text, limit)
+    return preview
 
 
 class CoworkSession:
@@ -619,6 +695,11 @@ class CoworkSession:
     @property
     def session_state(self) -> SessionState:
         return self._session_state
+
+    @property
+    def persisted_turn_count(self) -> int:
+        """Latest committed conversation-turn boundary for this session."""
+        return int(self._message_counter)
 
     @property
     def stop_requested(self) -> bool:
@@ -769,7 +850,10 @@ class CoworkSession:
     # ------------------------------------------------------------------
 
     async def send(
-        self, user_message: str,
+        self,
+        user_message: str,
+        *,
+        message_metadata: dict[str, Any] | None = None,
     ) -> AsyncGenerator[CoworkTurn | ToolCallEvent | str, None]:
         """Send a user message and yield events as the model responds.
 
@@ -785,12 +869,15 @@ class CoworkSession:
         async with self._counter_lock:
             self._turn_counter += 1
         self._session_state.set_focus(user_message.split("\n")[0])
+        normalized_metadata = _normalize_user_turn_metadata(message_metadata)
 
         # Possibly inject a recall hint
         hint = self._maybe_recall_hint(user_message)
 
-        self._messages.append({"role": "user", "content": user_message})
-        await self._persist_turn("user", content=user_message)
+        user_turn: dict[str, Any] = {"role": "user", "content": user_message}
+        user_turn.update(normalized_metadata)
+        self._messages.append(user_turn)
+        await self._persist_turn("user", content=user_message, metadata=normalized_metadata)
 
         if hint:
             self._messages.append({"role": "system", "content": hint})
@@ -807,6 +894,7 @@ class CoworkSession:
         last_tool_batch_signature = ""
         identical_tool_batch_streak = 0
         repeated_tool_batch_recovery_hints_used = 0
+        missing_final_answer_recovery_used = False
 
         for _ in range(MAX_TOOL_ITERATIONS):
             await self._await_if_paused(stage="model_request")
@@ -899,37 +987,35 @@ class CoworkSession:
                     tool_calls=tc_dicts,
                 )
 
-                ask_user_pending = False
-                for tc in response.tool_calls:
-                    await self._await_if_paused(stage=f"tool_start:{tc.name}")
-                    self._raise_if_stop_requested(stage=f"tool_start:{tc.name}")
-                    event = ToolCallEvent(
-                        name=tc.name,
-                        args=tc.arguments,
-                        tool_call_id=str(getattr(tc, "id", "") or ""),
-                    )
-                    yield event  # signal: tool call starting
-
-                    result, elapsed_ms = await self._execute_tool_call(
-                        tc.name,
-                        tc.arguments,
-                        tool_call_id=event.tool_call_id,
-                        caller_tool_name=tc.name,
-                    )
-                    event.result = result
-                    event.elapsed_ms = elapsed_ms
-                    all_tool_events.append(event)
+                ask_user_pending = any(
+                    tc.name in _USER_INTERACTION_TOOLS
+                    for tc in response.tool_calls
+                )
+                async for event in self._iter_tool_call_events(response.tool_calls):
+                    if event.result is not None:
+                        all_tool_events.append(event)
                     yield event
-                    self._raise_if_stop_requested(stage=f"tool_complete:{tc.name}")
-
-                    await self._append_tool_result(tc.id, tc.name, result)
-
-                    if tc.name in _USER_INTERACTION_TOOLS:
-                        ask_user_pending = True
 
                 if ask_user_pending:
                     break
             else:
+                if not str(response.text or "").strip() and all_tool_events:
+                    if not missing_final_answer_recovery_used:
+                        missing_final_answer_recovery_used = True
+                        self._messages.append({
+                            "role": "system",
+                            "content": MISSING_FINAL_ANSWER_SYSTEM_HINT,
+                        })
+                        await self._persist_turn(
+                            "system",
+                            content=MISSING_FINAL_ANSWER_SYSTEM_HINT,
+                        )
+                        continue
+                    fallback = self._build_missing_final_answer_fallback(all_tool_events)
+                    self._messages.append({"role": "assistant", "content": fallback})
+                    await self._persist_turn("assistant", content=fallback)
+                    text_parts.append(fallback)
+                    break
                 self._messages.append({"role": "assistant", "content": response.text or ""})
                 await self._persist_turn("assistant", content=response.text or "")
                 if self._should_retry_with_hybrid_fallback(
@@ -997,7 +1083,10 @@ class CoworkSession:
         )
 
     async def send_streaming(
-        self, user_message: str,
+        self,
+        user_message: str,
+        *,
+        message_metadata: dict[str, Any] | None = None,
     ) -> AsyncGenerator[CoworkTurn | ToolCallEvent | str, None]:
         """Like send() but streams text tokens as they arrive.
 
@@ -1008,11 +1097,14 @@ class CoworkSession:
         async with self._counter_lock:
             self._turn_counter += 1
         self._session_state.set_focus(user_message.split("\n")[0])
+        normalized_metadata = _normalize_user_turn_metadata(message_metadata)
 
         hint = self._maybe_recall_hint(user_message)
 
-        self._messages.append({"role": "user", "content": user_message})
-        await self._persist_turn("user", content=user_message)
+        user_turn: dict[str, Any] = {"role": "user", "content": user_message}
+        user_turn.update(normalized_metadata)
+        self._messages.append(user_turn)
+        await self._persist_turn("user", content=user_message, metadata=normalized_metadata)
 
         if hint:
             self._messages.append({"role": "system", "content": hint})
@@ -1029,6 +1121,7 @@ class CoworkSession:
         last_tool_batch_signature = ""
         identical_tool_batch_streak = 0
         repeated_tool_batch_recovery_hints_used = 0
+        missing_final_answer_recovery_used = False
 
         for _ in range(MAX_TOOL_ITERATIONS):
             await self._await_if_paused(stage="stream_model_request")
@@ -1061,6 +1154,8 @@ class CoworkSession:
                         1,
                         int((time.monotonic() - turn_started_at) * 1000),
                     )
+                if chunk.thinking:
+                    yield ("thinking", chunk.thinking)
                 if chunk.text:
                     iter_text_parts.append(chunk.text)
                     yield chunk.text
@@ -1144,37 +1239,35 @@ class CoworkSession:
                     tool_calls=tc_dicts,
                 )
 
-                ask_user_pending = False
-                for tc in final_tool_calls:
-                    await self._await_if_paused(stage=f"tool_start:{tc.name}")
-                    self._raise_if_stop_requested(stage=f"tool_start:{tc.name}")
-                    event = ToolCallEvent(
-                        name=tc.name,
-                        args=tc.arguments,
-                        tool_call_id=str(getattr(tc, "id", "") or ""),
-                    )
+                ask_user_pending = any(
+                    tc.name in _USER_INTERACTION_TOOLS
+                    for tc in final_tool_calls
+                )
+                async for event in self._iter_tool_call_events(final_tool_calls):
+                    if event.result is not None:
+                        all_tool_events.append(event)
                     yield event
-
-                    result, elapsed_ms = await self._execute_tool_call(
-                        tc.name,
-                        tc.arguments,
-                        tool_call_id=event.tool_call_id,
-                        caller_tool_name=tc.name,
-                    )
-                    event.result = result
-                    event.elapsed_ms = elapsed_ms
-                    all_tool_events.append(event)
-                    yield event
-                    self._raise_if_stop_requested(stage=f"tool_complete:{tc.name}")
-
-                    await self._append_tool_result(tc.id, tc.name, result)
-
-                    if tc.name in _USER_INTERACTION_TOOLS:
-                        ask_user_pending = True
 
                 if ask_user_pending:
                     break
             else:
+                if not str(response_text or "").strip() and all_tool_events:
+                    if not missing_final_answer_recovery_used:
+                        missing_final_answer_recovery_used = True
+                        self._messages.append({
+                            "role": "system",
+                            "content": MISSING_FINAL_ANSWER_SYSTEM_HINT,
+                        })
+                        await self._persist_turn(
+                            "system",
+                            content=MISSING_FINAL_ANSWER_SYSTEM_HINT,
+                        )
+                        continue
+                    fallback = self._build_missing_final_answer_fallback(all_tool_events)
+                    self._messages.append({"role": "assistant", "content": fallback})
+                    await self._persist_turn("assistant", content=fallback)
+                    all_text_parts.append(fallback)
+                    break
                 self._messages.append({"role": "assistant", "content": response_text or ""})
                 await self._persist_turn("assistant", content=response_text or "")
                 if self._should_retry_with_hybrid_fallback(
@@ -1252,26 +1345,75 @@ class CoworkSession:
             raise ValueError(f"Session not found: {session_id}")
 
         self._session_id = session_id
-        self._total_tokens = session.get("total_tokens", 0)
-        self._turn_counter = session.get("turn_count", 0)
+        self._total_tokens = int(session.get("total_tokens", 0) or 0)
 
         # Restore message counter from DB to avoid collisions
         self._message_counter = await self._store.get_turn_count(session_id)
+        self._turn_counter = await self._store.get_user_turn_count(session_id)
 
-        # Restore session state
+        checkpoint_through_turn = int(session.get("session_state_through_turn", 0) or 0)
+
+        # Restore session state from the latest valid checkpoint, then replay any
+        # fresher canonical turns so stale cowork_sessions rows cannot mask them.
         self._session_state = SessionState.from_json(session.get("session_state"))
+        if not self._session_state.session_id:
+            self._session_state = SessionState(
+                workspace=str(session.get("workspace_path", "") or ""),
+                model_name=str(session.get("model_name", self._model.name) or self._model.name),
+                session_id=session_id,
+            )
         self._session_state.session_id = session_id
+        self._session_state.workspace = str(
+            self._session_state.workspace
+            or session.get("workspace_path", "")
+            or "",
+        )
+        self._session_state.model_name = str(
+            self._session_state.model_name
+            or session.get("model_name", self._model.name)
+            or self._model.name,
+        )
+        self._session_state.turn_count = self._turn_counter
+        self._session_state.total_tokens = self._total_tokens
+
+        if self._message_counter > checkpoint_through_turn:
+            newer_turns = await self._store.get_turns_after(
+                session_id,
+                after_turn=checkpoint_through_turn,
+                limit=max(self._message_counter, 1),
+            )
+            self._replay_session_state_from_turn_rows(newer_turns)
 
         # Load recent turns into in-memory cache
         recent = await self._store.resume_session(session_id)
+        system_content = self._build_system_content()
+        system_prefix = (
+            [{"role": "system", "content": system_content}]
+            if system_content.strip()
+            else []
+        )
         self._messages = [
-            {"role": "system", "content": self._build_system_content()},
+            *system_prefix,
             *self._normalize_resumed_messages(recent),
         ]
         self._maybe_start_memory_indexer()
         await self._hydrate_memory_snapshot()
         if self._memory_indexer is not None and self._message_counter > 0:
             self._memory_indexer.enqueue_up_to_turn(self._message_counter)
+
+    def _replay_session_state_from_turn_rows(self, rows: list[dict[str, Any]]) -> None:
+        """Advance semantic session state from canonical turns past a stale checkpoint."""
+        if not rows:
+            return
+        for row in rows:
+            if str(row.get("role", "") or "").strip().lower() != "user":
+                continue
+            content = str(row.get("content", "") or "").strip()
+            if not content:
+                continue
+            self._session_state.set_focus(content.split("\n")[0])
+        self._session_state.turn_count = self._turn_counter
+        self._session_state.total_tokens = self._total_tokens
 
     # ------------------------------------------------------------------
     # Context management
@@ -1390,10 +1532,15 @@ class CoworkSession:
     def _format_recall_marker_line(self, entry: dict, marker: str) -> str:
         summary, _ = _compact_preview(entry.get("summary", ""), _RECALL_INDEX_LINE_CHARS)
         status = str(entry.get("status", "active") or "active").strip().lower() or "active"
+        try:
+            entry_id = max(0, int(entry.get("id", 0) or 0))
+        except (TypeError, ValueError):
+            entry_id = 0
         start = max(0, int(entry.get("source_turn_start", 0) or 0))
         end = max(start, int(entry.get("source_turn_end", start) or start))
         turns = f"turn {start}" if start == end else f"turns {start}-{end}"
-        line = f"[{marker}][{status}] {summary} ({turns})"
+        id_part = f"id={entry_id} " if entry_id > 0 else ""
+        line = f"[{marker}][{status}] {id_part}{summary} ({turns})"
         compact, _ = _compact_preview(line, _RECALL_INDEX_LINE_CHARS)
         return compact
 
@@ -1518,7 +1665,7 @@ class CoworkSession:
             '  * {"action":"decision_context","topic":"<topic>","limit":5}',
             '  * {"action":"entries","entry_type":"decision","status":"active","limit":5}',
             '  * {"action":"open_questions","topic":"<topic>","limit":5}',
-            '  * {"action":"source_turns","entry_ids":[<id>],"limit":6}',
+            '  * {"action":"source_turns","entry_ids":[<id from recall index>],"limit":6}',
             '  * {"action":"search","query":"<keywords>","limit":5}',
         ]
         for line in action_lines:
@@ -1696,6 +1843,112 @@ class CoworkSession:
             idx += 1
 
         return sanitized
+
+    def _tool_allows_parallel_batch(self, tool_name: str) -> bool:
+        clean_name = str(tool_name or "").strip()
+        if not clean_name or clean_name not in _PARALLEL_BATCH_TOOL_NAMES:
+            return False
+        if clean_name in _USER_INTERACTION_TOOLS or clean_name in _CORE_TOOL_NAMES:
+            return False
+        tool = self._tools.get(clean_name)
+        if tool is None:
+            return False
+        if bool(getattr(tool, "is_mutating", False)):
+            return False
+        if tool_auth_required(tool):
+            return False
+        return True
+
+    def _should_parallelize_tool_batch(self, tool_calls: list[ToolCall]) -> bool:
+        if len(tool_calls) < 2:
+            return False
+        return all(self._tool_allows_parallel_batch(tc.name) for tc in tool_calls)
+
+    async def _iter_tool_call_events(
+        self,
+        tool_calls: list[ToolCall],
+    ) -> AsyncGenerator[ToolCallEvent, None]:
+        if self._should_parallelize_tool_batch(tool_calls):
+            events = [
+                ToolCallEvent(
+                    name=tc.name,
+                    args=tc.arguments,
+                    tool_call_id=str(getattr(tc, "id", "") or ""),
+                )
+                for tc in tool_calls
+            ]
+            for event in events:
+                await self._await_if_paused(stage=f"tool_start:{event.name}")
+                self._raise_if_stop_requested(stage=f"tool_start:{event.name}")
+                yield event
+
+            semaphore = asyncio.Semaphore(MAX_PARALLEL_TOOL_BATCH_SIZE)
+
+            async def _run_one(idx: int, tc: ToolCall) -> tuple[int, ToolResult, int]:
+                async with semaphore:
+                    result, elapsed_ms = await self._execute_tool_call(
+                        tc.name,
+                        tc.arguments,
+                        tool_call_id=str(getattr(tc, "id", "") or ""),
+                        caller_tool_name=tc.name,
+                    )
+                    return idx, result, elapsed_ms
+
+            tasks = [
+                asyncio.create_task(_run_one(idx, tc))
+                for idx, tc in enumerate(tool_calls)
+            ]
+            completed_results: dict[int, tuple[ToolResult, int]] = {}
+            try:
+                for task in asyncio.as_completed(tasks):
+                    idx, result, elapsed_ms = await task
+                    event = events[idx]
+                    event.result = result
+                    event.elapsed_ms = elapsed_ms
+                    completed_results[idx] = (result, elapsed_ms)
+                    yield event
+                    self._raise_if_stop_requested(stage=f"tool_complete:{event.name}")
+            except Exception:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise
+
+            for idx, tc in enumerate(tool_calls):
+                result, _elapsed_ms = completed_results[idx]
+                await self._append_tool_result(
+                    str(getattr(tc, "id", "") or ""),
+                    tc.name,
+                    result,
+                )
+            return
+
+        for tc in tool_calls:
+            await self._await_if_paused(stage=f"tool_start:{tc.name}")
+            self._raise_if_stop_requested(stage=f"tool_start:{tc.name}")
+            event = ToolCallEvent(
+                name=tc.name,
+                args=tc.arguments,
+                tool_call_id=str(getattr(tc, "id", "") or ""),
+            )
+            yield event
+
+            result, elapsed_ms = await self._execute_tool_call(
+                tc.name,
+                tc.arguments,
+                tool_call_id=event.tool_call_id,
+                caller_tool_name=tc.name,
+            )
+            event.result = result
+            event.elapsed_ms = elapsed_ms
+            yield event
+            self._raise_if_stop_requested(stage=f"tool_complete:{tc.name}")
+
+            await self._append_tool_result(
+                str(getattr(tc, "id", "") or ""),
+                tc.name,
+                result,
+            )
 
     async def _execute_tool_call(
         self,
@@ -2005,6 +2258,7 @@ class CoworkSession:
             self._tools.list_tools(
                 auth_context=self._auth_context,
                 execution_surface="tui",
+                runnable_only=True,
             ),
         )
         mcp_aliases = {
@@ -2035,6 +2289,7 @@ class CoworkSession:
             self._tools.list_tools(
                 auth_context=self._auth_context,
                 execution_surface="tui",
+                runnable_only=True,
             ),
         )
         if not available:
@@ -2120,11 +2375,13 @@ class CoworkSession:
             return self._tools.all_schemas(
                 auth_context=self._auth_context,
                 execution_surface="tui",
+                runnable_only=True,
             )
 
         all_schemas = self._tools.all_schemas(
             auth_context=self._auth_context,
             execution_surface="tui",
+            runnable_only=True,
         )
         if not all_schemas:
             return []
@@ -2234,6 +2491,7 @@ class CoworkSession:
         schemas = self._tools.all_schemas(
             auth_context=auth_context,
             execution_surface=execution_surface,
+            runnable_only=True,
         )
         rows: list[dict] = []
         for schema in schemas:
@@ -2461,6 +2719,38 @@ class CoworkSession:
             "progress. I can continue once we change the query or tool arguments."
         )
 
+    def _build_missing_final_answer_fallback(
+        self,
+        tool_events: list[ToolCallEvent],
+    ) -> str:
+        """Return a deterministic fallback when tool work completes without an answer."""
+        completed = [
+            event
+            for event in tool_events
+            if event.result is not None
+        ]
+        if not completed:
+            return (
+                "I completed the turn but failed to produce a final answer. "
+                "Please ask me to summarize the completed work."
+            )
+
+        lines = [
+            "I completed the tool work but failed to produce a final answer.",
+            "Latest gathered results:",
+        ]
+        for event in completed[-3:]:
+            if event.result is None:
+                continue
+            preview_source = event.result.output or event.result.error or ""
+            preview, _ = _compact_preview(preview_source, 220)
+            if preview:
+                lines.append(f"- {event.name}: {preview}")
+            else:
+                lines.append(f"- {event.name}: completed")
+        lines.append("Please ask me to restate or refine this summary if needed.")
+        return "\n".join(lines)
+
     @staticmethod
     def _tool_output_limit(tool_name: str) -> int:
         if tool_name in _HEAVY_OUTPUT_TOOLS:
@@ -2480,11 +2770,7 @@ class CoworkSession:
 
         if len(data) > 12:
             packed = json.dumps(data, ensure_ascii=False, default=str)
-            summary_text = await self._compact_text(
-                packed,
-                max_chars=900,
-                label="cowork tool data payload",
-            )
+            summary_text = _tool_result_preview(packed, 900)
             return {
                 "summary": summary_text,
                 "key_count": len(data),
@@ -2493,20 +2779,12 @@ class CoworkSession:
         summary: dict = {}
         for key, value in data.items():
             if isinstance(value, str):
-                summary[key] = await self._compact_text(
-                    value,
-                    max_chars=180,
-                    label=f"cowork tool data {key}",
-                )
+                summary[key] = _tool_result_preview(value, 180)
             elif isinstance(value, (int, float, bool)) or value is None:
                 summary[key] = value
             elif isinstance(value, (list, dict)):
                 packed = json.dumps(value, ensure_ascii=False, default=str)
-                summary[key] = await self._compact_text(
-                    packed,
-                    max_chars=220,
-                    label=f"cowork tool data {key}",
-                )
+                summary[key] = _tool_result_preview(packed, 220)
             else:
                 summary[key] = str(type(value).__name__)
         return summary or None
@@ -2535,11 +2813,7 @@ class CoworkSession:
             for key in ("text", "text_fallback", "extracted_text", "thinking"):
                 value = compact.get(key)
                 if isinstance(value, str):
-                    compact[key] = await self._compact_text(
-                        value,
-                        max_chars=max_chars,
-                        label=f"cowork content block {key}",
-                    )
+                    compact[key] = _tool_result_preview(value, max_chars)
             serialized_blocks.append(compact)
         return serialized_blocks or None
 
@@ -2549,11 +2823,7 @@ class CoworkSession:
         result: ToolResult,
     ) -> str:
         limit = self._tool_output_limit(tool_name)
-        output_text = await self._compact_text(
-            result.output,
-            max_chars=limit,
-            label=f"cowork {tool_name} tool output",
-        )
+        output_text = _tool_result_preview(result.output, limit)
         payload: dict = {
             "success": result.success,
             "output": output_text,
@@ -2563,11 +2833,7 @@ class CoworkSession:
 
         if len(payload["files_changed"]) > 20:
             files_text = "\n".join(payload["files_changed"])
-            payload["files_changed_summary"] = await self._compact_text(
-                files_text,
-                max_chars=380,
-                label=f"cowork {tool_name} files changed",
-            )
+            payload["files_changed_summary"] = _tool_result_preview(files_text, 380)
             payload["files_changed_count"] = len(payload["files_changed"])
             payload.pop("files_changed", None)
 
@@ -2603,6 +2869,7 @@ class CoworkSession:
         self,
         role: str,
         content: str | None = None,
+        metadata: dict[str, Any] | None = None,
         tool_calls: list[dict] | None = None,
         tool_call_id: str | None = None,
         tool_name: str | None = None,
@@ -2619,6 +2886,7 @@ class CoworkSession:
                 turn_number=counter,
                 role=role,
                 content=content,
+                metadata=metadata,
                 tool_calls=tool_calls,
                 tool_call_id=tool_call_id,
                 tool_name=tool_name,
@@ -2633,11 +2901,10 @@ class CoworkSession:
         if self._store is None or not self._session_id:
             return
         try:
-            await self._store.update_session(
+            await self._store.write_session_checkpoint(
                 session_id=self._session_id,
-                total_tokens=self._total_tokens,
-                turn_count=self._turn_counter,
                 session_state=self._session_state.to_dict(),
+                through_turn=self._message_counter,
             )
         except Exception as e:
             logger.warning("Persist metadata failed: %s", e)
@@ -2673,7 +2940,7 @@ TOOL USAGE:
 - Use web_search to find documentation, solutions, or package information online.
 - Use web_fetch to read a specific URL's content.
 - Use web_fetch_html when you explicitly need raw page source markup.
-- Use shell_execute for running tests, builds, linters, etc.
+- {development_helper_tool_guidance()}
 - Use git_command for version control operations (including push).
 - Use task_tracker to organize multi-step work and show progress.
 - Use ask_user when you need the developer's input or decision.

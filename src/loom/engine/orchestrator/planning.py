@@ -23,8 +23,16 @@ from loom.models.request_diagnostics import (
     collect_request_diagnostics,
     collect_response_diagnostics,
 )
-from loom.models.retry import ModelRetryPolicy, call_with_model_retry
+from loom.models.retry import (
+    ModelRetryPolicy,
+    build_model_retry_event_payload,
+    call_with_model_retry,
+)
 from loom.processes.phase_alignment import infer_phase_id_for_subtask
+from loom.read_scope import (
+    resolve_read_path_map_from_metadata,
+    resolve_read_roots_from_metadata,
+)
 from loom.state.task_state import Plan, Subtask, SubtaskStatus, Task
 from loom.utils.concurrency import run_blocking_io
 
@@ -76,7 +84,7 @@ async def plan_task_with_validation(orchestrator, task: Task) -> Plan:
                 "Rejected planner output due to invalid topology "
                 f"(attempt {attempt}/{max_attempts}): {last_error}",
             )
-            orchestrator._state.save(task)
+            await orchestrator._save_task_state(task)
             if attempt >= max_attempts:
                 break
             planner_feedback = (
@@ -99,6 +107,7 @@ async def plan_task(
     code_analysis = ""
     workspace_analysis = ""
     read_roots = orchestrator._read_roots_for_task(task)
+    read_path_map = orchestrator._read_path_map_for_task(task)
     auth_context = None
     try:
         metadata = task.metadata if isinstance(task.metadata, dict) else {}
@@ -120,11 +129,13 @@ async def plan_task(
                     {},
                     workspace=workspace_path,
                     read_roots=read_roots,
+                    read_path_map=read_path_map,
                     auth_context=auth_context,
                 )
 
             async def _do_analysis():
-                analysis_path = read_roots[0] if read_roots else workspace_path
+                analysis_candidates = [path for path in read_roots if path.is_dir()]
+                analysis_path = analysis_candidates[0] if analysis_candidates else workspace_path
                 if orchestrator._process and orchestrator._process.workspace_scan:
                     result = await orchestrator._analyze_workspace_for_process(
                         analysis_path,
@@ -205,11 +216,36 @@ async def plan_task(
             "error": str(error),
         })
 
+    def _on_retry_scheduled(
+        attempt: int,
+        max_attempts: int,
+        error: BaseException,
+        remaining: int,
+        delay_seconds: float,
+    ) -> None:
+        orchestrator._emit(MODEL_INVOCATION, task.id, {
+            "subtask_id": "planning",
+            "model": model.name,
+            "phase": "done",
+            "operation": "complete",
+            "invocation_attempt": attempt,
+            "invocation_max_attempts": max_attempts,
+            "retry_queue_remaining": remaining,
+            "origin": request_diag.origin if request_diag else "",
+            "error_type": type(error).__name__,
+            "error": str(error),
+            **build_model_retry_event_payload(
+                error,
+                delay_seconds=delay_seconds,
+            ),
+        })
+
     try:
         response = await call_with_model_retry(
             _invoke_model,
             policy=policy,
             on_failure=_on_failure,
+            on_retry_scheduled=_on_retry_scheduled,
         )
     except Exception as e:
         logger.warning(
@@ -344,10 +380,37 @@ async def replan_task(
                     "structural_max_attempts": max_structural_attempts,
                 })
 
+            def _on_replanner_retry_scheduled(
+                attempt: int,
+                max_attempts: int,
+                error: BaseException,
+                remaining: int,
+                delay_seconds: float,
+            ) -> None:
+                orchestrator._emit(MODEL_INVOCATION, task.id, {
+                    "subtask_id": failed_subtask_id or "replanning",
+                    "model": model.name,
+                    "phase": "done",
+                    "operation": "complete",
+                    "invocation_attempt": attempt,
+                    "invocation_max_attempts": max_attempts,
+                    "retry_queue_remaining": remaining,
+                    "origin": request_diag.origin if request_diag else "",
+                    "error_type": type(error).__name__,
+                    "error": str(error),
+                    "structural_attempt": structural_attempt,
+                    "structural_max_attempts": max_structural_attempts,
+                    **build_model_retry_event_payload(
+                        error,
+                        delay_seconds=delay_seconds,
+                    ),
+                })
+
             response = await call_with_model_retry(
                 _invoke_replanner,
                 policy=policy,
                 on_failure=_on_replanner_failure,
+                on_retry_scheduled=_on_replanner_retry_scheduled,
             )
             orchestrator._emit(MODEL_INVOCATION, task.id, {
                 "subtask_id": failed_subtask_id or "replanning",
@@ -379,7 +442,7 @@ async def replan_task(
                 task.add_decision(
                     f"Rejected replanned plan: {parse_error}",
                 )
-                orchestrator._state.save(task)
+                await orchestrator._save_task_state(task)
                 if structural_attempt >= max_structural_attempts:
                     return False
                 topology_feedback = (
@@ -410,7 +473,7 @@ async def replan_task(
                     "max_attempts": max_structural_attempts,
                 })
                 task.add_decision(f"Rejected replanned plan: {topology_error}")
-                orchestrator._state.save(task)
+                await orchestrator._save_task_state(task)
                 if structural_attempt >= max_structural_attempts:
                     return False
                 topology_feedback = (
@@ -438,7 +501,7 @@ async def replan_task(
                 task.add_decision(
                     f"Rejected replanned plan: {validation_error}",
                 )
-                orchestrator._state.save(task)
+                await orchestrator._save_task_state(task)
                 if structural_attempt >= max_structural_attempts:
                     return False
                 topology_feedback = (
@@ -461,7 +524,7 @@ async def replan_task(
                     s.status = SubtaskStatus.COMPLETED
 
             task.plan = new_plan
-            orchestrator._state.save(task)
+            await orchestrator._save_task_state(task)
 
             orchestrator._emit(TASK_PLAN_READY, task.id, {
                 "subtask_count": len(new_plan.subtasks),
@@ -475,7 +538,7 @@ async def replan_task(
 
     except Exception as e:
         task.add_error("replanner", str(e))
-        orchestrator._state.save(task)
+        await orchestrator._save_task_state(task)
         return False
 
 
@@ -1072,7 +1135,7 @@ async def _attempt_stalled_recovery(
             "Recovered from scheduler stall by demoting non-terminal synthesis subtasks.",
         )
         async with self._state_lock:
-            self._state.save(task)
+            await self._save_task_state(task)
         self._emit(TASK_PLAN_NORMALIZED, task.id, {
             "context": "stalled_recovery",
             "normalized_subtasks": normalized_subtasks,
@@ -1113,7 +1176,8 @@ async def _attempt_stalled_recovery(
 def _read_roots_for_task(task: Task) -> list[Path]:
     """Resolve additional read roots from task metadata.
 
-    Only parent roots of the task workspace are accepted.
+    Accept workspace ancestors and explicitly attached sibling directories scoped
+    under the source workspace root.
     """
     workspace_text = str(task.workspace or "").strip()
     if not workspace_text:
@@ -1122,32 +1186,21 @@ def _read_roots_for_task(task: Task) -> list[Path]:
         workspace = Path(workspace_text).resolve()
     except Exception:
         return []
-
     metadata = task.metadata if isinstance(task.metadata, dict) else {}
-    raw_roots = metadata.get("read_roots", [])
-    if isinstance(raw_roots, str):
-        raw_roots = [raw_roots]
-    if not isinstance(raw_roots, list):
-        return []
+    return resolve_read_roots_from_metadata(workspace, metadata)
 
-    roots: list[Path] = []
-    seen: set[Path] = set()
-    for raw in raw_roots:
-        try:
-            candidate = Path(str(raw)).expanduser().resolve()
-        except Exception:
-            continue
-        if candidate == Path(candidate.anchor):
-            continue
-        try:
-            workspace.relative_to(candidate)
-        except ValueError:
-            continue
-        if candidate in seen:
-            continue
-        seen.add(candidate)
-        roots.append(candidate)
-    return roots
+
+def _read_path_map_for_task(task: Task) -> dict[str, Path]:
+    """Resolve exact attached read paths from task metadata."""
+    workspace_text = str(task.workspace or "").strip()
+    if not workspace_text:
+        return {}
+    try:
+        workspace = Path(workspace_text).resolve()
+    except Exception:
+        return {}
+    metadata = task.metadata if isinstance(task.metadata, dict) else {}
+    return resolve_read_path_map_from_metadata(workspace, metadata)
 
 async def _analyze_workspace(self, workspace_path: Path) -> str:
     """Run code analysis *and* document scan for better planning context.

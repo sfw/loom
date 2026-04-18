@@ -4,13 +4,25 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Callable
 from typing import Any
 
 from loom.cowork.approval import ToolApprover
 from loom.tui.widgets import ChatLog
+from loom.tui.widgets.tool_call import tool_args_preview, tool_output_preview
 
 logger = logging.getLogger(__name__)
+_CHAT_RENDER_SHIFT_STEP_MAX = 50
+_TRANSCRIPT_NOISY_TOOL_NAMES = frozenset(
+    {
+        "glob_find",
+        "read_file",
+        "ripgrep_search",
+        "search_files",
+        "web_fetch",
+        "web_fetch_html",
+        "web_search",
+    }
+)
 
 
 def _cowork_session_cls():
@@ -21,49 +33,309 @@ def _cowork_session_cls():
     return app_core.CoworkSession
 
 
-def apply_chat_render_cap(
+def _chat_render_shift_step(max_rows: int) -> int:
+    """Return the row overrun tolerated before the visible window advances."""
+    if max_rows <= 1:
+        return 1
+    return max(1, min(_CHAT_RENDER_SHIFT_STEP_MAX, max_rows // 8))
+
+
+def _is_transcript_noisy_tool(event: dict[str, Any]) -> bool:
+    payload = event.get("payload", {})
+    if not isinstance(payload, dict):
+        return False
+    tool_name = str(payload.get("tool_name", "") or "").strip()
+    return tool_name in _TRANSCRIPT_NOISY_TOOL_NAMES
+
+
+def _summarize_transcript_noisy_tools(events: list[dict[str, Any]]) -> dict[str, Any]:
+    lines: list[str] = [f"Collapsed {len(events)} lookup tool calls."]
+    shown = 0
+    for event in events:
+        payload = event.get("payload", {})
+        if not isinstance(payload, dict):
+            continue
+        tool_name = str(payload.get("tool_name", "") or "").strip() or "tool"
+        args = payload.get("args", {})
+        if not isinstance(args, dict):
+            args = {}
+        preview = tool_args_preview(tool_name, args)
+        detail = f"{tool_name} {preview}".strip()
+        lines.append(f"- {detail}")
+        shown += 1
+        if shown >= 5:
+            break
+    remaining = len(events) - shown
+    if remaining > 0:
+        lines.append(f"... {remaining} more")
+    return {
+        "event_type": "info",
+        "payload": {
+            "text": "\n".join(lines),
+            "markup": False,
+        },
+    }
+
+
+def _merge_thinking_events(events: list[dict[str, Any]]) -> dict[str, Any] | None:
+    chunks: list[str] = []
+    for event in events:
+        payload = event.get("payload", {})
+        if not isinstance(payload, dict):
+            continue
+        text = str(payload.get("text", "") or "").strip()
+        if text:
+            chunks.append(text)
+    if not chunks:
+        return None
+    return {
+        "event_type": "assistant_thinking",
+        "payload": {
+            "text": "\n\n".join(chunks),
+            "streaming": False,
+        },
+    }
+
+
+def build_chat_render_events(
+    events: list[dict[str, Any]],
+    *,
+    transcript_mode: bool,
+    show_thinking: bool,
+) -> list[dict[str, Any]]:
+    """Collapse transcript-only noise and optionally include thinking rows."""
+    if not transcript_mode:
+        return events
+
+    rendered: list[dict[str, Any]] = []
+    index = 0
+    while index < len(events):
+        event = events[index]
+        event_type = str(event.get("event_type", "") or "").strip()
+
+        if event_type == "assistant_thinking":
+            grouped: list[dict[str, Any]] = []
+            while index < len(events):
+                candidate = events[index]
+                if str(candidate.get("event_type", "") or "").strip() != "assistant_thinking":
+                    break
+                grouped.append(candidate)
+                index += 1
+            if show_thinking:
+                merged = _merge_thinking_events(grouped)
+                if merged is not None:
+                    rendered.append(merged)
+            continue
+
+        if event_type == "tool_call_started" and _is_transcript_noisy_tool(event):
+            index += 1
+            continue
+
+        if event_type == "tool_call_completed" and _is_transcript_noisy_tool(event):
+            grouped = [event]
+            index += 1
+            while index < len(events):
+                candidate = events[index]
+                candidate_type = str(candidate.get("event_type", "") or "").strip()
+                if candidate_type == "tool_call_started" and _is_transcript_noisy_tool(candidate):
+                    index += 1
+                    continue
+                if candidate_type == "content_indicator":
+                    index += 1
+                    continue
+                if candidate_type == "tool_call_completed" and _is_transcript_noisy_tool(candidate):
+                    grouped.append(candidate)
+                    index += 1
+                    continue
+                break
+            if len(grouped) >= 2:
+                rendered.append(_summarize_transcript_noisy_tools(grouped))
+            else:
+                rendered.extend(grouped)
+            continue
+
+        rendered.append(event)
+        index += 1
+
+    return rendered
+
+
+def chat_transcript_notice(*, transcript_mode: bool, show_thinking: bool) -> str:
+    """Build a transcript-mode status line."""
+    if not transcript_mode:
+        return ""
+    thinking_state = "shown" if show_thinking else "hidden"
+    return (
+        "[dim]Transcript mode active: search/jump enabled; "
+        f"lookup bursts collapsed; thinking {thinking_state}.[/dim]"
+    )
+
+
+def _event_search_text(event: dict[str, Any]) -> str:
+    event_type = str(event.get("event_type", "") or "").strip()
+    payload = event.get("payload", {})
+    if not isinstance(payload, dict):
+        payload = {}
+    if event_type in {
+        "user_message",
+        "assistant_text",
+        "assistant_thinking",
+        "turn_interrupted",
+        "info",
+    }:
+        return str(payload.get("text", payload.get("message", "")) or "")
+    if event_type in {"tool_call_started", "tool_call_completed"}:
+        tool_name = str(payload.get("tool_name", "") or "").strip()
+        args = payload.get("args", {})
+        if not isinstance(args, dict):
+            args = {}
+        parts = [tool_name, tool_args_preview(tool_name, args)]
+        if event_type == "tool_call_completed":
+            parts.append(tool_output_preview(tool_name, str(payload.get("output", "") or "")))
+            parts.append(str(payload.get("error", "") or ""))
+        return " ".join(part for part in parts if str(part).strip())
+    if event_type.startswith("steer_"):
+        return str(payload.get("text", payload.get("message", "")) or "")
+    return ""
+
+
+def search_chat_replay_events(
+    replay_events: list[dict[str, Any]],
+    *,
+    query: str,
+    include_thinking: bool = True,
+) -> list[int]:
+    """Return replay-event indices whose plain text matches the query."""
+    needle = str(query or "").strip().lower()
+    if not needle:
+        return []
+    matches: list[int] = []
+    for index, event in enumerate(replay_events):
+        event_type = str(event.get("event_type", "") or "").strip()
+        if event_type == "assistant_thinking" and not include_thinking:
+            continue
+        haystack = _event_search_text(event).lower()
+        if haystack and needle in haystack:
+            matches.append(index)
+    return matches
+
+
+def chat_search_notice(*, query: str, match_count: int, current_match: int) -> str:
+    """Build the transcript search status line."""
+    clean_query = str(query or "").strip()
+    if not clean_query:
+        return ""
+    safe_query = clean_query.replace("[", "\\[")
+    if match_count <= 0:
+        return f"[dim]Search: '{safe_query}' — no matches.[/dim]"
+    return f"[dim]Search: '{safe_query}' — match {current_match}/{match_count}.[/dim]"
+
+
+def focus_chat_event_index(
+    *,
+    total_rows: int,
+    max_rows: int,
+    index: int,
+) -> int:
+    """Return a render-window start that keeps the target row in view."""
+    total = max(0, int(total_rows))
+    limit = max(1, int(max_rows))
+    if total <= limit:
+        return 0
+    target = min(max(0, int(index)), total - 1)
+    preferred = max(0, target - max(1, limit // 3))
+    return min(preferred, max(0, total - limit))
+
+
+def update_chat_render_window(
+    *,
+    total_rows: int,
+    max_rows: int,
+    current_start: int,
+    follow_latest: bool,
+    mode: str,
+) -> tuple[bool, int, bool, int, int]:
+    """Update the visible transcript window without discarding loaded rows."""
+    total = max(0, int(total_rows))
+    limit = max(1, int(max_rows))
+    start = max(0, int(current_start))
+    visible_limit = max(0, total - limit)
+
+    if total <= limit:
+        hidden_newer = 0
+        hidden_older = 0
+        changed = start != 0 or not follow_latest
+        return changed, 0, True, hidden_older, hidden_newer
+
+    shift_step = _chat_render_shift_step(limit)
+    next_follow_latest = bool(follow_latest)
+    rerender = False
+
+    if mode == "hydrate":
+        start = visible_limit
+        next_follow_latest = True
+        rerender = True
+    elif mode == "prepend_older":
+        start = min(start, visible_limit)
+        next_follow_latest = False
+        rerender = True
+    elif mode == "focus":
+        start = min(start, visible_limit)
+        next_follow_latest = False
+        rerender = True
+    else:
+        if next_follow_latest and total - start > limit + shift_step:
+            start = visible_limit
+            rerender = True
+        else:
+            start = min(start, visible_limit)
+
+    if next_follow_latest and total - start <= limit + shift_step:
+        end = total
+    else:
+        end = min(total, start + limit)
+    hidden_older = start
+    hidden_newer = max(0, total - end)
+    changed = rerender or start != current_start or next_follow_latest != follow_latest
+    return changed, start, next_follow_latest, hidden_older, hidden_newer
+
+
+def visible_chat_replay_events(
     *,
     replay_events: list[dict[str, Any]],
+    start: int,
     max_rows: int,
-    trim_total: int,
-    history_source: str,
-    oldest_seq: int | None,
-    oldest_turn: int | None,
-    active_session_id: str,
-    event_cursor_turn: Callable[[dict[str, Any]], int | None],
-    logger: logging.Logger,
-) -> tuple[bool, list[dict[str, Any]], int, int | None, int | None]:
-    """Trim replay buffer to configured cap and return updated state."""
+    follow_latest: bool,
+) -> tuple[list[dict[str, Any]], int, int]:
+    """Return the visible transcript slice plus hidden row counts."""
     total = len(replay_events)
-    if total <= max_rows:
-        return False, replay_events, trim_total, oldest_seq, oldest_turn
+    limit = max(1, int(max_rows))
+    if total <= limit:
+        return replay_events, 0, 0
 
-    trimmed = total - max_rows
-    replay_events = replay_events[-max_rows:]
-    trim_total += trimmed
-    if history_source == "journal":
-        first = replay_events[0] if replay_events else {}
-        try:
-            seq = int(first.get("seq", 0) or 0)
-        except (TypeError, ValueError):
-            seq = 0
-        oldest_seq = seq if seq > 0 else oldest_seq
-    elif history_source == "legacy":
-        turns = [
-            turn
-            for turn in (event_cursor_turn(event) for event in replay_events)
-            if turn is not None
-        ]
-        oldest_turn = min(turns) if turns else oldest_turn
-
-    logger.info(
-        "chat_render_trimmed session=%s trimmed_rows=%s max_rows=%s total_trimmed=%s",
-        active_session_id,
-        trimmed,
-        max_rows,
-        trim_total,
+    clamped_start = min(max(0, int(start)), max(0, total - limit))
+    shift_step = _chat_render_shift_step(limit)
+    if follow_latest and total - clamped_start <= limit + shift_step:
+        end = total
+    else:
+        end = min(total, clamped_start + limit)
+    return (
+        replay_events[clamped_start:end],
+        clamped_start,
+        max(0, total - end),
     )
-    return True, replay_events, trim_total, oldest_seq, oldest_turn
+
+
+def chat_window_notice(*, hidden_older: int, hidden_newer: int) -> str:
+    """Build the transcript window status line."""
+    parts: list[str] = []
+    if hidden_older > 0:
+        parts.append(f"{hidden_older} older row(s) hidden")
+    if hidden_newer > 0:
+        parts.append(f"{hidden_newer} newer row(s) hidden")
+    if not parts:
+        return ""
+    return "[dim]Transcript window truncated: " + "; ".join(parts) + ".[/dim]"
 
 def render_chat_event(self, event: dict, *, source: str = "unknown") -> bool:
     """Render one normalized replay event into the chat widget."""
@@ -82,6 +354,14 @@ def render_chat_event(self, event: dict, *, source: str = "unknown") -> bool:
                 str(payload.get("text", "") or ""),
                 markup=self._coerce_bool(payload.get("markup", False)),
             )
+            return True
+        if event_type == "assistant_thinking":
+            if getattr(self, "_chat_transcript_mode", False) and getattr(
+                self,
+                "_chat_transcript_show_thinking",
+                False,
+            ):
+                chat.add_thinking_text(str(payload.get("text", "") or ""))
             return True
         if event_type in {"tool_call_started", "tool_call_completed"}:
             args = payload.get("args", {})
@@ -241,16 +521,41 @@ def rerender_chat_from_replay_events(self) -> tuple[int, int]:
     """Repaint chat panel from in-memory replay buffer."""
     self._clear_chat_widgets()
     chat = self.query_one("#chat-log", ChatLog)
-    if self._chat_trimmed_total > 0:
-        chat.add_info(
-            (
-                "[dim]Transcript window truncated: "
-                f"{self._chat_trimmed_total} older row(s) hidden.[/dim]"
-            ),
-        )
+    visible_events, hidden_older, hidden_newer = visible_chat_replay_events(
+        replay_events=self._chat_replay_events,
+        start=getattr(self, "_chat_render_window_start", 0),
+        max_rows=self._chat_resume_max_rendered_rows(),
+        follow_latest=getattr(self, "_chat_follow_latest", True),
+    )
+    render_events = build_chat_render_events(
+        visible_events,
+        transcript_mode=getattr(self, "_chat_transcript_mode", False),
+        show_thinking=getattr(self, "_chat_transcript_show_thinking", False),
+    )
+    transcript_notice = chat_transcript_notice(
+        transcript_mode=getattr(self, "_chat_transcript_mode", False),
+        show_thinking=getattr(self, "_chat_transcript_show_thinking", False),
+    )
+    notice = chat_window_notice(
+        hidden_older=hidden_older,
+        hidden_newer=hidden_newer,
+    )
+    search_notice = chat_search_notice(
+        query=getattr(self, "_chat_search_query", ""),
+        match_count=len(getattr(self, "_chat_search_match_positions", [])),
+        current_match=max(0, int(getattr(self, "_chat_search_match_current", 0))) + 1,
+    )
+    self._chat_hidden_older_count = hidden_older
+    self._chat_hidden_newer_count = hidden_newer
+    if transcript_notice:
+        chat.add_info(transcript_notice)
+    if notice:
+        chat.add_info(notice)
+    if search_notice:
+        chat.add_info(search_notice)
     rendered = 0
     skipped = 0
-    for event in self._chat_replay_events:
+    for event in render_events:
         if self._render_chat_event(event, source="hydrate"):
             rendered += 1
         else:
@@ -263,6 +568,7 @@ async def append_chat_replay_event(
     payload: dict,
     *,
     turn_number: int | None = None,
+    journal_through_turn: int | None = None,
     persist: bool = True,
     render: bool = False,
 ) -> None:
@@ -286,6 +592,7 @@ async def append_chat_replay_event(
                 session_id,
                 event["event_type"],
                 event["payload"],
+                journal_through_turn=journal_through_turn,
             )
             event["seq"] = seq
             if not self._chat_history_source:
@@ -301,8 +608,8 @@ async def append_chat_replay_event(
             )
 
     self._chat_replay_events.append(event)
-    trimmed = self._apply_chat_render_cap()
-    if trimmed:
+    rerender = self._apply_chat_render_cap(mode="append")
+    if rerender:
         self._rerender_chat_from_replay_events()
     elif render:
         self._render_chat_event(event, source="live")
@@ -323,15 +630,7 @@ async def hydrate_chat_history_for_active_session(self) -> None:
     parse_failures = 0
     source = ""
     start = time.monotonic()
-    source_pref = (
-        "journal"
-        if self._chat_resume_use_event_journal()
-        else (
-            "legacy"
-            if self._chat_resume_enable_legacy_fallback()
-            else "none"
-        )
-    )
+    source_pref = "transcript"
     logger.info(
         "chat_hydrate_started session=%s source=%s page_size=%s",
         session_id,
@@ -339,58 +638,42 @@ async def hydrate_chat_history_for_active_session(self) -> None:
         page_size,
     )
 
-    if self._chat_resume_use_event_journal():
+    try:
+        events = await _load_transcript_page(
+            self,
+            session_id,
+            limit=page_size,
+        )
+    except Exception as e:
+        logger.warning(
+            "chat_hydrate_failed session=%s source=transcript error_class=%s",
+            session_id,
+            e.__class__.__name__,
+        )
+        events = []
+    if events:
+        source = "transcript"
+        first = events[0]
         try:
-            events = await self._store.get_chat_events(
-                session_id,
-                limit=page_size,
+            self._chat_history_oldest_seq = int(first.get("seq", 0) or 0)
+        except (TypeError, ValueError):
+            self._chat_history_oldest_seq = None
+        turns = [
+            turn
+            for turn in (
+                self._chat_event_cursor_turn(event)
+                for event in events
             )
-        except Exception as e:
-            logger.warning(
-                "chat_hydrate_failed session=%s source=journal error_class=%s",
-                session_id,
-                e.__class__.__name__,
-            )
-            events = []
-        if events:
-            source = "journal"
-            first = events[0]
-            try:
-                self._chat_history_oldest_seq = int(first.get("seq", 0) or 0)
-            except (TypeError, ValueError):
-                self._chat_history_oldest_seq = None
-            parse_failures = sum(
-                1 for row in events if bool(row.get("payload_parse_error", False))
-            )
-
-    if not events and self._chat_resume_enable_legacy_fallback():
-        try:
-            events = await self._store.synthesize_chat_events_from_turns(
-                session_id,
-                limit=page_size,
-            )
-        except Exception as e:
-            logger.warning(
-                "chat_hydrate_failed session=%s source=legacy error_class=%s",
-                session_id,
-                e.__class__.__name__,
-            )
-            events = []
-        if events:
-            source = "legacy"
-            turns = [
-                turn
-                for turn in (
-                    self._chat_event_cursor_turn(event)
-                    for event in events
-                )
-                if turn is not None
-            ]
-            self._chat_history_oldest_turn = min(turns) if turns else None
+            if turn is not None
+        ]
+        self._chat_history_oldest_turn = min(turns) if turns else None
+        parse_failures = sum(
+            1 for row in events if bool(row.get("payload_parse_error", False))
+        )
 
     self._chat_replay_events = events
     self._chat_history_source = source
-    self._apply_chat_render_cap()
+    self._apply_chat_render_cap(mode="hydrate")
     rendered, skipped = self._rerender_chat_from_replay_events()
     elapsed_ms = max(1, int((time.monotonic() - start) * 1000))
     logger.info(
@@ -423,19 +706,20 @@ async def load_older_chat_history(self) -> bool:
         source or "none",
         page_size,
     )
-    if source == "journal":
+    if source == "transcript":
         before_seq = self._chat_history_oldest_seq
         if before_seq is None or before_seq <= 1:
             return False
         try:
-            older = await self._store.get_chat_events(
+            older = await _load_transcript_page(
+                self,
                 session_id,
                 before_seq=before_seq,
                 limit=page_size,
             )
         except Exception as e:
             logger.warning(
-                "chat_hydrate_failed session=%s source=journal "
+                "chat_hydrate_failed session=%s source=transcript "
                 "mode=older error_class=%s",
                 session_id,
                 e.__class__.__name__,
@@ -450,45 +734,13 @@ async def load_older_chat_history(self) -> bool:
             parse_failures = sum(
                 1 for row in older if bool(row.get("payload_parse_error", False))
             )
-    elif source == "legacy":
-        before_turn = self._chat_history_oldest_turn
-        if before_turn is None or before_turn <= 1:
-            return False
-        try:
-            older = await self._store.synthesize_chat_events_from_turns(
-                session_id,
-                before_turn=before_turn,
-                limit=page_size,
-            )
-        except Exception as e:
-            logger.warning(
-                "chat_hydrate_failed session=%s source=legacy "
-                "mode=older error_class=%s",
-                session_id,
-                e.__class__.__name__,
-            )
-            return False
-        if older:
-            turns = [
-                turn
-                for turn in (
-                    self._chat_event_cursor_turn(event)
-                    for event in older
-                )
-                if turn is not None
-            ]
-            self._chat_history_oldest_turn = (
-                min(turns)
-                if turns
-                else self._chat_history_oldest_turn
-            )
     else:
         return False
 
     if not older:
         return False
     self._chat_replay_events = [*older, *self._chat_replay_events]
-    self._apply_chat_render_cap()
+    self._apply_chat_render_cap(mode="prepend_older")
     rendered, skipped = self._rerender_chat_from_replay_events()
     elapsed_ms = max(1, int((time.monotonic() - start) * 1000))
     logger.info(
@@ -502,6 +754,160 @@ async def load_older_chat_history(self) -> bool:
         elapsed_ms,
     )
     return True
+
+
+def set_chat_transcript_mode(self, enabled: bool) -> bool:
+    """Toggle transcript-mode rendering and rerender when it changes."""
+    next_value = bool(enabled)
+    current = bool(getattr(self, "_chat_transcript_mode", False))
+    if current == next_value:
+        return False
+    self._chat_transcript_mode = next_value
+    if not next_value:
+        self._chat_search_query = ""
+        self._chat_search_match_positions = []
+        self._chat_search_match_current = -1
+        self._chat_follow_latest = True
+        self._chat_render_window_start = max(
+            0,
+            len(self._chat_replay_events) - self._chat_resume_max_rendered_rows(),
+        )
+    self._rerender_chat_from_replay_events()
+    return True
+
+
+def set_chat_transcript_show_thinking(self, enabled: bool) -> bool:
+    """Toggle transcript thinking visibility and rerender when it changes."""
+    next_value = bool(enabled)
+    current = bool(getattr(self, "_chat_transcript_show_thinking", False))
+    if current == next_value:
+        return False
+    self._chat_transcript_show_thinking = next_value
+    if getattr(self, "_chat_transcript_mode", False):
+        self._rerender_chat_from_replay_events()
+    return True
+
+
+def clear_chat_search(self) -> bool:
+    """Clear transcript search state and rerender if necessary."""
+    had_query = bool(getattr(self, "_chat_search_query", ""))
+    self._chat_search_query = ""
+    self._chat_search_match_positions = []
+    self._chat_search_match_current = -1
+    if had_query:
+        self._rerender_chat_from_replay_events()
+    return had_query
+
+
+def search_chat_history(self, query: str) -> int:
+    """Search replay history, focus the first match, and rerender."""
+    clean_query = str(query or "").strip()
+    self._chat_search_query = clean_query
+    self._chat_search_match_positions = search_chat_replay_events(
+        self._chat_replay_events,
+        query=clean_query,
+        include_thinking=bool(getattr(self, "_chat_transcript_show_thinking", False)),
+    )
+    if not self._chat_search_match_positions:
+        self._chat_search_match_current = -1
+        self._chat_transcript_mode = True
+        self._rerender_chat_from_replay_events()
+        return 0
+    self._chat_search_match_current = 0
+    self._chat_transcript_mode = True
+    target_index = self._chat_search_match_positions[0]
+    self._chat_render_window_start = focus_chat_event_index(
+        total_rows=len(self._chat_replay_events),
+        max_rows=self._chat_resume_max_rendered_rows(),
+        index=target_index,
+    )
+    self._chat_follow_latest = False
+    self._apply_chat_render_cap(mode="focus")
+    self._rerender_chat_from_replay_events()
+    return len(self._chat_search_match_positions)
+
+
+def step_chat_history_search(self, direction: int) -> tuple[bool, int, int]:
+    """Move to the next/previous active search match."""
+    matches = list(getattr(self, "_chat_search_match_positions", []))
+    if not matches:
+        return False, 0, 0
+    current = int(getattr(self, "_chat_search_match_current", -1))
+    if current < 0:
+        current = 0
+    else:
+        current = (current + int(direction)) % len(matches)
+    self._chat_search_match_current = current
+    self._chat_transcript_mode = True
+    self._chat_render_window_start = focus_chat_event_index(
+        total_rows=len(self._chat_replay_events),
+        max_rows=self._chat_resume_max_rendered_rows(),
+        index=matches[current],
+    )
+    self._chat_follow_latest = False
+    self._apply_chat_render_cap(mode="focus")
+    self._rerender_chat_from_replay_events()
+    return True, current + 1, len(matches)
+
+
+def jump_chat_history_latest(self) -> bool:
+    """Jump transcript view back to the live tail."""
+    total_rows = len(self._chat_replay_events)
+    self._chat_follow_latest = True
+    self._chat_render_window_start = max(
+        0,
+        total_rows - self._chat_resume_max_rendered_rows(),
+    )
+    self._apply_chat_render_cap(mode="focus")
+    self._rerender_chat_from_replay_events()
+    return True
+
+
+async def _load_transcript_page(
+    self,
+    session_id: str,
+    *,
+    before_seq: int | None = None,
+    before_turn: int | None = None,
+    after_seq: int = 0,
+    limit: int = 200,
+) -> list[dict[str, Any]]:
+    getter = getattr(self._store, "get_transcript_page", None)
+    if callable(getter):
+        try:
+            return await getter(
+                session_id,
+                before_seq=before_seq,
+                before_turn=before_turn,
+                after_seq=after_seq,
+                limit=limit,
+            )
+        except TypeError:
+            logger.debug(
+                "chat_transcript_loader_fallback session=%s reason=type_error",
+                session_id,
+                exc_info=True,
+            )
+
+    if before_turn is not None and before_seq is None:
+        synth = getattr(self._store, "synthesize_chat_events_from_turns", None)
+        if callable(synth):
+            return await synth(
+                session_id,
+                before_turn=before_turn,
+                limit=limit,
+            )
+        return []
+
+    get_chat_events = getattr(self._store, "get_chat_events", None)
+    if not callable(get_chat_events):
+        return []
+    return await get_chat_events(
+        session_id,
+        before_seq=before_seq,
+        after_seq=(None if after_seq <= 0 else after_seq),
+        limit=limit,
+    )
 
 async def new_session(self) -> None:
     """Create a fresh session, replacing the current one."""

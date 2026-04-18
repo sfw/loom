@@ -194,7 +194,12 @@ def _collect_text(tool: Tool, args: dict[str, Any], ctx: ToolContext) -> str:
 
     if paths and ctx.workspace is not None:
         for item in paths:
-            path = tool._resolve_read_path(item, ctx.workspace, ctx.read_roots)
+            path = tool._resolve_read_path(
+                item,
+                ctx.workspace,
+                ctx.read_roots,
+                ctx.read_path_map,
+            )
             if not path.exists() or not path.is_file():
                 continue
             chunks.append(path.read_text(encoding="utf-8", errors="ignore"))

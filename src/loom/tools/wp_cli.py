@@ -5,10 +5,20 @@ from __future__ import annotations
 import json
 import logging
 import shlex
-import shutil
 import time
 
-from loom.tools.registry import Tool, ToolContext, ToolResult
+from loom.tools.registry import (
+    Tool,
+    ToolAvailabilityReason,
+    ToolAvailabilityStatus,
+    ToolContext,
+    ToolResult,
+)
+from loom.tools.tooling_common.binary_resolution import (
+    configured_binary_override,
+    normalize_binary_overrides,
+    resolve_binary,
+)
 from loom.tools.tooling_common.command_runner import constrained_env, run_command
 from loom.tools.tooling_common.wp_policy import assess_wp_cli_risk
 from loom.utils.latency import log_latency_event
@@ -68,9 +78,11 @@ class WpCliTool(Tool):
         *,
         enabled: bool = True,
         high_risk_requires_confirmation: bool = True,
+        binary_overrides: dict[str, str] | None = None,
     ) -> None:
         self._enabled = bool(enabled)
         self._high_risk_requires_confirmation = bool(high_risk_requires_confirmation)
+        self._binary_overrides = normalize_binary_overrides(binary_overrides or {})
 
     @property
     def is_mutating(self) -> bool:
@@ -83,6 +95,56 @@ class WpCliTool(Tool):
     @property
     def high_risk_requires_confirmation(self) -> bool:
         return self._high_risk_requires_confirmation
+
+    def _resolve_wp_binary(self):
+        return resolve_binary(
+            "wp",
+            override=configured_binary_override(
+                self._binary_overrides,
+                self.name,
+                "wp",
+            ),
+        )
+
+    def availability(
+        self,
+        *,
+        execution_surface: object = "tui",
+    ) -> ToolAvailabilityStatus:
+        base = super().availability(execution_surface=execution_surface)
+        if not base.runnable:
+            return base
+        if not self._enabled:
+            return ToolAvailabilityStatus(
+                state="unavailable",
+                reasons=(
+                    ToolAvailabilityReason(
+                        code="feature_disabled",
+                        message="WordPress tools are disabled by configuration.",
+                    ),
+                ),
+            )
+        resolution = self._resolve_wp_binary()
+        if resolution.found:
+            return ToolAvailabilityStatus(
+                state="available",
+                metadata={
+                    "binary": "wp",
+                    "binary_path": resolution.path,
+                    "binary_source": resolution.source,
+                },
+            )
+        return ToolAvailabilityStatus(
+            state="unavailable",
+            reasons=(
+                ToolAvailabilityReason(
+                    code=resolution.error_code or "binary_not_found",
+                    message=resolution.message or "Binary not found: wp",
+                    metadata=dict(resolution.metadata or {}),
+                ),
+            ),
+            metadata={"binary": "wp"},
+        )
 
     async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
         started = time.monotonic()
@@ -110,9 +172,14 @@ class WpCliTool(Tool):
         except Exception as e:
             return self._error("path_outside_workspace", str(e))
 
-        binary_path = shutil.which("wp")
+        resolution = self._resolve_wp_binary()
+        binary_path = resolution.path
         if not binary_path:
-            return self._error("binary_not_found", "Binary not found: wp")
+            return self._error(
+                resolution.error_code or "binary_not_found",
+                resolution.message or "Binary not found: wp",
+                extra_data={"reason_code": "tool_runtime_capability_unavailable"},
+            )
 
         risk = assess_wp_cli_risk(group, action, payload)
         if (
@@ -422,10 +489,13 @@ class WpCliTool(Tool):
         return shlex.join(redacted)
 
     @staticmethod
-    def _error(code: str, message: str) -> ToolResult:
+    def _error(code: str, message: str, *, extra_data: dict | None = None) -> ToolResult:
+        data = {"error_code": code}
+        if isinstance(extra_data, dict):
+            data.update(extra_data)
         return ToolResult(
             success=False,
             output="",
             error=message,
-            data={"error_code": code},
+            data=data,
         )

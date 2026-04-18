@@ -38,6 +38,14 @@ def test_runtime_store_set_runtime_value_updates_effective_config() -> None:
     assert store.effective_config().telemetry.mode == "all_typed"
 
 
+def test_runtime_store_snapshot_includes_exposure_level() -> None:
+    store = ConfigRuntimeStore(Config())
+
+    snapshot = store.snapshot("execution.ask_user_policy")
+
+    assert snapshot["exposure_level"] == "basic"
+
+
 def test_runtime_store_persist_and_reset_scalar_value(tmp_path: Path) -> None:
     config_path = tmp_path / "loom.toml"
     store = ConfigRuntimeStore(Config(), source_path=config_path)

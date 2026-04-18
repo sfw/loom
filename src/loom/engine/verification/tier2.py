@@ -17,7 +17,11 @@ from loom.models.request_diagnostics import (
     collect_request_diagnostics,
     collect_response_diagnostics,
 )
-from loom.models.retry import ModelRetryPolicy, call_with_model_retry
+from loom.models.retry import (
+    ModelRetryPolicy,
+    build_model_retry_event_payload,
+    call_with_model_retry,
+)
 from loom.models.router import ModelRouter, ResponseValidator
 from loom.prompts.assembler import PromptAssembler
 from loom.state.task_state import Subtask
@@ -1417,11 +1421,39 @@ class LLMVerifier:
                 },
             )
 
+        def _on_retry_scheduled(
+            attempt: int,
+            max_attempts: int,
+            error: BaseException,
+            remaining: int,
+            delay_seconds: float,
+        ) -> None:
+            self._emit_model_event(
+                task_id=task_id,
+                subtask_id=subtask_id,
+                model_name=getattr(model, "name", "unknown"),
+                phase="done",
+                details={
+                    "operation": "complete",
+                    "origin": request_diag.origin,
+                    "invocation_attempt": attempt,
+                    "invocation_max_attempts": max_attempts,
+                    "retry_queue_remaining": remaining,
+                    "error_type": type(error).__name__,
+                    "error": str(error),
+                    **build_model_retry_event_payload(
+                        error,
+                        delay_seconds=delay_seconds,
+                    ),
+                },
+            )
+
         try:
             response = await call_with_model_retry(
                 _invoke_model,
                 policy=policy,
                 on_failure=_on_failure,
+                on_retry_scheduled=_on_retry_scheduled,
             )
         except Exception:
             return None
@@ -1516,10 +1548,38 @@ class LLMVerifier:
                 },
             )
 
+        def _on_retry_scheduled(
+            attempt: int,
+            max_attempts: int,
+            error: BaseException,
+            remaining: int,
+            delay_seconds: float,
+        ) -> None:
+            self._emit_model_event(
+                task_id=task_id,
+                subtask_id=subtask_id,
+                model_name=getattr(model, "name", "unknown"),
+                phase="done",
+                details={
+                    "operation": "complete",
+                    "origin": request_diag.origin,
+                    "invocation_attempt": attempt,
+                    "invocation_max_attempts": max_attempts,
+                    "retry_queue_remaining": remaining,
+                    "error_type": type(error).__name__,
+                    "error": str(error),
+                    **build_model_retry_event_payload(
+                        error,
+                        delay_seconds=delay_seconds,
+                    ),
+                },
+            )
+
         response = await call_with_model_retry(
             _invoke_model,
             policy=policy,
             on_failure=_on_failure,
+            on_retry_scheduled=_on_retry_scheduled,
         )
         self._emit_model_event(
             task_id=task_id,

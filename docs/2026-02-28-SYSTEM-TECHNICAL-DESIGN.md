@@ -588,6 +588,16 @@ Startup flow:
 
 Failure policy:
 - Existing DB upgrade failures are blocking startup errors.
+
+Runtime policy:
+- Loom keeps SQLite as the local default and now uses a governed connection
+  model: one long-lived write connection, a small read pool, WAL mode, and
+  explicit pragmas (`busy_timeout=5000`, `synchronous=NORMAL`,
+  `wal_autocheckpoint=2000`, `temp_store=MEMORY`, negative `cache_size`).
+- High-volume compliance events are persisted through a bounded in-process
+  batch queue instead of one fresh SQLite connection and commit per event.
+- Run and notification SSE streams do an initial durable catch-up from SQLite,
+  then switch to direct in-process event-bus delivery for live updates.
 - Existing DB failures do not auto-fallback to ephemeral mode.
 - New DB initialization failures are also blocking by default; ephemeral mode
   requires explicit `--ephemeral` opt-in.

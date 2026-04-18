@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 import pytest
 
 from loom.events.bus import EventBus
+from loom.events.types import APPROVAL_REJECTED, APPROVAL_TIMED_OUT
 from loom.recovery.approval import (
     ApprovalDecision,
     ApprovalManager,
@@ -254,6 +255,8 @@ class TestApprovalWorkflow:
         asyncio.create_task(reject_after_delay())
         result = await mgr.request_approval(request)
         assert result is False
+        event_types = [event.event_type for event in bus.recent_events()]
+        assert APPROVAL_REJECTED in event_types
 
     @pytest.mark.asyncio
     async def test_deny_on_timeout(self):
@@ -272,6 +275,8 @@ class TestApprovalWorkflow:
 
         result = await mgr.request_approval(request)
         assert result is False
+        event_types = [event.event_type for event in bus.recent_events()]
+        assert APPROVAL_TIMED_OUT in event_types
 
     def test_resolve_nonexistent_approval(self):
         bus = EventBus()

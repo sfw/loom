@@ -24,6 +24,8 @@ from loom.tools.file_ops import (
 from loom.tools.git import GitCommandTool, check_git_safety, parse_subcommand
 from loom.tools.registry import (
     Tool,
+    ToolAvailabilityReason,
+    ToolAvailabilityStatus,
     ToolContext,
     ToolRegistry,
     ToolResult,
@@ -35,6 +37,7 @@ from loom.tools.shell import (
     check_command_safety,
     high_risk_command_metadata,
 )
+from loom.tools.verification_helper import VerificationHelperTool
 
 WORKSPACE_WRITING_TOOLS = sorted({
     "citation_manager",
@@ -72,6 +75,7 @@ WORKSPACE_WRITING_TOOLS = sorted({
     "symbol_universe_api",
     "timeline_visualizer",
     "valuation_engine",
+    "verification_helper",
     "wp_quality_gate",
     "write_file",
     "delete_file",
@@ -143,6 +147,7 @@ class TestRegistry:
         assert "web_fetch" in tools
         assert "web_fetch_html" in tools
         assert "read_artifact" in tools
+        assert "verification_helper" in tools
 
     def test_register_duplicate_raises(self):
         reg = ToolRegistry()
@@ -165,6 +170,46 @@ class TestRegistry:
         assert "ask_user" in tui_names
         assert "ask_user" not in cli_names
 
+    def test_runnable_only_filters_unavailable_tools(self):
+        class _UnavailableTool(Tool):
+            __loom_register__ = False
+
+            @property
+            def name(self) -> str:
+                return "unavailable_tool"
+
+            @property
+            def description(self) -> str:
+                return "Unavailable tool"
+
+            @property
+            def parameters(self) -> dict:
+                return {"type": "object", "properties": {}}
+
+            def availability(self, *, execution_surface: object = "tui") -> ToolAvailabilityStatus:
+                return ToolAvailabilityStatus(
+                    state="unavailable",
+                    reasons=(
+                        ToolAvailabilityReason(
+                            code="binary_not_found",
+                            message="Missing binary",
+                        ),
+                    ),
+                )
+
+            async def execute(self, args: dict, _ctx: ToolContext) -> ToolResult:
+                del args
+                return ToolResult.fail("should not run")
+
+        registry = ToolRegistry()
+        registry.register(ReadFileTool())
+        registry.register(_UnavailableTool())
+
+        assert "unavailable_tool" in registry.list_tools()
+        assert "unavailable_tool" not in registry.list_tools(runnable_only=True)
+        schemas = registry.all_schemas(runnable_only=True)
+        assert {schema["name"] for schema in schemas} == {"read_file"}
+
     def test_discover_tools_finds_all_builtins(self):
         classes = discover_tools()
         names = {cls.__name__ for cls in classes}
@@ -172,7 +217,7 @@ class TestRegistry:
             "ReadFileTool", "WriteFileTool", "EditFileTool",
             "DeleteFileTool", "MoveFileTool", "ShellExecuteTool",
             "GitCommandTool", "SearchFilesTool", "ListDirectoryTool",
-            "AnalyzeCodeTool", "WebFetchTool", "WebFetchHtmlTool",
+            "AnalyzeCodeTool", "VerificationHelperTool", "WebFetchTool", "WebFetchHtmlTool",
             "ReadArtifactTool",
         }
         assert expected.issubset(names), f"Missing: {expected - names}"
@@ -633,6 +678,30 @@ class TestReadFile:
         assert result.success
         assert "Campaign brief" in result.output
 
+    async def test_read_file_relative_path_resolves_from_attached_file_map(self, tmp_path: Path):
+        root = tmp_path / "project"
+        run_ws = root / "run-1"
+        source_dir = root / "source-data"
+        root.mkdir()
+        run_ws.mkdir()
+        source_dir.mkdir()
+        report_path = source_dir / "report.md"
+        report_path.write_text("Attached report")
+        (source_dir / "other.md").write_text("Sibling file")
+
+        tool = ReadFileTool()
+        ctx = ToolContext(
+            workspace=run_ws,
+            read_path_map={"source-data/report.md": report_path},
+        )
+        result = await tool.execute({"path": "source-data/report.md"}, ctx)
+        assert result.success
+        assert "Attached report" in result.output
+
+        other_result = await tool.execute({"path": "source-data/other.md"}, ctx)
+        assert not other_result.success
+        assert "not found" in other_result.error
+
     async def test_read_image_returns_metadata(self, ctx: ToolContext, workspace: Path):
         # Create a dummy image file
         img_path = workspace / "logo.png"
@@ -825,6 +894,135 @@ class TestShellExecute:
         assert "README.md" in result.output
 
 
+# --- VerificationHelperTool ---
+
+class TestVerificationHelperTool:
+    async def test_run_build_check_succeeds(self, ctx: ToolContext) -> None:
+        tool = VerificationHelperTool()
+        result = await tool.execute(
+            {
+                "helper": "run_build_check",
+                "args": {"command": "printf 'build ok'"},
+            },
+            ctx,
+        )
+
+        assert result.success is True
+        assert "build ok" in result.output
+        assert result.data == {
+            "exit_code": 0,
+            "command": "printf 'build ok'",
+            "helper": "run_build_check",
+            "helper_capability": "command_execution",
+        }
+
+    async def test_run_test_suite_surfaces_reason_code(self, ctx: ToolContext) -> None:
+        tool = VerificationHelperTool()
+        result = await tool.execute(
+            {
+                "helper": "run_test_suite",
+                "args": {"command": "false"},
+            },
+            ctx,
+        )
+
+        assert result.success is False
+        assert result.error == "dev_test_failed"
+        assert isinstance(result.data, dict)
+        assert result.data["exit_code"] != 0
+        assert result.data["helper"] == "run_test_suite"
+        assert result.data["helper_capability"] == "command_execution"
+        assert result.data["helper_reason_code"] == "dev_test_failed"
+
+    async def test_http_assert_surfaces_helper_metadata(self, ctx: ToolContext) -> None:
+        tool = VerificationHelperTool()
+        result = await tool.execute(
+            {
+                "helper": "http_assert",
+                "args": {"url": "http://127.0.0.1:1/index.html"},
+            },
+            ctx,
+        )
+
+        assert result.success is False
+        assert isinstance(result.data, dict)
+        assert result.data["helper"] == "http_assert"
+        assert result.data["helper_capability"] == "service_runtime"
+        assert result.data["helper_reason_code"] in {
+            "dev_verifier_capability_unavailable",
+            "dev_verifier_timeout",
+        }
+
+    async def test_browser_session_surfaces_helper_metadata_on_failure(
+        self,
+        ctx: ToolContext,
+    ) -> None:
+        tool = VerificationHelperTool()
+        result = await tool.execute(
+            {
+                "helper": "browser_session",
+                "args": {
+                    "start_url": "http://127.0.0.1:1/index.html",
+                    "steps": [{"action": "open", "url": "http://127.0.0.1:1/index.html"}],
+                },
+            },
+            ctx,
+        )
+
+        assert result.success is False
+        assert isinstance(result.data, dict)
+        assert result.data["helper"] == "browser_session"
+        assert result.data["helper_capability"] == "browser_runtime"
+        assert result.data["helper_reason_code"] in {
+            "dev_browser_check_failed",
+            "dev_verifier_capability_unavailable",
+            "dev_verifier_timeout",
+        }
+
+    async def test_render_verification_report_writes_output_file(
+        self,
+        ctx: ToolContext,
+        workspace: Path,
+    ) -> None:
+        tool = VerificationHelperTool()
+        result = await tool.execute(
+            {
+                "helper": "render_verification_report",
+                "args": {
+                    "title": "UI Validation",
+                    "canonical_result": {"passed": 15, "total": 16, "failed": 1},
+                    "output_path": "reports/ui-integration-validation-report.md",
+                },
+            },
+            ctx,
+        )
+
+        report_path = workspace / "reports" / "ui-integration-validation-report.md"
+        assert result.success is True
+        assert report_path.exists()
+        assert result.files_changed == ["reports/ui-integration-validation-report.md"]
+        assert isinstance(result.data, dict)
+        assert result.data["output_path"] == "reports/ui-integration-validation-report.md"
+        assert "# UI Validation" in report_path.read_text()
+
+    async def test_registry_executes_verification_helper_tool(
+        self,
+        registry: ToolRegistry,
+        workspace: Path,
+    ) -> None:
+        result = await registry.execute(
+            "verification_helper",
+            {
+                "helper": "run_build_check",
+                "args": {"command": "printf 'registry ok'"},
+            },
+            workspace=workspace,
+        )
+
+        assert result.success is True
+        assert "registry ok" in result.output
+
+
 # --- Shell Safety ---
 
 class TestShellSafety:
@@ -983,6 +1181,27 @@ class TestSearchFiles:
         assert result.success
         assert "notes.txt" in result.output
 
+    async def test_search_exact_attached_file_via_read_path_map(self, tmp_path: Path):
+        root = tmp_path / "project"
+        run_ws = root / "run-1"
+        source_dir = root / "source-data"
+        source_dir.mkdir(parents=True)
+        run_ws.mkdir()
+        report_path = source_dir / "report.md"
+        report_path.write_text("creative brief source\n")
+
+        tool = SearchFilesTool()
+        ctx = ToolContext(
+            workspace=run_ws,
+            read_path_map={"source-data/report.md": report_path},
+        )
+        result = await tool.execute(
+            {"pattern": "creative brief", "path": "source-data/report.md"},
+            ctx,
+        )
+        assert result.success
+        assert "report.md:1:" in result.output
+
 
 # --- ListDirectoryTool ---
 
@@ -1036,6 +1255,25 @@ class TestListDirectory:
         tool = ListDirectoryTool()
         ctx = ToolContext(workspace=run_ws, read_roots=[root])
         result = await tool.execute({"path": "docs"}, ctx)
+        assert result.success
+        assert "brief.md" in result.output
+
+    async def test_list_relative_path_resolves_from_attached_directory_map(self, tmp_path: Path):
+        root = tmp_path / "project"
+        run_ws = root / "run-1"
+        audit_dir = root / "seo-geo-review"
+        root.mkdir()
+        run_ws.mkdir()
+        audit_dir.mkdir()
+        (audit_dir / "brief.md").write_text("brief")
+
+        tool = ListDirectoryTool()
+        ctx = ToolContext(
+            workspace=run_ws,
+            read_roots=[audit_dir],
+            read_path_map={"seo-geo-review": audit_dir},
+        )
+        result = await tool.execute({"path": "seo-geo-review"}, ctx)
         assert result.success
         assert "brief.md" in result.output
 

@@ -303,7 +303,12 @@ class TestCoworkSession:
 
         assert provider.tool_payloads
         first_call = provider.tool_payloads[0] or []
-        assert len(first_call) == len(tools.all_schemas())
+        assert len(first_call) == len(
+            tools.all_schemas(
+                execution_surface="tui",
+                runnable_only=True,
+            ),
+        )
 
     async def test_hybrid_unknown_tool_error_suggests_list_tools(self, workspace, tools):
         provider = MockProvider([
@@ -690,6 +695,7 @@ class TestCoworkSession:
         session.session_state.update_memory_snapshot({
             "active_decisions": [
                 {
+                    "id": 108,
                     "entry_type": "decision",
                     "status": "active",
                     "summary": "Use compactor model for cowork memory extraction",
@@ -730,6 +736,7 @@ class TestCoworkSession:
         recall_content = str(recall_messages[0].get("content", ""))
         assert "Active DECISION" in recall_content
         assert "Open QUESTION" in recall_content
+        assert "id=108" in recall_content
         assert "decision_context" in recall_content
 
     async def test_context_window_repairs_dangling_assistant_tool_calls(
@@ -949,6 +956,48 @@ class TestCoworkSession:
         )
         assert indexed
 
+    async def test_resume_replays_canonical_turns_past_stale_session_checkpoint(
+        self,
+        tmp_path: Path,
+    ):
+        database = Database(tmp_path / "stale-checkpoint.db")
+        await database.initialize()
+        store = ConversationStore(database)
+        sid = await store.create_session(workspace=str(tmp_path), model_name="mock")
+
+        await store.append_turn(sid, 1, "user", "Old focus")
+        await store.update_session(
+            sid,
+            total_tokens=5,
+            turn_count=1,
+            session_state={
+                "session_id": sid,
+                "workspace": str(tmp_path),
+                "model_name": "mock",
+                "turn_count": 1,
+                "total_tokens": 5,
+                "current_focus": "Old focus",
+            },
+            session_state_through_turn=1,
+        )
+        await store.append_turn(sid, 2, "assistant", "Old answer")
+        await store.append_turn(sid, 3, "user", "Fresh followup")
+
+        session = CoworkSession(
+            model=MockProvider([ModelResponse(text="ok", usage=TokenUsage(total_tokens=1))]),
+            tools=create_default_registry(),
+            workspace=tmp_path,
+            system_prompt="test",
+            store=store,
+        )
+
+        await session.resume(sid)
+
+        assert session.persisted_turn_count == 3
+        assert session.session_state.turn_count == 2
+        assert session.session_state.current_focus == "Fresh followup"
+        assert session.messages[-1]["content"] == "Fresh followup"
+
     async def test_send_retries_transient_model_failure(self, workspace, tools):
         provider = MockProvider([
             RuntimeError("transient model failure"),
@@ -1039,6 +1088,107 @@ class TestCoworkSession:
         # Two executions, then recovery hint, then deterministic stop.
         assert len(turns[0].tool_calls) == 2
 
+    async def test_send_streaming_recovers_when_tool_turn_ends_without_final_text(
+        self,
+        workspace,
+        tools,
+    ):
+        class _EchoTool(Tool):
+            @property
+            def name(self) -> str:
+                return "echo_tool"
+
+            @property
+            def description(self) -> str:
+                return "Return deterministic test output."
+
+            @property
+            def parameters(self) -> dict:
+                return {
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}},
+                    "required": ["value"],
+                }
+
+            async def execute(self, args: dict, ctx) -> ToolResult:
+                return ToolResult.ok(f"tool result: {args.get('value', '')}")
+
+        tools.register(_EchoTool())
+        provider = MockProvider([
+            ModelResponse(
+                text="",
+                tool_calls=[ToolCall(
+                    id="echo-1",
+                    name="echo_tool",
+                    arguments={"value": "hello"},
+                )],
+                usage=TokenUsage(total_tokens=3),
+            ),
+            ModelResponse(text="", usage=TokenUsage(total_tokens=1)),
+            ModelResponse(text="Final recommendation.", usage=TokenUsage(total_tokens=2)),
+        ])
+        session = CoworkSession(model=provider, tools=tools, workspace=workspace)
+
+        events = []
+        async for event in session.send_streaming("use the tool then answer"):
+            events.append(event)
+
+        turns = [event for event in events if isinstance(event, CoworkTurn)]
+        assert len(turns) == 1
+        assert turns[0].text == "Final recommendation."
+        assert provider._call_count == 3
+
+    async def test_send_recovers_with_fallback_when_tool_turn_still_has_no_final_text(
+        self,
+        workspace,
+        tools,
+    ):
+        class _EchoTool(Tool):
+            @property
+            def name(self) -> str:
+                return "echo_tool"
+
+            @property
+            def description(self) -> str:
+                return "Return deterministic test output."
+
+            @property
+            def parameters(self) -> dict:
+                return {
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}},
+                    "required": ["value"],
+                }
+
+            async def execute(self, args: dict, ctx) -> ToolResult:
+                return ToolResult.ok(f"tool result: {args.get('value', '')}")
+
+        tools.register(_EchoTool())
+        provider = MockProvider([
+            ModelResponse(
+                text="",
+                tool_calls=[ToolCall(
+                    id="echo-1",
+                    name="echo_tool",
+                    arguments={"value": "world"},
+                )],
+                usage=TokenUsage(total_tokens=3),
+            ),
+            ModelResponse(text="", usage=TokenUsage(total_tokens=1)),
+            ModelResponse(text="", usage=TokenUsage(total_tokens=1)),
+        ])
+        session = CoworkSession(model=provider, tools=tools, workspace=workspace)
+
+        events = []
+        async for event in session.send("use the tool then answer"):
+            events.append(event)
+
+        turns = [event for event in events if isinstance(event, CoworkTurn)]
+        assert len(turns) == 1
+        assert "failed to produce a final answer" in turns[0].text.lower()
+        assert "echo_tool" in turns[0].text
+        assert "tool result: world" in turns[0].text
+
     async def test_send_estimates_tokens_when_usage_missing(self, workspace, tools):
         provider = MockProvider([
             ModelResponse(
@@ -1062,6 +1212,107 @@ class TestCoworkSession:
         assert turns[0].context_tokens > 0
         assert turns[0].context_messages > 0
 
+    async def test_append_tool_result_uses_fast_preview_without_semantic_compactor(
+        self,
+        workspace,
+        tools,
+    ):
+        session = CoworkSession(
+            model=MockProvider([ModelResponse(text="ok", usage=TokenUsage(total_tokens=1))]),
+            tools=tools,
+            workspace=workspace,
+        )
+
+        class _ExplodingCompactor:
+            async def compact(self, text: str, *, max_chars: int, label: str = "") -> str:
+                raise AssertionError("semantic compactor should not run for tool results")
+
+        session._compactor = _ExplodingCompactor()
+        long_text = "important evidence " * 400
+
+        await session._append_tool_result(
+            "call-fast-preview",
+            "web_fetch",
+            ToolResult.ok(long_text, data={"body": long_text}),
+        )
+
+        assert session._messages
+        payload = json.loads(str(session._messages[-1]["content"]))
+        assert str(payload["output"]).endswith("...[truncated]")
+        assert str(payload["data"]["body"]).endswith("...[truncated]")
+
+    async def test_send_parallelizes_safe_web_tool_batches(self, workspace, tools):
+        tools.exclude("web_fetch")
+        state = {"active": 0, "max_active": 0}
+
+        class _SlowWebFetchTool(Tool):
+            @property
+            def name(self) -> str:
+                return "web_fetch"
+
+            @property
+            def description(self) -> str:
+                return "Test web fetch tool."
+
+            @property
+            def parameters(self) -> dict:
+                return {
+                    "type": "object",
+                    "properties": {
+                        "url": {"type": "string"},
+                    },
+                    "required": ["url"],
+                }
+
+            async def execute(self, args: dict, ctx) -> ToolResult:
+                state["active"] += 1
+                state["max_active"] = max(state["max_active"], state["active"])
+                try:
+                    await asyncio.sleep(0.05)
+                finally:
+                    state["active"] -= 1
+                return ToolResult.ok(
+                    f"Fetched {args.get('url', '')}",
+                    data={"url": args.get("url", "")},
+                )
+
+        tools.register(_SlowWebFetchTool())
+        provider = MockProvider([
+            ModelResponse(
+                text="",
+                tool_calls=[
+                    ToolCall(
+                        id="wf-1",
+                        name="web_fetch",
+                        arguments={"url": "https://example.com/1"},
+                    ),
+                    ToolCall(
+                        id="wf-2",
+                        name="web_fetch",
+                        arguments={"url": "https://example.com/2"},
+                    ),
+                ],
+                usage=TokenUsage(total_tokens=6),
+            ),
+            ModelResponse(text="done", usage=TokenUsage(total_tokens=1)),
+        ])
+        session = CoworkSession(model=provider, tools=tools, workspace=workspace)
+
+        events = []
+        started_ids: list[str] = []
+        async for event in session.send("fetch both"):
+            events.append(event)
+            if isinstance(event, ToolCallEvent) and event.result is None:
+                started_ids.append(event.tool_call_id)
+
+        completed = [
+            event for event in events
+            if isinstance(event, ToolCallEvent) and event.result is not None
+        ]
+        assert started_ids == ["wf-1", "wf-2"]
+        assert sorted({event.tool_call_id for event in completed}) == ["wf-1", "wf-2"]
+        assert state["max_active"] >= 2
+
 
 class TestBuildSystemPrompt:
     def test_with_workspace(self, workspace):
@@ -1078,3 +1329,6 @@ class TestBuildSystemPrompt:
         assert "glob_find" in prompt
         assert "ripgrep_search" in prompt
         assert "ask_user" in prompt
+        assert "verification_helper" in prompt
+        assert "browser_session" in prompt
+        assert "shell_execute" in prompt

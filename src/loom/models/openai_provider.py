@@ -475,6 +475,7 @@ class OpenAICompatibleProvider(ModelProvider):
                                 choice = first
                         delta = choice.get("delta", {}) if isinstance(choice, dict) else {}
                         text = delta.get("content") or ""
+                        reasoning = delta.get("reasoning_content") or delta.get("reasoning") or ""
 
                         # Accumulate tool call deltas
                         if delta.get("tool_calls"):
@@ -512,9 +513,9 @@ class OpenAICompatibleProvider(ModelProvider):
                             )
                             latest_usage = usage
 
-                        if text or usage is not None:
+                        if text or reasoning or usage is not None:
                             yield StreamChunk(
-                                text=text, done=False, usage=usage,
+                                text=text, thinking=reasoning, done=False, usage=usage,
                             )
         except httpx.ConnectError as e:
             raise ModelConnectionError(
@@ -648,15 +649,20 @@ class OpenAICompatibleProvider(ModelProvider):
         as the tool result (must be a string), and multimodal parts are
         injected as a follow-up user message with image_url/file content.
         """
-        if not self._capabilities or not self._capabilities.vision:
-            return self._normalize_openai_messages(messages)
-
         result = []
+        supports_multimodal_tool_followups = bool(
+            self._capabilities
+            and (self._capabilities.vision or self._capabilities.native_pdf)
+        )
         for msg in messages:
-            if msg.get("role") == "tool":
+            role = str(msg.get("role", "") or "").strip()
+            if role == "tool":
+                if not supports_multimodal_tool_followups:
+                    result.append(self._strip_internal_message_fields(msg))
+                    continue
                 raw_content = msg.get("content", "")
                 text_content = self._build_tool_result_content(raw_content)
-                out = dict(msg)
+                out = self._strip_internal_message_fields(msg)
                 out["content"] = text_content
                 result.append(out)
 
@@ -667,9 +673,102 @@ class OpenAICompatibleProvider(ModelProvider):
                         "role": "user",
                         "content": parts,
                     })
+            elif role == "user":
+                out = self._strip_internal_message_fields(msg)
+                out["content"] = self._build_user_message_content(msg)
+                result.append(out)
             else:
-                result.append(msg)
+                result.append(self._strip_internal_message_fields(msg))
         return self._normalize_openai_messages(result)
+
+    @staticmethod
+    def _strip_internal_message_fields(message: dict) -> dict:
+        out = dict(message)
+        for key in (
+            "workspace_paths",
+            "workspace_files",
+            "workspace_directories",
+            "content_blocks",
+        ):
+            out.pop(key, None)
+        return out
+
+    @staticmethod
+    def _attachment_path_text(message: dict) -> str:
+        workspace_paths = message.get("workspace_paths")
+        if not isinstance(workspace_paths, list) or not workspace_paths:
+            return ""
+        lines = [
+            str(path or "").strip()
+            for path in workspace_paths
+            if str(path or "").strip()
+        ]
+        if not lines:
+            return ""
+        return "Attached workspace context:\n" + "\n".join(f"- {path}" for path in lines)
+
+    def _build_user_message_content(self, message: dict) -> str | list[dict]:
+        text_segments = [
+            str(message.get("content", "") or "").strip(),
+            self._attachment_path_text(message),
+        ]
+        base_text = "\n\n".join(segment for segment in text_segments if segment)
+        blocks = message.get("content_blocks")
+        if not isinstance(blocks, list) or not blocks:
+            return base_text
+
+        parts: list[dict] = []
+        if base_text:
+            parts.append({"type": "text", "text": base_text})
+
+        caps = self._capabilities
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            btype = str(block.get("type", "") or "").strip().lower()
+            if btype == "text":
+                text = str(block.get("text", "") or "")
+                if text:
+                    parts.append({"type": "text", "text": text})
+                continue
+            if btype == "image" and caps and caps.vision:
+                source_path = str(block.get("source_path", "") or "").strip()
+                data = encode_image_base64(Path(source_path)) if source_path else None
+                if data:
+                    media = str(block.get("media_type", "image/png") or "image/png")
+                    parts.append({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{media};base64,{data}",
+                            "detail": "high",
+                        },
+                    })
+                    continue
+            if btype == "document" and caps and caps.native_pdf:
+                source_path = str(block.get("source_path", "") or "").strip()
+                data = encode_file_base64(Path(source_path)) if source_path else None
+                if data:
+                    parts.append({
+                        "type": "file",
+                        "file": {
+                            "filename": Path(source_path).name,
+                            "file_data": f"data:application/pdf;base64,{data}",
+                        },
+                    })
+                    continue
+            fallback = str(block.get("text_fallback", "") or "").strip()
+            if fallback:
+                parts.append({"type": "text", "text": fallback})
+
+        if not parts:
+            return base_text
+        if (
+            len(parts) == 1
+            and parts[0].get("type") == "text"
+            and isinstance(parts[0].get("text"), str)
+        ):
+            return str(parts[0]["text"])
+        return parts
 
     @staticmethod
     def _normalize_openai_messages(messages: list[dict]) -> list[dict]:

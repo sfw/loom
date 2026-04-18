@@ -1,0 +1,39 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Loom Desktop",
+  "version": "0.3.0",
+  "identifier": "com.sfw.loom.desktop",
+  "build": {
+    "beforeDevCommand": "pnpm dev",
+    "beforeBuildCommand": "pnpm icons:sync && pnpm build && pnpm bundle:python",
+    "devUrl": "http://127.0.0.1:1420",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Loom Desktop",
+        "width": 1440,
+        "height": 960,
+        "minWidth": 980,
+        "minHeight": 720,
+        "resizable": true
+      }
+    ]
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/icon.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "resources": {
+      "target/macos-bundle-resources/python": "python",
+      "target/macos-bundle-resources/loom-env": "loom-env",
+      "target/macos-bundle-resources/loom-desktop-bundle.json": "loom-desktop-bundle.json"
+    }
+  }
+}

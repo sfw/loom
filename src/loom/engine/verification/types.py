@@ -33,10 +33,33 @@ _VALID_ASSERTION_VERDICTS = {
 }
 
 _REASON_CODE_SEVERITY: dict[str, str] = {
+    "dev_browser_check_failed": "semantic",
+    "dev_build_failed": "semantic",
+    "dev_contract_failed": "semantic",
+    "dev_report_contract_violation": "infra",
+    "dev_test_failed": "semantic",
+    "dev_verifier_capability_unavailable": "infra",
+    "dev_verifier_timeout": "infra",
     "hard_invariant_failed": "hard_invariant",
+    "provider_binary_not_found": "infra",
+    "provider_binary_unsupported": "infra",
     "parse_inconclusive": "inconclusive",
     "infra_verifier_error": "infra",
+    "tool_capability_unavailable": "infra",
+    "tool_method_failed": "semantic",
+    "tool_transient_failure": "infra",
+    "tool_upstream_unavailable": "infra",
+    "tool_write_retryable": "infra",
+    "tool_runtime_retryable": "infra",
+    "tool_runtime_capability_unavailable": "infra",
 }
+
+def severity_class_for_reason_code(reason_code: str | None) -> str:
+    """Return the normalized severity class for a structured reason code."""
+    return _REASON_CODE_SEVERITY.get(
+        str(reason_code or "").strip().lower(),
+        "",
+    )
 
 
 @dataclass
@@ -85,9 +108,9 @@ class VerificationResult:
         tier: int,
         passed: bool,
     ) -> str:
-        normalized_reason = str(reason_code or "").strip().lower()
-        if normalized_reason in _REASON_CODE_SEVERITY:
-            return _REASON_CODE_SEVERITY[normalized_reason]
+        severity = severity_class_for_reason_code(reason_code)
+        if severity:
+            return severity
         if outcome == "fail" and tier <= 1:
             return "hard_invariant"
         if not passed and outcome == "fail":

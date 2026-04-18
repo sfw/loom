@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -61,8 +62,9 @@ from loom.state.task_state import (
     TaskStateManager,
     TaskStatus,
 )
-from loom.tools.registry import ToolRegistry
+from loom.tools.registry import ToolRegistry, normalize_tool_execution_surface
 from loom.tools.workspace import ChangeLog
+from loom.utils.concurrency import run_blocking_io
 
 from . import budget as orchestrator_budget
 from . import dispatch as orchestrator_dispatch
@@ -181,6 +183,8 @@ class Orchestrator:
         question_manager: QuestionManager | None = None,
         learning_manager: LearningManager | None = None,
         process: ProcessDefinition | None = None,
+        snapshot_mirror_writer: Callable[[Task], Awaitable[None]] | None = None,
+        execution_surface: str = "tui",
     ):
         self._router = model_router
         self._tools = tool_registry
@@ -191,6 +195,8 @@ class Orchestrator:
         self._config = config
         self._learning = learning_manager
         self._process = process
+        self._snapshot_mirror_writer = snapshot_mirror_writer
+        self._execution_surface = normalize_tool_execution_surface(execution_surface)
         self._scheduler = Scheduler()
         self._validator = ResponseValidator()
         self._verification = VerificationGates(
@@ -264,14 +270,20 @@ class Orchestrator:
 
             required_tools = list(getattr(process.tools, "required", []) or [])
             if required_tools:
-                available = set(self._tools.list_tools())
+                available = set(self._tools.list_tools(
+                    runnable_only=True,
+                    execution_surface=self._execution_surface,
+                ))
                 missing = sorted(
                     tool_name
                     for tool_name in required_tools
                     if tool_name not in available
                 )
                 if missing:
-                    joined = ", ".join(missing)
+                    joined = ", ".join(
+                        self._format_required_tool_unavailability(tool_name)
+                        for tool_name in missing
+                    )
                     raise ValueError(
                         f"Process '{process.name}' requires missing tool(s): {joined}"
                     )
@@ -287,7 +299,26 @@ class Orchestrator:
             config=config,
             event_bus=event_bus,
             question_manager=self._question,
+            task_snapshot_writer=self._save_task_state,
         )
+
+    def _format_required_tool_unavailability(self, tool_name: str) -> str:
+        status = self._tools.availability(
+            tool_name,
+            execution_surface=self._execution_surface,
+        )
+        if status is None:
+            return f"{tool_name} (not registered for this runtime)"
+        reasons = getattr(status, "reasons", ()) or ()
+        if reasons:
+            first = reasons[0]
+            message = str(getattr(first, "message", "") or "").strip()
+            code = str(getattr(first, "code", "") or "").strip().lower()
+            detail = message or code or str(status.state or "").strip().lower()
+            if detail:
+                return f"{tool_name} ({detail})"
+        state = str(getattr(status, "state", "") or "").strip().lower()
+        return f"{tool_name} ({state or 'unavailable'})"
 
     async def execute_task(
         self,
@@ -299,7 +330,7 @@ class Orchestrator:
         try:
             self._telemetry_rollup = self._new_telemetry_rollup()
             self._run_budget = _RunBudget(self._config)
-            run_id = self._initialize_task_run_id(task)
+            run_id = await self._initialize_task_run_id_async(task)
             self._emit(TASK_RUN_ACQUIRED, task.id, {
                 "run_id": run_id,
             })
@@ -317,7 +348,7 @@ class Orchestrator:
                 )
                 task.plan = plan
                 reused_plan_replanned = False
-                if self._should_replan_resumed_existing_plan(task):
+                if await self._should_replan_resumed_existing_plan(task):
                     self._run_budget.observe_replan()
                     reused_plan_replanned = await self._replan_task(
                         task,
@@ -329,7 +360,7 @@ class Orchestrator:
                     if reused_plan_replanned and task.plan and task.plan.subtasks:
                         plan = task.plan
                 task.status = TaskStatus.EXECUTING
-                self._state.save(task)
+                await self._save_task_state(task)
                 if not reused_plan_replanned:
                     self._emit(TASK_PLAN_READY, task.id, {
                         "subtask_count": len(plan.subtasks),
@@ -340,6 +371,7 @@ class Orchestrator:
             else:
                 # 1. Planning phase
                 task.status = TaskStatus.PLANNING
+                await self._save_task_state(task)
                 self._emit(TASK_PLANNING, task.id, {
                     "goal": task.goal,
                     "run_id": run_id,
@@ -348,7 +380,7 @@ class Orchestrator:
                 plan = await self._plan_task_with_validation(task)
                 task.plan = plan
                 task.status = TaskStatus.EXECUTING
-                self._state.save(task)
+                await self._save_task_state(task)
                 self._emit(TASK_PLAN_READY, task.id, {
                     "subtask_count": len(plan.subtasks),
                     "subtask_ids": [s.id for s in plan.subtasks],
@@ -594,7 +626,7 @@ class Orchestrator:
             )
             if bool(getattr(self._config.execution, "enable_sqlite_remediation_queue", False)):
                 await self._sync_remediation_queue_to_db(task)
-            result_task = self._finalize_task(task)
+            result_task = await self._finalize_task_async(task)
             self._export_evidence_ledger_csv(result_task)
 
             # 4. Learn from execution (best-effort)
@@ -607,7 +639,7 @@ class Orchestrator:
             task.status = TaskStatus.FAILED
             task.add_error("orchestrator", f"{type(e).__name__}: {e}")
             try:
-                self._state.save(task)
+                await self._save_task_state(task)
             except Exception as save_err:
                 logger.error("Failed to save after fatal: %s", save_err)
             self._emit(TASK_FAILED, task.id, {
@@ -1109,7 +1141,7 @@ class Orchestrator:
                     + (verification.feedback or subtask.summary or "unknown failure")
                 ),
             )
-            self._state.save(task)
+            await self._save_task_state(task)
 
     def _phase_mode(self) -> str:
         return orchestrator_planning.phase_mode(self)
@@ -1135,7 +1167,7 @@ class Orchestrator:
         if mode == "require_approval":
             async with self._state_lock:
                 task.status = TaskStatus.WAITING_APPROVAL
-                self._state.save(task)
+                await self._save_task_state(task)
             approved = await self._approval.request_approval(
                 ApprovalRequest(
                     task_id=task.id,
@@ -1152,7 +1184,7 @@ class Orchestrator:
             )
             async with self._state_lock:
                 task.status = TaskStatus.PLANNING
-                self._state.save(task)
+                await self._save_task_state(task)
             if not approved:
                 raise ValueError(
                     f"Planner degraded fallback not approved ({reason_code})",
@@ -2125,7 +2157,7 @@ class Orchestrator:
             f"{verification.tier}{suffix_text} with no feedback."
         )
 
-    def _should_replan_resumed_existing_plan(self, task: Task) -> bool:
+    async def _should_replan_resumed_existing_plan(self, task: Task) -> bool:
         """Replan once when resuming a failed task with pending work."""
         decisions = [str(item or "").strip() for item in task.decisions_log]
         if "Resumed execution from prior task state." not in decisions:
@@ -2147,7 +2179,7 @@ class Orchestrator:
         metadata["resume_preflight_replan_count"] = prior_count + 1
         task.metadata = metadata
         try:
-            self._state.save(task)
+            await self._save_task_state(task)
         except Exception:
             logger.debug(
                 "Failed persisting resume preflight replan marker for %s",
@@ -2183,7 +2215,7 @@ class Orchestrator:
                 lines.append(f"- {item}")
         return "\n".join(lines)
 
-    def _should_auto_replan_critical_path_scope_failure(
+    async def _should_auto_replan_critical_path_scope_failure(
         self,
         *,
         task: Task,
@@ -2219,7 +2251,7 @@ class Orchestrator:
         metadata["critical_path_scope_replans"] = tracker
         task.metadata = metadata
         try:
-            self._state.save(task)
+            await self._save_task_state(task)
         except Exception:
             logger.debug(
                 "Failed persisting critical-path adaptive replan marker for %s/%s",
@@ -2244,7 +2276,7 @@ class Orchestrator:
             "reason": "verifier_parse_error",
         })
         prior_calls: list[ToolCallRecord] = []
-        prior_evidence = self._evidence_for_subtask(task.id, subtask.id)
+        prior_evidence = await self._evidence_for_subtask_async(task.id, subtask.id)
         for attempt in attempts:
             raw_calls = getattr(attempt, "successful_tool_calls", [])
             if isinstance(raw_calls, list):
@@ -2313,6 +2345,10 @@ class Orchestrator:
     @staticmethod
     def _read_roots_for_task(task: Task) -> list[Path]:
         return orchestrator_planning._read_roots_for_task(task)
+
+    @staticmethod
+    def _read_path_map_for_task(task: Task) -> dict[str, Path]:
+        return orchestrator_planning._read_path_map_for_task(task)
 
     # Document extensions grouped by category for workspace scanning.
     _DOC_EXTENSIONS: dict[str, tuple[str, ...]] = {
@@ -2418,8 +2454,97 @@ class Orchestrator:
             "current_plan_version": int(task.plan.version),
         })
 
+    async def _save_task_state(self, task: Task) -> None:
+        await run_blocking_io(self._state.save, task)
+        if self._snapshot_mirror_writer is None:
+            return
+        try:
+            await self._snapshot_mirror_writer(task)
+        except Exception:
+            logger.debug(
+                "Failed syncing mirrored task snapshot for %s",
+                task.id,
+                exc_info=True,
+            )
+
+    async def _sync_task_snapshot_projection(self, task: Task) -> None:
+        if self._snapshot_mirror_writer is None:
+            return
+        try:
+            await self._snapshot_mirror_writer(task)
+        except Exception:
+            logger.debug(
+                "Failed syncing mirrored task snapshot for %s",
+                task.id,
+                exc_info=True,
+            )
+
+    def _save_task_state_sync(self, task: Task) -> None:
+        self._state.save(task)
+        if self._snapshot_mirror_writer is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            try:
+                asyncio.run(self._sync_task_snapshot_projection(task))
+            except Exception:
+                logger.debug(
+                    "Failed syncing mirrored task snapshot for %s",
+                    task.id,
+                    exc_info=True,
+                )
+            return
+        loop.create_task(self._sync_task_snapshot_projection(task))
+
+    def set_snapshot_mirror_writer(
+        self,
+        writer: Callable[[Task], Awaitable[None]] | None,
+    ) -> None:
+        self._snapshot_mirror_writer = writer
+
+    async def _load_task_state(self, task_id: str) -> Task | None:
+        try:
+            task = await run_blocking_io(self._state.load, task_id)
+        except Exception:
+            return None
+        return task if isinstance(task, Task) else None
+
+    async def _task_state_exists(self, task_id: str) -> bool:
+        return bool(await run_blocking_io(self._state.exists, task_id))
+
+    async def _load_evidence_records(self, task_id: str) -> list[dict]:
+        try:
+            records = await run_blocking_io(self._state.load_evidence_records, task_id)
+        except Exception:
+            return []
+        return [record for record in records if isinstance(record, dict)]
+
+    async def _append_evidence_records(
+        self,
+        task_id: str,
+        records: list[dict],
+    ) -> list[dict]:
+        merged = await run_blocking_io(
+            self._state.append_evidence_records,
+            task_id,
+            records,
+        )
+        return [record for record in merged if isinstance(record, dict)]
+
     def _evidence_for_subtask(self, task_id: str, subtask_id: str) -> list[dict]:
-        return orchestrator_evidence._evidence_for_subtask(self, task_id, subtask_id)
+        return orchestrator_evidence._evidence_for_subtask(
+            self,
+            task_id,
+            subtask_id,
+        )
+
+    async def _evidence_for_subtask_async(self, task_id: str, subtask_id: str) -> list[dict]:
+        return await orchestrator_evidence._evidence_for_subtask_async(
+            self,
+            task_id,
+            subtask_id,
+        )
 
     def _persist_subtask_evidence(
         self,
@@ -2431,6 +2556,24 @@ class Orchestrator:
         workspace: str | Path | None = None,
     ) -> None:
         return orchestrator_evidence._persist_subtask_evidence(
+            self,
+            task_id,
+            subtask_id,
+            evidence_records,
+            tool_calls=tool_calls,
+            workspace=workspace,
+        )
+
+    async def _persist_subtask_evidence_async(
+        self,
+        task_id: str,
+        subtask_id: str,
+        evidence_records: list[dict] | None,
+        *,
+        tool_calls: list[ToolCallRecord] | None = None,
+        workspace: str | Path | None = None,
+    ) -> None:
+        return await orchestrator_evidence._persist_subtask_evidence_async(
             self,
             task_id,
             subtask_id,
@@ -2559,6 +2702,9 @@ class Orchestrator:
     def _finalize_task(self, task: Task) -> Task:
         return orchestrator_output._finalize_task(self, task)
 
+    async def _finalize_task_async(self, task: Task) -> Task:
+        return await orchestrator_output._finalize_task_async(self, task)
+
     async def _learn_from_task(self, task: Task) -> None:
         return await orchestrator_telemetry._learn_from_task(self, task)
 
@@ -2571,6 +2717,9 @@ class Orchestrator:
 
     def _initialize_task_run_id(self, task: Task) -> str:
         return orchestrator_runtime.initialize_task_run_id(self, task)
+
+    async def _initialize_task_run_id_async(self, task: Task) -> str:
+        return await orchestrator_runtime.initialize_task_run_id_async(self, task)
 
     def _apply_budget_metadata(
         self,
@@ -2610,7 +2759,6 @@ class Orchestrator:
             task.metadata = {}
         task.metadata["cancel_reason"] = "cancel_requested"
         task.status = TaskStatus.CANCELLED
-        self._state.save(task)
         self._emit(TASK_CANCEL_REQUESTED, task.id, {
             "requested": True,
             "path": "orchestrator",
@@ -2629,7 +2777,6 @@ class Orchestrator:
             task.metadata = {}
         task.metadata["paused_from_status"] = task.status.value
         task.status = TaskStatus.PAUSED
-        self._state.save(task)
         self._emit(TASK_PAUSED, task.id, {
             "requested": True,
             "status": task.status.value,
@@ -2652,7 +2799,6 @@ class Orchestrator:
             task.status = TaskStatus.PLANNING
         else:
             task.status = TaskStatus.EXECUTING
-        self._state.save(task)
         self._emit(TASK_RESUMED, task.id, {
             "requested": True,
             "status": task.status.value,

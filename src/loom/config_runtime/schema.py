@@ -18,6 +18,7 @@ ApplicationClass = Literal[
     "restart_required",
 ]
 ConfigValueKind = Literal["int", "bool", "enum", "string"]
+ExposureLevel = Literal["basic", "advanced"]
 
 
 @dataclass(frozen=True)
@@ -50,6 +51,7 @@ class ConfigRuntimeEntry:
     maximum: int | None = None
     parser: Callable[[object], ParsedConfigValue] | None = None
     search_terms: tuple[str, ...] = field(default_factory=tuple)
+    exposure_level: ExposureLevel = "advanced"
 
     def parse(self, raw_value: object) -> ParsedConfigValue:
         if self.parser is not None:

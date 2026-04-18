@@ -225,6 +225,18 @@ tools:
 
 The required and excluded lists must not overlap.
 
+Task-shaping note:
+- Choose required tools based on the package's actual work. Research packages
+  often need source-gathering and writing tools; development packages often
+  need file mutation, command execution, and structured verification tools;
+  operational packages may need workflow- or API-specific tools.
+- If the package builds, edits, tests, or verifies software, include
+  `verification_helper` in `tools.required` so Loom can route common
+  build/test/report/runtime verification steps through the structured helper
+  layer instead of relying only on ad hoc shell snippets.
+- Keep `shell_execute` available only when the package genuinely needs
+  arbitrary command execution beyond the built-in helper routes.
+
 ### Auth requirements
 
 If your process needs authenticated APIs/MCPs, declare them explicitly so Loom
@@ -369,6 +381,22 @@ exact path (not `tesla_financial_summary.csv` or other variants).
 - Dependencies form a DAG (directed acyclic graph). Cycles are rejected at load time.
 - Independent phases (no shared dependencies) can run in parallel.
 - Deliverable names must be unique across all phases.
+
+Mixed-workflow note:
+- A single process package can contain both research-oriented and
+  development-oriented phases/subtasks. For example, one package can gather
+  evidence, design an approach, implement code, and then run validation.
+- Today, phases are the main way to express that mixed workflow. The package
+  can model different kinds of work in one DAG, but `verification.policy`
+  still applies at the process level rather than being fully customizable per
+  phase.
+- In practice, choose the overall verification policy based on the package's
+  dominant or riskiest failure mode, then use phases, acceptance criteria,
+  planner examples, and semantic checks to make the mixed workflow explicit.
+- If research and development portions need fundamentally different
+  verification behavior, consider splitting them into separate packages or
+  treating one package as the primary workflow and the other as a follow-on
+  process.
 
 **Model tier guidance:**
 - **Tier 1** — Simple extraction, formatting, data manipulation
@@ -586,6 +614,216 @@ verification:
 
 Every process should include the `no-placeholders` regex rule. It catches the most common failure mode (model leaving `[TBD]` stubs).
 
+### Choosing a verification shape by task type
+
+Package verification should match the package's dominant task shape rather than
+assuming every process is primarily research- or development-oriented.
+
+Common patterns:
+
+- Research and analysis packages:
+  Use `mode: llm_first` when the core task is evaluating sources, writing
+  narrative analysis, or judging domain quality. Pair it with deterministic
+  placeholder/structure rules and strong `validity_contract` settings.
+- Development and build packages:
+  Use `mode: static_first` with deterministic checks first, semantic checks
+  second, and capability-aware runtime verification when the package edits or
+  validates software artifacts.
+- Mixed packages:
+  Keep the overall process shaped around the final deliverable. For example, a
+  market-research package that generates a small dashboard can still be
+  research-first, while a code-generation package that includes some discovery
+  phases should still use the stronger development-oriented verification policy.
+- Important current limitation:
+  mixed packages are supported, but Loom does not yet support a completely
+  separate `verification.policy` per phase. Think of verification shape as a
+  process-level default that all subtasks inherit, with subtask/phase wording
+  and capability contracts helping the runtime infer the right behavior inside
+  that shared policy.
+- Other operational packages:
+  Choose the simplest policy that reliably catches the failure modes that
+  matter in that domain. For workflow automation or data maintenance packages,
+  deterministic file, schema, or API-contract checks are usually better than
+  generic prose-quality rules.
+
+Use these questions to decide:
+
+- Is the package's main risk unsupported claims, stale evidence, or poor
+  synthesis? Start with research-oriented verification.
+- Is the package's main risk broken artifacts, failed commands, or runtime
+  regressions? Start with development-oriented verification.
+- Does the package have both? Bias toward the riskier failure mode, then use
+  phases, acceptance criteria, and semantic checks to keep the other mode
+  represented.
+
+### Choosing `tool_success_policy`
+
+`verification.policy.static_checks.tool_success_policy` controls how Loom
+interprets tool failures during verification and recovery. Choose it based on
+whether a failed tool call should be treated as a blocked objective, an
+alternate route to success, or a true product failure.
+
+Recommended policy selection:
+
+- `method_resilient`:
+  Best default for research, analysis, consulting, strategy, data-processing,
+  and other operational packages where most tool failures should trigger retry
+  or replanning rather than hard failure. This policy treats ordinary method
+  failures such as transient website outages, parser/runtime failures, missing
+  optional upstreams, or retryable write issues as recoverable route failures.
+- `development_balanced`:
+  Best for software and build/test packages where product-facing failures like
+  broken builds, failed tests, or invalid runtime behavior must remain
+  blocking, while verifier harness issues and missing optional capabilities can
+  still be downgraded appropriately.
+- `safety_integrity_only`:
+  Use only when you intentionally want ordinary tool failures to be advisory
+  unless they implicate safety, policy, or integrity. This is more permissive
+  than `method_resilient` and does not actively push the runtime to treat
+  ordinary tool failures as replan-worthy method failures.
+- `all_tools_hard`:
+  Use only for packages that truly require every tool failure to block the run.
+  This is rarely the right choice for networked, research-heavy, or operational
+  packages.
+
+Example research/analysis baseline:
+
+```yaml
+verification:
+  policy:
+    mode: llm_first
+    static_checks:
+      tool_success_policy: method_resilient
+```
+
+With `method_resilient`, ordinary failures such as "website unavailable",
+"document write failed for a retryable non-policy reason", or "this parser/tool
+path broke" are treated as method failures that should give Loom opportunities
+to retry or replan through alternate routes. Hard failures should be reserved
+for major faults such as safety violations, policy denials, integrity breaches,
+or true exhaustion of viable methods.
+
+Migration guidance for existing packages:
+
+- If a package currently uses `safety_integrity_only` but you want Loom to
+  retry or replan around ordinary tool failures, change it to
+  `method_resilient`.
+- Keep `development_balanced` for software implementation, test, build, and
+  runtime-verification packages.
+- Keep `safety_integrity_only` only if advisory treatment for ordinary tool
+  failures is intentional.
+- Review external packages that operate over the network or third-party tools.
+  Those are the most likely to benefit from `method_resilient`.
+
+### Development-focused verification policies
+
+Packages that produce or verify software should not rely on a purely
+research-style verification shape. Prefer a build-oriented policy that:
+
+- Uses `mode: static_first`
+- Uses `static_checks.tool_success_policy: development_balanced`
+- Treats verifier infrastructure failures as warnings instead of product
+  failures when appropriate
+- Prefers behavior checks over style checks
+- Declares semantic capability contracts for browser/service/runtime checks
+- Uses registered helpers (`run_test_suite`, `run_build_check`,
+  `serve_static`, `http_assert`, `browser_assert`, `browser_session`,
+  `render_verification_report`) instead of one-off verifier shell flows when
+  possible
+
+Recommended baseline:
+
+```yaml
+tools:
+  required:
+    - write_file
+    - shell_execute
+    - verification_helper
+
+verification:
+  policy:
+    mode: static_first
+    static_checks:
+      tool_success_policy: development_balanced
+    semantic_checks:
+      - name: test-suite
+        capability: command_execution
+        helper: run_test_suite
+      - name: build-check
+        capability: command_execution
+        helper: run_build_check
+      - name: local-service-smoke
+        capability: service_runtime
+        helper: serve_static
+      - name: browser-smoke
+        capability: browser_runtime
+        helper: browser_session
+        optional: true
+    output_contract:
+      required_fields: [passed, outcome, reason_code, severity_class, confidence, feedback, issues, metadata]
+    outcome_policy:
+      treat_verifier_infra_as_warning: true
+      prefer_behavior_over_style: true
+      optional_capabilities: [browser_runtime]
+```
+
+Field guidance for development packages:
+
+- `development_balanced` keeps real product failures like broken tests or build
+  failures blocking, while downgrading verifier harness issues such as probe
+  timeouts or missing optional browser capability.
+- `semantic_checks[].capability` declares what kind of verification is being
+  requested. Common values are `command_execution`, `service_runtime`,
+  `browser_runtime`, and `report_rendering`.
+- `semantic_checks[].helper` should name a registered verification helper. Loom
+  validates helper names and capability compatibility at load time.
+- `semantic_checks[].optional: true` is the right shape for checks that improve
+  confidence but should not fail the package when the environment lacks that
+  capability.
+- `outcome_policy.optional_capabilities` is the process-level escape hatch for
+  capabilities such as `browser_runtime` that may be unavailable in some
+  environments.
+- `prefer_behavior_over_style: true` tells Loom to bias toward behavioral
+  checks like "page loads and table renders" instead of brittle source-style
+  rules like "must reference `window.*` explicitly."
+
+Browser verification guidance:
+
+- Use `browser_session` for richer localhost browser checks when the package
+  needs navigation, clicks, form filling, assertions, network capture, or
+  screenshots.
+- Loom prefers a Playwright-backed browser session when the optional browser
+  addon is installed and falls back to a static HTTP/DOM engine otherwise.
+- Treat browser checks as optional unless the package truly requires full
+  browser verification to satisfy its contract.
+- Users can inspect addon availability with `loom doctor` and enforce it with
+  `loom doctor --require-addon browser`.
+- Install the addon with `uv sync --extra browser`; install Playwright browser
+  binaries with `uv run playwright install`.
+
+Subtask design guidance for development packages:
+
+- Keep subtasks aligned to software lifecycle boundaries such as `implement`,
+  `build`, `test`, `runtime-verify`, and `report`.
+- Put deterministic checks as early as possible so failures localize quickly.
+- Reserve browser/runtime subtasks for concrete behavioral validation, not
+  style policing.
+- If a package includes both research and build subtasks, keep the
+  build-oriented phases on the stricter development verification policy instead
+  of inheriting a single research-shaped verifier for the entire package.
+
+General subtask design guidance for all package types:
+
+- Keep subtasks aligned to meaningful task boundaries in the domain rather than
+  arbitrary output chunks.
+- Put deterministic checks as early as possible when they can cheaply localize
+  failures.
+- Use semantic checks for quality dimensions that cannot be expressed as simple
+  file/regex/exit-code checks.
+- If the package mixes task types, reflect that in the subtasks and examples:
+  separate research, transformation, implementation, validation, and synthesis
+  work instead of flattening them into one generic execution phase.
+
 ### Memory types
 
 ```yaml
@@ -779,11 +1017,18 @@ class MyDomainTool(Tool):
 8. **Workspace-writing tools must declare `is_mutating = True`** so mutation policy is enforced preflight
 9. **Workspace-writing tools must return accurate `files_changed`** (workspace-relative paths) on success
 10. **If write targets use non-standard arg keys, expose `mutation_target_arg_keys`** so path policy can find them (for example `output_path`, `output_json_path`)
+11. **Read inputs must support attached read scope**. In scoped runs, a user-selected file or folder may be available through Loom's read-only alias mapping even when it does not physically exist under `ctx.workspace`.
 
 Mutation policy note:
 - Sealed artifact protection is enforced before mutating tool execution.
 - Successful mutations on tracked sealed files trigger reseal/provenance updates.
 - If a writing tool omits mutating metadata or `files_changed`, runtime safety and synthesis seal checks can drift.
+
+Attached read scope note:
+- `ctx.workspace` is the writable run workspace, not necessarily the full source workspace.
+- User-attached files/folders can be exposed through `ctx.read_roots` and `ctx.read_path_map`.
+- Built-in Loom tools already resolve those aliases. Bundled package tools must do the same for read operations.
+- Do not assume every valid read path is a real on-disk child of `ctx.workspace`.
 
 ### Upgrading existing bundled tools
 
@@ -798,8 +1043,12 @@ current mutation contract before release:
    `output_json_path`).
 4. Keep write targets inside `ctx.workspace` and use `_resolve_path(...)`
    for normalization/safety.
-5. Add/refresh package tests so each writer confirms `is_mutating` and
-   `files_changed` behavior for success paths.
+5. For read inputs, use `_resolve_read_path(raw, ctx.workspace, ctx.read_roots, ctx.read_path_map)`
+   or an equivalent helper. Do not resolve reads with plain `Path(ctx.workspace) / raw`
+   unless the input is guaranteed to be a write target inside the run workspace.
+6. Add/refresh package tests so each writer confirms `is_mutating` and
+   `files_changed` behavior for success paths, and each read-oriented tool
+   confirms attached aliases work through `ctx.read_path_map`.
 
 Minimal before/after migration example:
 
@@ -909,12 +1158,25 @@ The `ctx` object provides:
 | Field | Type | Description |
 |-------|------|-------------|
 | `workspace` | `Path \| None` | The user's workspace directory |
+| `read_roots` | `list[Path]` | Extra read-only directory roots exposed to this run |
+| `read_path_map` | `dict[str, Path]` | Exact workspace-relative attached aliases mapped to real readable paths |
 | `scratch_dir` | `Path \| None` | Temp directory for intermediate files |
 | `subtask_id` | `str` | Current subtask identifier |
 | `auth_context` | `RunAuthContext \| None` | Run-scoped selected auth profiles and secret resolver |
 | `execution_surface` | `"tui" \| "api" \| "cli"` | Current run surface for this tool invocation |
 
 Use `workspace` to resolve file paths. Use `_resolve_path(raw, workspace)` for safe path resolution that prevents directory traversal.
+
+Use `_resolve_read_path(raw, ctx.workspace, ctx.read_roots, ctx.read_path_map)` for read inputs that may come from attached files or folders selected by the user. This matters most for scoped runs, where the writable run folder is separate from the source workspace.
+
+Rule of thumb:
+- Use `_resolve_path(...)` for writes and for paths that must stay inside the run workspace.
+- Use `_resolve_read_path(...)` for read-only inputs such as source folders, attached reports, uploaded CSVs, or package inputs selected in the launcher.
+- If your tool emits user-facing relative paths or manifests, preserve the logical alias/path the user selected when possible rather than leaking absolute external filesystem paths.
+
+Common pitfall:
+- `candidate = (Path(ctx.workspace) / raw_path).resolve(); candidate.relative_to(ctx.workspace.resolve())`
+- That pattern breaks for attached aliases because the alias may be valid through `ctx.read_path_map` without existing as a physical child of `ctx.workspace`.
 
 ### ToolResult
 
@@ -1065,12 +1327,19 @@ Use this build sequence when authoring new process definitions:
    - Set synthesis phase `verification_tier` >= 2.
    - Keep `final_gate.synthesis_min_verification_tier` >= 2.
    - Keep `max_contradicted_count: 0` for production-grade processes.
-7. Add deterministic + semantic verification:
+7. Add deterministic + semantic verification appropriate to the task:
    - Regex rules for structure/placeholders.
-   - LLM rules for domain quality and claim-source alignment.
+   - LLM rules for domain quality and claim-source alignment when judgment is
+     the main quality bar.
+   - Capability- and artifact-based checks when the package produces software,
+     automations, or other executable/runtime-facing outputs.
 8. Validate migration and behavior in CI:
    - Add `tests:` cases in the package.
    - Include at least one failure-path test for unsupported or contradicted claims.
+   - Add failure-path tests that match the package's dominant risks. For
+     example: unsupported claims for research packages, failing build/test cases
+     for software packages, or schema/contract mismatches for automation/data
+     packages.
 
 Suggested policy baselines:
 
@@ -1242,6 +1511,7 @@ Before publishing a package:
 - [ ] `replanning` section describes when to adapt
 - [ ] Bundled tools (if any) handle errors gracefully and return `ToolResult.fail`
 - [ ] Bundled workspace-writing tools set `is_mutating = True` and return accurate `files_changed`
+- [ ] Bundled read-oriented tools support attached aliases through `ctx.read_roots` / `ctx.read_path_map`
 - [ ] Bundled tool names are unique (no collisions with built-ins or other packages)
 - [ ] Dependencies are version-pinned
 - [ ] `loom install /path/to/package` succeeds
@@ -1256,6 +1526,12 @@ Install or enable the required tools, or remove them from `tools.required`.
 
 - `Bundled tool '<name>' ... conflicts with existing tool class ...; skipping bundled tool`:
 Rename the bundled tool to a globally unique name and reinstall the package.
+
+- `root_path is not a directory: <attached-alias>` or a similar failure for a selected context folder:
+Your bundled tool is probably treating a read input as a physical child of
+`ctx.workspace`. Update read-side path resolution to use
+`_resolve_read_path(..., ctx.read_roots, ctx.read_path_map)` instead of plain
+`Path(ctx.workspace) / raw_path`.
 
 - `Failed to create isolated dependency environment`:
 Ensure the selected Python executable can create virtual environments (`python -m venv`).

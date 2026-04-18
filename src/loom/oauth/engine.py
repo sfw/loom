@@ -196,6 +196,9 @@ class OAuthEngine:
             raise OAuthEngineError(e.reason_code, self._redact(str(e))) from e
         return self._normalize_callback(clean_state, payload)
 
+    def callback_received(self, *, state: str) -> bool:
+        return self._state_store.callback_received(state=str(state or "").strip())
+
     def submit_callback_payload(
         self,
         *,

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 from pathlib import Path
 
 import pytest
@@ -205,6 +207,72 @@ class TestConversationStore:
         await store.append_turn(sid, 2, "assistant", "Hi")
         assert await store.get_turn_count(sid) == 2
 
+    async def test_append_chat_event_waits_for_inflight_write_commit(
+        self,
+        store: ConversationStore,
+        db: Database,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        sid = await store.create_session(workspace="/tmp", model_name="m")
+        write_db = await db._get_write_db()
+        original_commit = write_db.commit
+        first_commit_started = asyncio.Event()
+        allow_first_commit = asyncio.Event()
+        commit_calls = 0
+
+        async def gated_commit():
+            nonlocal commit_calls
+            commit_calls += 1
+            if commit_calls == 1:
+                first_commit_started.set()
+                await asyncio.wait_for(allow_first_commit.wait(), timeout=1.0)
+            return await original_commit()
+
+        monkeypatch.setattr(write_db, "commit", gated_commit)
+
+        append_turn_task = asyncio.create_task(
+            store.append_turn(sid, 1, "user", "Hello"),
+        )
+        await asyncio.wait_for(first_commit_started.wait(), timeout=1.0)
+
+        append_event_task = asyncio.create_task(
+            store.append_chat_event(sid, "assistant_text", {"text": "Hi there"}),
+        )
+        await asyncio.sleep(0)
+        allow_first_commit.set()
+
+        await asyncio.wait_for(append_turn_task, timeout=1.0)
+        seq = await asyncio.wait_for(append_event_task, timeout=1.0)
+
+        turns = await store.get_turns(sid)
+        events = await store.get_chat_events(sid)
+        assert len(turns) == 1
+        assert turns[0]["role"] == "user"
+        assert seq == 1
+        assert len(events) == 1
+        assert events[0]["event_type"] == "assistant_text"
+        assert events[0]["payload"]["text"] == "Hi there"
+
+    async def test_link_run_round_trip(self, store: ConversationStore, db: Database):
+        sid = await store.create_session(workspace="/tmp", model_name="m")
+        await db.insert_task(
+            task_id="task-1",
+            goal="Run task",
+            workspace_path="/tmp",
+            status="pending",
+        )
+
+        await store.link_run(sid, "task-1")
+        await store.link_run(sid, "task-1")
+
+        linked_runs = await store.list_linked_runs(sid)
+        assert len(linked_runs) == 1
+        assert linked_runs[0]["run_id"] == "task-1"
+
+        linked_conversations = await store.list_linked_conversations("task-1")
+        assert len(linked_conversations) == 1
+        assert linked_conversations[0]["session_id"] == sid
+
     async def test_update_session(self, store: ConversationStore):
         sid = await store.create_session(workspace="/tmp", model_name="m")
 
@@ -231,6 +299,34 @@ class TestConversationStore:
         assert messages[0]["role"] == "user"
         assert messages[0]["content"] == "Hello"
         assert messages[-1]["content"] == "Help me code"
+
+    async def test_resume_session_restores_attachment_metadata(self, store: ConversationStore):
+        sid = await store.create_session(workspace="/tmp", model_name="m")
+        await store.append_turn(
+            sid,
+            1,
+            "user",
+            "See these files",
+            metadata={
+                "workspace_paths": ["src/app.tsx", "assets"],
+                "workspace_files": ["src/app.tsx"],
+                "workspace_directories": ["assets"],
+                "content_blocks": [
+                    {
+                        "type": "image",
+                        "source_path": "/tmp/pasted.png",
+                        "media_type": "image/png",
+                        "text_fallback": "Pasted image",
+                    },
+                ],
+            },
+        )
+
+        messages = await store.resume_session(sid)
+        assert messages[0]["workspace_paths"] == ["src/app.tsx", "assets"]
+        assert messages[0]["workspace_files"] == ["src/app.tsx"]
+        assert messages[0]["workspace_directories"] == ["assets"]
+        assert messages[0]["content_blocks"][0]["type"] == "image"
 
     async def test_tool_calls_persisted(self, store: ConversationStore):
         sid = await store.create_session(workspace="/tmp", model_name="m")
@@ -292,6 +388,165 @@ class TestConversationStore:
         assert events[1]["event_type"] == "assistant_text"
         assert events[1]["seq"] == 2
 
+    async def test_append_chat_event_can_advance_journal_coverage(self, store: ConversationStore):
+        sid = await store.create_session(workspace="/tmp", model_name="m")
+
+        seq = await store.append_chat_event(
+            sid,
+            "turn_separator",
+            {"tokens": 12},
+            journal_through_turn=3,
+        )
+
+        session = await store.get_session(sid)
+        assert seq == 1
+        assert int(session["chat_journal_through_turn"]) == 3
+        assert int(session["chat_journal_through_seq"]) == 1
+        event = (await store.get_chat_events(sid, limit=1))[0]
+        assert event["payload"]["journal_through_turn"] == 3
+
+    async def test_write_session_checkpoint_derives_metrics_and_preserves_metadata(
+        self,
+        store: ConversationStore,
+    ):
+        sid = await store.create_session(workspace="/tmp", model_name="m")
+        await store.patch_session_state_metadata(
+            sid,
+            title="Architecture chat",
+            ui_state={"active_tab": "process"},
+        )
+        await store.append_turn(sid, 1, "user", "hello architect")
+        await store.append_turn(sid, 2, "assistant", "hi there")
+        turns = await store.get_turns(sid)
+        expected_tokens = sum(int(row["token_count"] or 0) for row in turns)
+
+        await store.write_session_checkpoint(
+            sid,
+            session_state={
+                "session_id": sid,
+                "workspace": "/tmp",
+                "model_name": "m",
+                "turn_count": 999,
+                "total_tokens": 999,
+                "current_focus": "fresh focus",
+                "ui_state": {"active_tab": "chat"},
+            },
+            through_turn=2,
+        )
+
+        session = await store.get_session(sid)
+        assert int(session["turn_count"]) == 1
+        assert int(session["total_tokens"]) == expected_tokens
+        assert int(session["session_state_through_turn"]) == 2
+        state = json.loads(str(session["session_state"] or "{}"))
+        assert state["current_focus"] == "fresh focus"
+        assert state["title"] == "Architecture chat"
+        assert state["ui_state"] == {"active_tab": "process"}
+
+    async def test_patch_session_state_metadata_preserves_semantic_checkpoint(
+        self,
+        store: ConversationStore,
+    ):
+        sid = await store.create_session(workspace="/tmp", model_name="m")
+        await store.update_session(
+            sid,
+            total_tokens=11,
+            turn_count=2,
+            session_state={
+                "session_id": sid,
+                "workspace": "/tmp",
+                "model_name": "m",
+                "turn_count": 2,
+                "total_tokens": 11,
+                "current_focus": "semantic focus",
+            },
+            session_state_through_turn=3,
+        )
+
+        await store.patch_session_state_metadata(
+            sid,
+            title="Pinned title",
+            ui_state={"active_tab": "events"},
+        )
+
+        session = await store.get_session(sid)
+        assert int(session["session_state_through_turn"]) == 3
+        state = json.loads(str(session["session_state"] or "{}"))
+        assert state["current_focus"] == "semantic focus"
+        assert state["turn_count"] == 2
+        assert state["title"] == "Pinned title"
+        assert state["ui_state"] == {"active_tab": "events"}
+
+    async def test_backfill_chat_journal_coverage_recovers_explicit_boundary(
+        self,
+        store: ConversationStore,
+        db: Database,
+    ):
+        sid = await store.create_session(workspace="/tmp", model_name="m")
+        await store.append_turn(sid, 1, "user", "hello")
+        await store.append_turn(sid, 2, "assistant", "world")
+        await store.append_chat_event(
+            sid,
+            "turn_separator",
+            {"tokens": 12},
+            journal_through_turn=2,
+        )
+        await db.execute(
+            """
+            UPDATE cowork_sessions
+            SET chat_journal_through_turn = 0,
+                chat_journal_through_seq = 0
+            WHERE id = ?
+            """,
+            (sid,),
+        )
+
+        recovered_turn, recovered_seq = await store.backfill_chat_journal_coverage(sid)
+        session = await store.get_session(sid)
+        assert (recovered_turn, recovered_seq) == (2, 1)
+        assert int(session["chat_journal_through_turn"]) == 2
+        assert int(session["chat_journal_through_seq"]) == 1
+
+    async def test_append_chat_event_with_concurrent_readers(self, store: ConversationStore):
+        sid = await store.create_session(workspace="/tmp", model_name="m")
+        stop = asyncio.Event()
+
+        async def reader() -> None:
+            while not stop.is_set():
+                await store.get_session(sid)
+                await store.get_chat_events(sid, limit=64)
+                await store.get_last_chat_seq(sid)
+                await asyncio.sleep(0)
+
+        readers = [asyncio.create_task(reader()) for _ in range(8)]
+        await asyncio.sleep(0)
+        try:
+            await store.append_chat_event(
+                sid,
+                "user_message",
+                {"text": "hello"},
+            )
+            for index in range(1, 33):
+                seq = await store.append_chat_event(
+                    sid,
+                    "assistant_thinking",
+                    {"text": f"chunk {index}", "streaming": True},
+                )
+                assert seq == index + 1
+            final_seq = await store.append_chat_event(
+                sid,
+                "assistant_text",
+                {"text": "done"},
+            )
+        finally:
+            stop.set()
+            await asyncio.gather(*readers)
+
+        assert final_seq == 34
+        events = await store.get_chat_events(sid, limit=40)
+        assert [row["seq"] for row in events] == list(range(1, 35))
+        assert events[-1]["event_type"] == "assistant_text"
+
     async def test_get_chat_events_before_seq(self, store: ConversationStore):
         sid = await store.create_session(workspace="/tmp", model_name="m")
         for index in range(1, 6):
@@ -304,6 +559,25 @@ class TestConversationStore:
         page = await store.get_chat_events(sid, before_seq=5, limit=2)
         assert len(page) == 2
         assert [row["seq"] for row in page] == [3, 4]
+
+    async def test_get_chat_events_between_after_and_before_seq(
+        self, store: ConversationStore,
+    ):
+        sid = await store.create_session(workspace="/tmp", model_name="m")
+        for index in range(1, 9):
+            await store.append_chat_event(
+                sid,
+                "info",
+                {"text": f"line {index}"},
+            )
+
+        page = await store.get_chat_events(
+            sid,
+            after_seq=3,
+            before_seq=7,
+            limit=10,
+        )
+        assert [row["seq"] for row in page] == [4, 5, 6]
 
     async def test_get_chat_events_payload_parse_failure_non_fatal(self, store: ConversationStore):
         sid = await store.create_session(workspace="/tmp", model_name="m")
@@ -389,3 +663,63 @@ class TestConversationStore:
         assert payload["success"] is False
         assert payload["error"] == "Malformed tool result payload"
         assert "not-json" in payload["output"]
+
+    async def test_get_transcript_page_after_seq_uses_durable_journal_rows_only(
+        self, store: ConversationStore,
+    ):
+        sid = await store.create_session(workspace="/tmp", model_name="m")
+
+        await store.append_turn(sid, 1, "user", "covered user")
+        await store.append_turn(sid, 2, "assistant", "covered assistant")
+        await store.append_turn(sid, 3, "user", "fresh uncovered user")
+
+        first_seq = await store.append_chat_event(
+            sid,
+            "user_message",
+            {"text": "covered user"},
+            journal_through_turn=1,
+        )
+        second_seq = await store.append_chat_event(
+            sid,
+            "user_message",
+            {"text": "fresh uncovered user"},
+        )
+
+        rows = await store.get_transcript_page(sid, after_seq=first_seq, limit=10)
+
+        assert [(row["seq"], row["event_type"]) for row in rows] == [
+            (second_seq, "user_message"),
+        ]
+        assert all("turn_number" not in row for row in rows)
+
+    async def test_synthesized_user_attachment_events_include_content_indicator(
+        self,
+        store: ConversationStore,
+    ):
+        sid = await store.create_session(workspace="/tmp", model_name="m")
+        await store.append_turn(
+            sid,
+            1,
+            "user",
+            "Review this",
+            metadata={
+                "workspace_paths": ["src/main.ts"],
+                "workspace_files": ["src/main.ts"],
+                "content_blocks": [
+                    {
+                        "type": "image",
+                        "source_path": "/tmp/review.png",
+                        "media_type": "image/png",
+                        "text_fallback": "Screenshot",
+                    },
+                ],
+            },
+        )
+
+        events = await store.synthesize_chat_events_from_turns(sid, limit=10)
+        assert [event["event_type"] for event in events] == [
+            "user_message",
+            "content_indicator",
+        ]
+        assert events[0]["payload"]["workspace_paths"] == ["src/main.ts"]
+        assert events[1]["payload"]["content_blocks"][0]["type"] == "image"

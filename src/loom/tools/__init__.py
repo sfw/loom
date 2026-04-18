@@ -72,6 +72,7 @@ def _tool_catalog_category(name: str) -> str:
         "delete_file",
         "search_files",
         "list_directory",
+        "verification_helper",
         "shell_execute",
         "git_command",
         "analyze_code",
@@ -100,6 +101,7 @@ def _bind_hybrid_fallback_tools(registry: ToolRegistry) -> None:
             for schema in registry.all_schemas(
                 auth_context=auth_context,
                 execution_surface=execution_surface,
+                runnable_only=True,
             ):
                 name = str(schema.get("name", "")).strip()
                 if not name:
@@ -168,6 +170,7 @@ def _bind_hybrid_fallback_tools(registry: ToolRegistry) -> None:
                 arguments,
                 workspace=ctx.workspace,
                 read_roots=ctx.read_roots,
+                read_path_map=ctx.read_path_map,
                 scratch_dir=ctx.scratch_dir,
                 changelog=ctx.changelog,
                 subtask_id=ctx.subtask_id,
@@ -300,6 +303,13 @@ def _instantiate_tool(tool_cls: type[Tool], config: Config | None) -> Tool | Non
                     "on",
                 ) or "on",
             ),
+            binary_overrides=dict(
+                getattr(
+                    config.execution,
+                    "tool_binary_overrides",
+                    {},
+                ) or {},
+            ),
         )
 
     if class_name == "WpCliTool":
@@ -312,14 +322,31 @@ def _instantiate_tool(tool_cls: type[Tool], config: Config | None) -> Tool | Non
                     True,
                 ),
             ),
+            binary_overrides=dict(
+                getattr(
+                    config.execution,
+                    "tool_binary_overrides",
+                    {},
+                ) or {},
+            ),
         )
 
     if class_name in {"WpEnvTool", "WpScaffoldBlockTool", "WpQualityGateTool"}:
         return tool_cls(
             enabled=_software_dev_family_enabled(config, family="wordpress"),
+            binary_overrides=dict(
+                getattr(
+                    config.execution,
+                    "tool_binary_overrides",
+                    {},
+                ) or {},
+            ),
         )
 
     if class_name == "FactCheckerTool":
+        return tool_cls(config=config)
+
+    if class_name in {"WebFetchTool", "WebSearchTool"}:
         return tool_cls(config=config)
 
     return tool_cls()

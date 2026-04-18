@@ -10,8 +10,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from loom import __version__
 from loom.config import Config
 
+LOCAL_CORS_ORIGIN_REGEX = (
+    r"^(https?://(localhost|127\.0\.0\.1)(:\d+)?|"
+    r"https://tauri\.localhost|"
+    r"tauri://localhost)$"
+)
 
-def create_app(config: Config | None = None) -> FastAPI:
+
+def create_app(config: Config | None = None, *, runtime_role: str = "api") -> FastAPI:
     """Create and configure the FastAPI application.
 
     Two modes:
@@ -28,12 +34,21 @@ def create_app(config: Config | None = None) -> FastAPI:
 
         logger = logging.getLogger("loom.server")
         try:
-            engine = await create_engine(resolved_config)
+            engine = await create_engine(resolved_config, runtime_role=runtime_role)
         except Exception as e:
             logger.error("Failed to initialize engine: %s", e)
             raise
         app.state.engine = engine
         yield
+        integration_oauth_runtime = getattr(app.state, "integration_oauth_runtime", None)
+        if integration_oauth_runtime is not None:
+            shutdown = getattr(
+                getattr(integration_oauth_runtime, "engine", None),
+                "shutdown",
+                None,
+            )
+            if callable(shutdown):
+                shutdown()
         await engine.shutdown()
 
     app = FastAPI(
@@ -48,7 +63,7 @@ def create_app(config: Config | None = None) -> FastAPI:
     # CORS — local only for V1
     app.add_middleware(
         CORSMiddleware,
-        allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
+        allow_origin_regex=LOCAL_CORS_ORIGIN_REGEX,
         allow_methods=["*"],
         allow_headers=["*"],
     )

@@ -157,7 +157,7 @@ verification:
   policy:
     mode: llm_first
     static_checks:
-      tool_success_policy: safety_integrity_only
+      tool_success_policy: method_resilient
       file_integrity_policy: enforce_nonempty_changed_files
       syntax_policy: enforce_parseable_artifacts
       deliverable_existence_policy: enforce_declared_deliverables

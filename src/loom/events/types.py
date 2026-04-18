@@ -22,6 +22,7 @@ TASK_PLAN_DEGRADED = "task_plan_degraded"
 TASK_COMPLETED = "task_completed"
 TASK_FAILED = "task_failed"
 TASK_CANCELLED = "task_cancelled"
+TASK_RESTARTED = "task_restarted"
 
 # Control-plane lifecycle events
 TASK_PAUSED = "task_paused"
@@ -83,6 +84,8 @@ ARTIFACT_SEAL_VALIDATION = "artifact_seal_validation"
 # Human interaction events
 APPROVAL_REQUESTED = "approval_requested"
 APPROVAL_RECEIVED = "approval_received"
+APPROVAL_REJECTED = "approval_rejected"
+APPROVAL_TIMED_OUT = "approval_timed_out"
 ASK_USER_REQUESTED = "ask_user_requested"
 ASK_USER_ANSWERED = "ask_user_answered"
 ASK_USER_TIMEOUT = "ask_user_timeout"
@@ -175,6 +178,7 @@ EVENT_LIFECYCLE: dict[str, EventLifecycle] = {
     TASK_COMPLETED: "active",
     TASK_FAILED: "active",
     TASK_CANCELLED: "active",
+    TASK_RESTARTED: "active",
     TASK_PAUSED: "active",
     TASK_RESUMED: "active",
     TASK_INJECTED: "active",
@@ -229,6 +233,8 @@ EVENT_LIFECYCLE: dict[str, EventLifecycle] = {
     # Human events
     APPROVAL_REQUESTED: "active",
     APPROVAL_RECEIVED: "active",
+    APPROVAL_REJECTED: "active",
+    APPROVAL_TIMED_OUT: "active",
     ASK_USER_REQUESTED: "active",
     ASK_USER_ANSWERED: "active",
     ASK_USER_TIMEOUT: "active",

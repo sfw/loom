@@ -118,16 +118,38 @@ async def run_interaction(self, message: str) -> None:
     events_panel = self.query_one("#events-panel", EventPanel)
 
     streamed_text = False
+    thinking_chunks: list[str] = []
+
+    async def _flush_thinking_chunks() -> None:
+        if not thinking_chunks:
+            return
+        await self._append_chat_replay_event(
+            "assistant_thinking",
+            {
+                "text": "\n\n".join(thinking_chunks),
+                "streaming": False,
+            },
+        )
+        thinking_chunks.clear()
 
     await self._sync_pending_inject_apply_state()
     async for event in self._session.send_streaming(message):
         await self._sync_pending_inject_apply_state()
         if isinstance(event, str):
+            await _flush_thinking_chunks()
             if not streamed_text:
                 streamed_text = True
             chat.add_streaming_text(event)
+        elif isinstance(event, tuple) and len(event) == 2 and event[0] == "thinking":
+            thinking_text = str(event[1] or "")
+            if thinking_text:
+                # Keep thinking in replay history for transcript mode without
+                # surfacing a separate live panel during the active turn.
+                thinking_chunks.append(thinking_text)
+            continue
 
         elif isinstance(event, ToolCallEvent):
+            await _flush_thinking_chunks()
             if event.result is None:
                 # Tool starting
                 self._mark_cowork_tool_inflight(event.name)
@@ -251,6 +273,7 @@ async def run_interaction(self, message: str) -> None:
                         await self._run_followup(answer)
 
         elif isinstance(event, CoworkTurn):
+            await _flush_thinking_chunks()
             if event.text and not streamed_text:
                 chat.add_model_text(event.text)
             if event.text:
@@ -292,6 +315,7 @@ async def run_interaction(self, message: str) -> None:
                     "omitted_messages": int(event.omitted_messages),
                     "recall_index_used": bool(event.recall_index_used),
                 },
+                journal_through_turn=self._session.persisted_turn_count,
             )
             events_panel.add_event(
                 _now_str(), "turn",
@@ -301,4 +325,5 @@ async def run_interaction(self, message: str) -> None:
 
             # Update files panel
             self._update_files_panel(event)
+    await _flush_thinking_chunks()
     await self._sync_pending_inject_apply_state()

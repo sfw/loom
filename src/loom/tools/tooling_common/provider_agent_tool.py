@@ -5,11 +5,21 @@ from __future__ import annotations
 import json
 import logging
 import os
-import shutil
 import time
 from pathlib import Path
 
-from loom.tools.registry import Tool, ToolContext, ToolResult
+from loom.tools.registry import (
+    Tool,
+    ToolAvailabilityReason,
+    ToolAvailabilityStatus,
+    ToolContext,
+    ToolResult,
+)
+from loom.tools.tooling_common.binary_resolution import (
+    configured_binary_override,
+    normalize_binary_overrides,
+    resolve_binary,
+)
 from loom.tools.tooling_common.command_runner import constrained_env, run_command
 from loom.tools.tooling_common.version_matrix import (
     PROVIDER_SPECS,
@@ -179,6 +189,7 @@ class ProviderAgentTool(Tool):
         allowed_providers: list[str] | None = None,
         max_timeout_seconds: int = 1800,
         default_network_mode: str = "on",
+        binary_overrides: dict[str, str] | None = None,
         max_timeout_resolver=None,
     ) -> None:
         self._enabled = bool(enabled)
@@ -192,6 +203,7 @@ class ProviderAgentTool(Tool):
         self._max_timeout_resolver = max_timeout_resolver
         mode = str(default_network_mode or "on").strip().lower()
         self._default_network_mode = mode if mode in {"on", "off"} else "on"
+        self._binary_overrides = normalize_binary_overrides(binary_overrides or {})
 
     @property
     def is_mutating(self) -> bool:
@@ -211,6 +223,83 @@ class ProviderAgentTool(Tool):
     def set_max_timeout_seconds_resolver(self, resolver) -> None:
         """Install a runtime resolver for future agent-tool calls."""
         self._max_timeout_resolver = resolver
+
+    def _binary_override(self, spec: ProviderSpec) -> str:
+        return configured_binary_override(
+            self._binary_overrides,
+            self.name,
+            self._provider,
+            spec.binary,
+        )
+
+    def _resolve_provider_binary(self, spec: ProviderSpec):
+        return resolve_binary(spec.binary, override=self._binary_override(spec))
+
+    def availability(
+        self,
+        *,
+        execution_surface: object = "tui",
+    ) -> ToolAvailabilityStatus:
+        base = super().availability(execution_surface=execution_surface)
+        if not base.runnable:
+            return base
+        provider = self._provider
+        if not self._enabled:
+            return ToolAvailabilityStatus(
+                state="unavailable",
+                reasons=(
+                    ToolAvailabilityReason(
+                        code="feature_disabled",
+                        message="Agent tools are disabled by configuration.",
+                    ),
+                ),
+                metadata={"provider": provider},
+            )
+        if provider not in self._allowed_providers:
+            return ToolAvailabilityStatus(
+                state="unavailable",
+                reasons=(
+                    ToolAvailabilityReason(
+                        code="provider_not_allowed",
+                        message=f"Provider '{provider}' is not allowed by configuration.",
+                    ),
+                ),
+                metadata={"provider": provider},
+            )
+        spec = PROVIDER_SPECS.get(provider)
+        if spec is None:
+            return ToolAvailabilityStatus(
+                state="unavailable",
+                reasons=(
+                    ToolAvailabilityReason(
+                        code="unknown_provider",
+                        message=f"Unknown provider: {provider}",
+                    ),
+                ),
+                metadata={"provider": provider},
+            )
+        resolution = self._resolve_provider_binary(spec)
+        if resolution.found:
+            return ToolAvailabilityStatus(
+                state="available",
+                metadata={
+                    "provider": provider,
+                    "binary": spec.binary,
+                    "binary_path": resolution.path,
+                    "binary_source": resolution.source,
+                },
+            )
+        return ToolAvailabilityStatus(
+            state="unavailable",
+            reasons=(
+                ToolAvailabilityReason(
+                    code=resolution.error_code or "binary_not_found",
+                    message=resolution.message or f"Binary not found: {spec.binary}",
+                    metadata=dict(resolution.metadata or {}),
+                ),
+            ),
+            metadata={"provider": provider, "binary": spec.binary},
+        )
 
     async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
         started = time.monotonic()
@@ -366,10 +455,20 @@ class ProviderAgentTool(Tool):
             timeout = 300
         timeout = max(1, min(timeout, self._max_timeout_seconds))
 
-        binary_path = shutil.which(spec.binary)
+        resolution = self._resolve_provider_binary(spec)
+        binary_path = resolution.path
         if not binary_path:
             return _complete(
-                self._error("binary_not_found", f"Binary not found: {spec.binary}"),
+                self._error(
+                    resolution.error_code or "binary_not_found",
+                    resolution.message or f"Binary not found: {spec.binary}",
+                    extra_data={
+                        "binary": spec.binary,
+                        "provider": provider,
+                        "reason_code": "provider_binary_not_found",
+                        **dict(resolution.metadata or {}),
+                    },
+                ),
             )
         version_gate = await self._enforce_version_gate(provider, binary_path, spec)
         if version_gate is not None:
@@ -547,6 +646,7 @@ class ProviderAgentTool(Tool):
             return self._error(
                 "unsupported_version",
                 f"Could not determine {provider} version: {e}",
+                extra_data={"provider": provider, "reason_code": "provider_binary_unsupported"},
             )
         version_text = (
             (version_result.stdout or "")
@@ -564,6 +664,12 @@ class ProviderAgentTool(Tool):
                 f"Provider '{provider}' version is unsupported. "
                 f"Installed: {actual}. Minimum required: {expected}."
             ),
+            extra_data={
+                "provider": provider,
+                "reason_code": "provider_binary_unsupported",
+                "minimum_version": expected,
+                "installed_version": actual,
+            },
         )
 
     @staticmethod
@@ -653,6 +759,21 @@ class ProviderAgentTool(Tool):
         extra_data: dict | None = None,
     ) -> ToolResult:
         data = {"error_code": code}
+        reason_code = ""
+        normalized = str(code or "").strip().lower()
+        if normalized == "binary_not_found":
+            reason_code = "provider_binary_not_found"
+        elif normalized == "unsupported_version":
+            reason_code = "provider_binary_unsupported"
+        elif normalized in {
+            "feature_disabled",
+            "provider_not_allowed",
+            "network_disabled",
+            "unsupported_mode_combination",
+        }:
+            reason_code = "tool_capability_unavailable"
+        if reason_code:
+            data["reason_code"] = reason_code
         if isinstance(extra_data, dict):
             data.update(extra_data)
         return ToolResult(

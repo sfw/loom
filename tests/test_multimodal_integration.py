@@ -231,6 +231,27 @@ class TestOpenAIMessageBuilding:
         assert parts[0]["type"] == "text"
         assert parts[0]["text"] == "hello"
 
+    def test_user_message_with_explicit_context_builds_content_parts(self):
+        provider = self._make_provider(vision=True)
+        block = serialize_block(ImageBlock(
+            source_path="/tmp/test.png",
+            media_type="image/png",
+            width=100,
+            height=100,
+            text_fallback="Image fallback",
+        ))
+        result = provider._build_openai_messages([{
+            "role": "user",
+            "content": "Please review this",
+            "workspace_paths": ["src/app.tsx"],
+            "content_blocks": [block],
+        }])
+        assert len(result) == 1
+        assert result[0]["role"] == "user"
+        assert isinstance(result[0]["content"], list)
+        assert result[0]["content"][0]["type"] == "text"
+        assert "Attached workspace context" in result[0]["content"][0]["text"]
+
 
 # ---------------------------------------------------------------------------
 # Runner tool event emission tests

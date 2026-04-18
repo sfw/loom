@@ -245,7 +245,7 @@ class ExecutionConfig:
     executor_completion_contract_mode: str = "off"  # off | warn | enforce
     planner_degraded_mode: str = "allow"  # allow | require_approval | deny
     enable_sqlite_remediation_queue: bool = False
-    enable_durable_task_runner: bool = False
+    enable_durable_task_runner: bool = True
     enable_mutation_idempotency: bool = False
     sealed_artifact_post_call_guard: str = "warn"  # off | warn | enforce
     enable_slo_metrics: bool = False
@@ -280,6 +280,7 @@ class ExecutionConfig:
     agent_tools_allowed_providers: list[str] = field(
         default_factory=lambda: ["codex", "claude_code", "opencode"],
     )
+    tool_binary_overrides: dict[str, str] = field(default_factory=dict)
     agent_tools_max_timeout_seconds: int = 1800
     agent_tools_default_network_mode: str = "on"  # on | off
 
@@ -514,6 +515,9 @@ class MCPServerConfig:
     cwd: str = ""
     timeout_seconds: int = MCP_DEFAULT_TIMEOUT_SECONDS
     enabled: bool = True
+    approval_required: bool = False
+    approval_state: str = "not_required"
+    server_fingerprint: str = ""
 
 
 @dataclass(frozen=True)
@@ -700,6 +704,20 @@ def _string_list_from(source: dict, key: str, default: list[str]) -> list[str]:
         if text not in cleaned:
             cleaned.append(text)
     return cleaned or list(default)
+
+
+def _string_map_from(source: dict, key: str) -> dict[str, str]:
+    """Parse dict[str, str] from config, dropping empty keys/values."""
+    raw = source.get(key, {})
+    if not isinstance(raw, dict):
+        return {}
+    cleaned: dict[str, str] = {}
+    for item_key, item_value in raw.items():
+        clean_key = str(item_key or "").strip()
+        clean_value = str(item_value or "").strip()
+        if clean_key and clean_value:
+            cleaned[clean_key] = clean_value
+    return cleaned
 
 
 def load_config(path: Path | None = None) -> Config:
@@ -1083,6 +1101,7 @@ def load_config(path: Path | None = None) -> Config:
             "agent_tools_allowed_providers",
             ExecutionConfig().agent_tools_allowed_providers,
         ),
+        tool_binary_overrides=_string_map_from(exec_data, "tool_binary_overrides"),
         agent_tools_max_timeout_seconds=_int_from(
             exec_data,
             "agent_tools_max_timeout_seconds",

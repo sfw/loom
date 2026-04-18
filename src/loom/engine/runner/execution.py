@@ -22,7 +22,11 @@ from loom.models.request_diagnostics import (
     collect_request_diagnostics,
     collect_response_diagnostics,
 )
-from loom.models.retry import ModelRetryPolicy, call_with_model_retry
+from loom.models.retry import (
+    ModelRetryPolicy,
+    build_model_retry_event_payload,
+    call_with_model_retry,
+)
 from loom.recovery.questions import QuestionRequest
 from loom.state.evidence import (
     extract_evidence_records,
@@ -34,6 +38,7 @@ from loom.tools.registry import ToolResult
 from loom.tools.workspace import ChangeLog
 
 from . import session as runner_session
+from . import tool_routing as runner_tool_routing
 from .types import SubtaskResult, SubtaskResultStatus, ToolCallRecord
 
 logger = logging.getLogger(__name__)
@@ -90,6 +95,7 @@ async def run_subtask(
     try:
         workspace = Path(task.workspace) if task.workspace else None
         read_roots = runner._read_roots_for_task(task, workspace)
+        read_path_map = runner._read_path_map_for_task(task, workspace)
         auth_context = None
         try:
             metadata = task.metadata if isinstance(task.metadata, dict) else {}
@@ -133,6 +139,7 @@ async def run_subtask(
             available_tools=runner._tools.all_schemas(
                 auth_context=auth_context,
                 execution_surface=execution_surface,
+                runnable_only=True,
             ),
             evidence_ledger_summary=evidence_summary,
         )
@@ -167,6 +174,14 @@ async def run_subtask(
             allowed_output_prefixes or [],
             workspace=workspace,
         )
+        canonical_deliverable_set = set(canonical_deliverables)
+        one_shot_direct_deliverable_mode = (
+            bool(canonical_deliverables)
+            and not normalized_allowed_output_prefixes
+        )
+        touched_canonical_deliverables: set[str] = set()
+        completion_only_after_deliverables = False
+        completion_only_instruction_sent = False
         iteration_budget = runner._tool_iteration_budget(
             subtask=subtask,
             retry_strategy=retry_strategy,
@@ -195,10 +210,25 @@ async def run_subtask(
                 task_id=task.id,
                 subtask_id=subtask.id,
             )
-            tool_schemas = runner._tools.all_schemas(
-                auth_context=auth_context,
-                execution_surface=execution_surface,
-            )
+            if completion_only_after_deliverables and not completion_only_instruction_sent:
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "CANONICAL DELIVERABLE WRITE COMPLETE: all required deliverables "
+                        "for this subtask have already been written once. Do not call "
+                        "more tools or modify files. Respond with your final completion "
+                        "message only."
+                    ),
+                })
+                completion_only_instruction_sent = True
+            if completion_only_after_deliverables:
+                tool_schemas = []
+            else:
+                tool_schemas = runner._tools.all_schemas(
+                    auth_context=auth_context,
+                    execution_surface=execution_surface,
+                    runnable_only=True,
+                )
             operation = "stream" if streaming else "complete"
             session.response = None
             policy = ModelRetryPolicy.from_execution_config(runner._config.execution)
@@ -297,12 +327,46 @@ async def run_subtask(
                     },
                 )
 
+            def _on_invocation_retry_scheduled(
+                attempt: int,
+                max_attempts: int,
+                error: BaseException,
+                remaining: int,
+                delay_seconds: float,
+            ) -> None:
+                runner._emit_model_event(
+                    task_id=task.id,
+                    subtask_id=subtask.id,
+                    model_name=model.name,
+                    phase="done",
+                    details={
+                        "origin": request_diag.origin if request_diag else "",
+                        "iteration": iteration + 1,
+                        "operation": operation,
+                        "invocation_attempt": attempt,
+                        "invocation_max_attempts": max_attempts,
+                        "retry_queue_remaining": remaining,
+                        "error_type": type(error).__name__,
+                        "error": str(error),
+                        "overflow_error_detected": (
+                            runner._is_model_request_overflow_error(error)
+                        ),
+                        "overflow_fallback_attempted": overflow_fallback_attempted,
+                        **build_model_retry_event_payload(
+                            error,
+                            delay_seconds=delay_seconds,
+                        ),
+                        **(overflow_fallback_report or {}),
+                    },
+                )
+
             try:
                 session.response = await call_with_model_retry(
                     _invoke_model,
                     policy=policy,
                     should_retry=_should_retry_invocation,
                     on_failure=_on_invocation_failure,
+                    on_retry_scheduled=_on_invocation_retry_scheduled,
                 )
             except Exception as e:
                 session.interruption_reason = (
@@ -347,6 +411,7 @@ async def run_subtask(
                     runner._tools.all_schemas(
                         auth_context=auth_context,
                         execution_surface=execution_surface,
+                        runnable_only=True,
                     ),
                 )
                 if not validation.valid:
@@ -378,36 +443,72 @@ async def run_subtask(
                     if not await runner._wait_for_task_control_window(task):
                         session.interruption_reason = "Execution cancelled before completion."
                         break
+                    resolved_tool_name, resolved_tool_args, route_metadata = (
+                        runner_tool_routing.route_tool_call_for_process(
+                            tool_name=tc.name,
+                            tool_args=tc.arguments,
+                            process=getattr(runner._prompts, "process", None),
+                            workspace=workspace,
+                            subtask_id=subtask.id,
+                            execution_surface=execution_surface,
+                        )
+                    )
                     runner._emit_tool_event(
                         TOOL_CALL_STARTED, task.id, subtask.id,
-                        tc.name, tc.arguments,
+                        resolved_tool_name, resolved_tool_args,
                     )
                     tool_call_id = str(getattr(tc, "id", "") or "")
-                    tool_obj = runner._tools.get(tc.name)
+                    tool_obj = runner._tools.get(resolved_tool_name)
                     is_mutating_tool = bool(getattr(tool_obj, "is_mutating", False))
                     mutation_target_arg_keys = tuple(
                         getattr(tool_obj, "mutation_target_arg_keys", ()) or (),
                     )
-                    runner._increment_subtask_counter("tool_calls")
-                    if is_mutating_tool:
-                        runner._increment_subtask_counter("mutating_tool_calls")
-                    policy_error = runner._validate_deliverable_write_policy(
+                    attempted_paths = runner._target_paths_for_policy(
                         tool_name=tc.name,
                         tool_args=tc.arguments,
                         workspace=workspace,
                         is_mutating_tool=is_mutating_tool,
                         mutation_target_arg_keys=mutation_target_arg_keys,
-                        expected_deliverables=canonical_deliverables,
-                        forbidden_deliverables=canonical_forbidden_deliverables,
-                        allowed_output_prefixes=normalized_allowed_output_prefixes,
-                        enforce_deliverable_paths=enforce_deliverable_paths,
-                        edit_existing_only=edit_existing_only,
                     )
+                    runner._increment_subtask_counter("tool_calls")
+                    if is_mutating_tool:
+                        runner._increment_subtask_counter("mutating_tool_calls")
+                    if (
+                        completion_only_after_deliverables
+                        and is_mutating_tool
+                        and attempted_paths
+                    ):
+                        policy_error = (
+                            "reason_code=forbidden_output_path; "
+                            "Canonical deliverable completion violation: "
+                            "all required deliverables for this subtask attempt "
+                            "have already been written. Do not call mutating tools "
+                            "after the canonical write; return the completion "
+                            "response instead."
+                        )
+                    else:
+                        policy_error = runner._validate_deliverable_write_policy(
+                            tool_name=resolved_tool_name,
+                            tool_args=resolved_tool_args,
+                            workspace=workspace,
+                            is_mutating_tool=is_mutating_tool,
+                            mutation_target_arg_keys=mutation_target_arg_keys,
+                            expected_deliverables=canonical_deliverables,
+                            forbidden_deliverables=canonical_forbidden_deliverables,
+                            allowed_output_prefixes=normalized_allowed_output_prefixes,
+                            enforce_deliverable_paths=enforce_deliverable_paths,
+                            edit_existing_only=edit_existing_only,
+                            already_touched_deliverables=(
+                                touched_canonical_deliverables
+                                if one_shot_direct_deliverable_mode
+                                else None
+                            ),
+                        )
                     if not policy_error:
                         policy_error = runner._validate_sealed_artifact_mutation_policy(
                             task=task,
-                            tool_name=tc.name,
-                            tool_args=tc.arguments,
+                            tool_name=resolved_tool_name,
+                            tool_args=resolved_tool_args,
                             workspace=workspace,
                             is_mutating_tool=is_mutating_tool,
                             mutation_target_arg_keys=mutation_target_arg_keys,
@@ -415,21 +516,14 @@ async def run_subtask(
                             current_tool_calls=tool_calls_record,
                         )
                     if policy_error:
-                        blocked_paths = runner._target_paths_for_policy(
-                            tool_name=tc.name,
-                            tool_args=tc.arguments,
-                            workspace=workspace,
-                            is_mutating_tool=is_mutating_tool,
-                            mutation_target_arg_keys=mutation_target_arg_keys,
-                        )
                         if runner._is_forbidden_output_path_error(policy_error):
                             runner._emit_telemetry_event(
                                 event_type=FORBIDDEN_CANONICAL_WRITE_BLOCKED,
                                 task_id=task.id,
                                 data={
                                     "subtask_id": subtask.id,
-                                    "tool": tc.name,
-                                    "attempted_paths": blocked_paths,
+                                    "tool": resolved_tool_name,
+                                    "attempted_paths": attempted_paths,
                                     "expected_deliverables": list(canonical_deliverables),
                                     "forbidden_deliverables": list(
                                         canonical_forbidden_deliverables,
@@ -444,8 +538,8 @@ async def run_subtask(
                             runner._emit_sealed_policy_preflight_blocked(
                                 task_id=task.id,
                                 subtask_id=subtask.id,
-                                tool_name=tc.name,
-                                attempted_paths=blocked_paths,
+                                tool_name=resolved_tool_name,
+                                attempted_paths=attempted_paths,
                                 policy_error=policy_error,
                             )
                         tool_result = ToolResult.fail(policy_error)
@@ -459,8 +553,8 @@ async def run_subtask(
                             idempotency_key, args_hash = runner._mutation_idempotency_key(
                                 task=task,
                                 subtask=subtask,
-                                tool_name=tc.name,
-                                arguments=tc.arguments,
+                                tool_name=resolved_tool_name,
+                                arguments=resolved_tool_args,
                             )
                             try:
                                 ledger_entry = await runner._memory.get_mutation_ledger_entry(
@@ -478,14 +572,14 @@ async def run_subtask(
                                 )
                                 deduped = True
                                 runner._emit_telemetry_event(
-                                    event_type=TOOL_CALL_DEDUPLICATED,
-                                    task_id=task.id,
-                                    data={
-                                        "subtask_id": subtask.id,
-                                        "tool": tc.name,
-                                        "tool_call_id": tool_call_id,
-                                        "idempotency_key": idempotency_key,
-                                        "run_id": runner._normalize_run_id(task),
+                                        event_type=TOOL_CALL_DEDUPLICATED,
+                                        task_id=task.id,
+                                        data={
+                                            "subtask_id": subtask.id,
+                                            "tool": resolved_tool_name,
+                                            "tool_call_id": tool_call_id,
+                                            "idempotency_key": idempotency_key,
+                                            "run_id": runner._normalize_run_id(task),
                                     },
                                 )
                         if (
@@ -497,9 +591,9 @@ async def run_subtask(
                                 task=task,
                                 workspace=workspace,
                             )
-                        execute_args = dict(tc.arguments)
+                        execute_args = dict(resolved_tool_args)
                         if (
-                            tc.name == "ask_user"
+                            resolved_tool_name == "ask_user"
                             and not runner._tools.has(
                                 "ask_user",
                                 execution_surface=execution_surface,
@@ -508,7 +602,10 @@ async def run_subtask(
                             tool_result = runner._ask_user_limit_error(
                                 "ask_user is unavailable for this execution surface.",
                             )
-                        elif tc.name == "ask_user" and runner._ask_user_runtime_enabled():
+                        elif (
+                            resolved_tool_name == "ask_user"
+                            and runner._ask_user_runtime_enabled()
+                        ):
                             now = time.monotonic()
                             if (
                                 session.ask_user_questions_asked
@@ -540,7 +637,7 @@ async def run_subtask(
                                     )
                                 else:
                                     request = QuestionRequest.from_ask_user_args(
-                                        tc.arguments,
+                                        resolved_tool_args,
                                         timeout_policy=runner._ask_user_policy,
                                         timeout_seconds=runner._ask_user_timeout_seconds,
                                         timeout_default_response=(
@@ -592,7 +689,7 @@ async def run_subtask(
                                     else:
                                         session.ask_user_questions_asked += 1
                                         session.last_ask_user_requested_at = now
-                                        runner._set_waiting_for_user_input(
+                                        await runner._set_waiting_for_user_input(
                                             task=task,
                                             subtask=subtask,
                                             request=request,
@@ -612,7 +709,7 @@ async def run_subtask(
                                                 check_task_control=_check_task_control,
                                             )
                                         finally:
-                                            runner._clear_waiting_for_user_input(
+                                            await runner._clear_waiting_for_user_input(
                                                 task=task,
                                                 question_id=request.question_id,
                                             )
@@ -663,7 +760,7 @@ async def run_subtask(
                                             answer=answer,
                                         )
                         elif not deduped:
-                            if tc.name in {"web_fetch", "web_fetch_html"}:
+                            if resolved_tool_name in {"web_fetch", "web_fetch_html"}:
                                 execute_args["_enable_filetype_ingest_router"] = bool(
                                     runner._enable_filetype_ingest_router,
                                 )
@@ -677,15 +774,24 @@ async def run_subtask(
                                     runner._ingest_artifact_retention_max_bytes_per_scope,
                                 )
                             tool_result = await runner._tools.execute(
-                                tc.name, execute_args,
+                                resolved_tool_name, execute_args,
                                 workspace=workspace,
                                 read_roots=read_roots,
+                                read_path_map=read_path_map,
                                 scratch_dir=runner._config.scratch_path,
                                 changelog=changelog,
                                 subtask_id=subtask.id,
                                 auth_context=auth_context,
                                 execution_surface=execution_surface,
                             )
+                        if route_metadata:
+                            route_data = (
+                                dict(tool_result.data)
+                                if isinstance(tool_result.data, dict)
+                                else {}
+                            )
+                            route_data.update(route_metadata)
+                            tool_result.data = route_data
                         if (
                             is_mutating_tool
                             and not deduped
@@ -696,8 +802,8 @@ async def run_subtask(
                                 unexpected_paths = runner._unexpected_sealed_mutation_paths(
                                     task=task,
                                     workspace=workspace,
-                                    tool_name=tc.name,
-                                    tool_args=tc.arguments,
+                                    tool_name=resolved_tool_name,
+                                    tool_args=resolved_tool_args,
                                     tool_result=tool_result,
                                     is_mutating_tool=is_mutating_tool,
                                     mutation_target_arg_keys=mutation_target_arg_keys,
@@ -707,7 +813,7 @@ async def run_subtask(
                                 runner._emit_sealed_unexpected_mutation_detected(
                                     task_id=task.id,
                                     subtask_id=subtask.id,
-                                    tool_name=tc.name,
+                                    tool_name=resolved_tool_name,
                                     tool_call_id=tool_call_id,
                                     mode=guard_mode,
                                     unexpected_paths=unexpected_paths,
@@ -782,7 +888,7 @@ async def run_subtask(
                                     task_id=task.id,
                                     run_id=runner._normalize_run_id(task),
                                     subtask_id=subtask.id,
-                                    tool_name=tc.name,
+                                    tool_name=resolved_tool_name,
                                     args_hash=args_hash,
                                     status="success" if tool_result.success else "failure",
                                     result_json=tool_result.to_json(),
@@ -794,8 +900,8 @@ async def run_subtask(
                                     exc_info=True,
                                 )
                     record = ToolCallRecord(
-                        tool=tc.name,
-                        args=tc.arguments,
+                        tool=resolved_tool_name,
+                        args=resolved_tool_args,
                         result=tool_result,
                         call_id=str(getattr(tc, "id", "") or ""),
                     )
@@ -824,43 +930,60 @@ async def run_subtask(
                             tool_result.data = data
                         else:
                             tool_result.data = data
+                    if (
+                        one_shot_direct_deliverable_mode
+                        and is_mutating_tool
+                        and tool_result.success
+                    ):
+                        touched_paths = [
+                            path
+                            for path in attempted_paths
+                            if path in canonical_deliverable_set
+                        ]
+                        if touched_paths:
+                            touched_canonical_deliverables.update(touched_paths)
+                            if canonical_deliverable_set.issubset(
+                                touched_canonical_deliverables,
+                            ):
+                                completion_only_after_deliverables = True
                     runner._emit_tool_event(
                         TOOL_CALL_COMPLETED, task.id, subtask.id,
-                        tc.name, tc.arguments,
+                        resolved_tool_name, resolved_tool_args,
                         result=tool_result,
                         workspace=workspace,
                     )
                     runner._emit_artifact_ingest_telemetry(
                         task_id=task.id,
                         subtask_id=subtask.id,
-                        tool_name=tc.name,
-                        tool_args=tc.arguments,
+                        tool_name=resolved_tool_name,
+                        tool_args=resolved_tool_args,
                         result=tool_result,
                     )
                     runner._emit_artifact_read_telemetry(
                         task_id=task.id,
                         subtask_id=subtask.id,
-                        tool_name=tc.name,
-                        tool_args=tc.arguments,
+                        tool_name=resolved_tool_name,
+                        tool_args=resolved_tool_args,
                         result=tool_result,
                     )
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tc.id,
                         "content": await runner._serialize_tool_result_for_model(
-                            tc.name, tool_result,
+                            resolved_tool_name, tool_result,
                         ),
                     })
                 if session.interruption_reason:
                     break
 
                 # Anti-amnesia reminder
-                messages.append({
-                    # Some OpenAI-compatible providers reject repeated in-thread
-                    # system messages during tool-call loops.
-                    "role": "user",
-                    "content": runner._build_todo_reminder(task, subtask),
-                })
+                if not completion_only_after_deliverables:
+                    messages.append({
+                        # Some OpenAI-compatible providers reject repeated in-thread
+                        # system messages during tool-call loops.
+                        "role": "user",
+                        "content": runner._build_todo_reminder(task, subtask),
+                    })
             else:
                 # Text-only response. Depending on configured mode, require
                 # explicit completion contract payload before termination.

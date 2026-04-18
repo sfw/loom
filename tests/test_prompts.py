@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from loom.processes.schema import ProcessDefinition, VerificationPolicyContract
 from loom.prompts.assembler import PromptAssembler
 from loom.prompts.constraints import (
     COMMON_CONSTRAINTS,
@@ -206,6 +207,33 @@ class TestExecutorPrompt:
         assert "Set question_type explicitly" in prompt
         assert "do NOT add a redundant" in prompt
 
+    def test_executor_includes_development_execution_constraints(
+        self,
+        sample_task: Task,
+        state_manager: TaskStateManager,
+    ):
+        state_manager.create(sample_task)
+        process = ProcessDefinition(
+            name="build-process",
+            verification_policy=VerificationPolicyContract(
+                static_checks={"tool_success_policy": "development_balanced"},
+            ),
+        )
+        assembler = PromptAssembler(process=process)
+        subtask = sample_task.get_subtask("add-tsconfig")
+
+        prompt = assembler.build_executor_prompt(
+            task=sample_task,
+            subtask=subtask,
+            state_manager=state_manager,
+        )
+
+        assert "DEVELOPMENT EXECUTION CONSTRAINTS" in prompt
+        assert "Avoid shell background-process chains" in prompt
+        assert "Write machine-readable validation artifacts first" in prompt
+        assert "verification_helper" in prompt
+        assert "run_build_check" in prompt
+
     def test_executor_includes_memory(
         self,
         assembler: PromptAssembler,
@@ -276,6 +304,27 @@ class TestExecutorPrompt:
         assert "READ/WRITE SCOPE" in prompt
         assert "source-workspace" in prompt
         assert "Do NOT prefix write paths with `myapp/`" in prompt
+
+    def test_executor_includes_attached_read_only_context_paths(
+        self,
+        assembler: PromptAssembler,
+        sample_task: Task,
+        state_manager: TaskStateManager,
+    ):
+        state_manager.create(sample_task)
+        sample_task.metadata["attached_read_path_map"] = {
+            "source-data/report.md": "/tmp/source-data/report.md",
+        }
+        subtask = sample_task.get_subtask("add-tsconfig")
+
+        prompt = assembler.build_executor_prompt(
+            task=sample_task,
+            subtask=subtask,
+            state_manager=state_manager,
+        )
+
+        assert "ATTACHED READ-ONLY CONTEXT" in prompt
+        assert "source-data/report.md" in prompt
 
     def test_executor_section_order(
         self,
@@ -450,6 +499,37 @@ class TestVerifierPrompt:
         prompt = assembler.build_verifier_prompt(subtask, "Done.", "")
         assert "cardinality-agnostic" in prompt
         assert "company name(s)" in prompt
+
+    def test_verifier_includes_development_verifier_constraints(self):
+        process = ProcessDefinition(
+            name="build-process",
+            verification_policy=VerificationPolicyContract(
+                static_checks={"tool_success_policy": "development_balanced"},
+                semantic_checks=[
+                    {
+                        "name": "optional_browser_verification",
+                        "capability": "browser_runtime",
+                        "helper": "browser_assert",
+                        "optional": True,
+                    },
+                ],
+            ),
+        )
+        assembler = PromptAssembler(process=process)
+        subtask = Subtask(id="verify-ui", description="Verify the build output")
+
+        prompt = assembler.build_verifier_prompt(subtask, "Done.", "")
+
+        assert "DEVELOPMENT VERIFIER CONSTRAINTS" in prompt
+        assert "Treat unavailable browser/service/runtime capabilities as infra" in prompt
+        assert "machine-readable result" in prompt
+        assert "canonical" in prompt
+        assert "verification_helper" in prompt
+        assert "browser_session" in prompt
+        assert "DEVELOPMENT VERIFICATION CAPABILITIES" in prompt
+        assert "browser_runtime: optional, helper=browser_assert" in prompt
+        assert "DEVELOPMENT HELPER REGISTRY" in prompt
+        assert "browser_assert (browser_runtime), available" in prompt
 
 
 class TestConstraints:

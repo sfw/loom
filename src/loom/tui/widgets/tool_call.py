@@ -183,13 +183,39 @@ class ToolCallWidget(Static):
         self._error = error
 
     def compose(self) -> ComposeResult:
+        yield self._build_content_widget()
+
+    def update_state(
+        self,
+        *,
+        args: dict | None = None,
+        success: bool | None = None,
+        elapsed_ms: int = 0,
+        output: str = "",
+        error: str = "",
+    ) -> None:
+        """Update rendered state for the same tool call lifecycle."""
+        if args is not None and isinstance(args, dict):
+            self._args = args
+        if success is None and self._success is not None:
+            return
+        if success is not None:
+            self._success = success
+            self._elapsed_ms = max(0, int(elapsed_ms))
+            self._output = output
+            self._error = error
+        if self.is_mounted:
+            self.remove_children()
+            self.mount(self._build_content_widget())
+
+    def _build_content_widget(self) -> Static | Collapsible:
         preview = tool_args_preview(self._tool_name, self._args)
         elapsed = f"{self._elapsed_ms}ms" if self._elapsed_ms else ""
 
         if self._success is None:
             # Tool still running
             title = f"[dim]{self._tool_name}[/dim] [dim]{preview}[/dim]"
-            yield Static(f"  {title}")
+            return Static(f"  {title}")
         elif self._success:
             out_preview = tool_output_preview(self._tool_name, self._output)
             status = "[#9ece6a]ok[/]"
@@ -209,13 +235,13 @@ class ToolCallWidget(Static):
                     styled = _style_multimodal_output(snippet)
                 else:
                     styled = f"[dim]{_escape(snippet)}[/dim]"
-                yield Collapsible(
+                return Collapsible(
                     Static(styled),
                     title=title,
                     collapsed=True,
                 )
             else:
-                yield Static(title)
+                return Static(title)
         else:
             err_msg = _trunc(self._error or "failed", 80)
             title = (
@@ -223,13 +249,13 @@ class ToolCallWidget(Static):
                 f" [dim]{preview}[/dim] [dim]{elapsed}[/dim]"
             )
             if self._error:
-                yield Collapsible(
+                return Collapsible(
                     Static(f"[#f7768e]{_escape(err_msg)}[/]"),
                     title=title,
                     collapsed=True,
                 )
             else:
-                yield Static(title)
+                return Static(title)
 
 
 class DelegateProgressWidget(Static):

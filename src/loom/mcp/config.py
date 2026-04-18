@@ -8,6 +8,7 @@ import tomllib
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
+from time import time
 
 from loom.config import (
     MCP_DEFAULT_TIMEOUT_SECONDS,
@@ -49,6 +50,7 @@ class MergedMCPConfig:
     workspace_path: Path
     user_path: Path
     legacy_config_path: Path | None
+    approvals_path: Path | None = None
 
     def get(self, alias: str) -> MCPServerView | None:
         return self.sources.get(alias)
@@ -60,6 +62,145 @@ class MergedMCPConfig:
 def default_user_mcp_path() -> Path:
     """Default user-scoped MCP config path."""
     return Path.home() / ".loom" / "mcp.toml"
+
+
+@dataclass(frozen=True)
+class MCPApprovalRecord:
+    """User trust decision for one server fingerprint."""
+
+    status: str = "approved"
+    reviewed_at: int = 0
+    alias: str = ""
+    source: str = ""
+    server_type: str = ""
+    url: str = ""
+
+
+def default_user_mcp_approvals_path(
+    *,
+    explicit_path: Path | None = None,
+    user_path: Path | None = None,
+) -> Path:
+    """Return the approval store path for MCP trust decisions."""
+    if explicit_path is not None:
+        return explicit_path.expanduser().resolve().with_name("mcp.approvals.toml")
+    if user_path is not None:
+        return user_path.expanduser().resolve().with_name("mcp.approvals.toml")
+    return Path.home() / ".loom" / "mcp.approvals.toml"
+
+
+def load_mcp_approvals(path: Path) -> dict[str, MCPApprovalRecord]:
+    """Load persisted MCP approval decisions."""
+    target = path.expanduser().resolve()
+    if not target.exists():
+        return {}
+    try:
+        with open(target, "rb") as handle:
+            raw = tomllib.load(handle)
+    except tomllib.TOMLDecodeError as e:
+        raise MCPConfigManagerError(f"Invalid TOML in {target}: {e}") from e
+    except OSError as e:
+        raise MCPConfigManagerError(f"Cannot read MCP approvals {target}: {e}") from e
+
+    approvals_raw = raw.get("mcp", {}).get("approvals", {}) if isinstance(raw, dict) else {}
+    if not isinstance(approvals_raw, dict):
+        return {}
+
+    approvals: dict[str, MCPApprovalRecord] = {}
+    for fingerprint, value in approvals_raw.items():
+        clean_fingerprint = str(fingerprint or "").strip()
+        if not clean_fingerprint or not isinstance(value, dict):
+            continue
+        status = str(value.get("status", "") or "").strip().lower()
+        if status not in {"approved", "rejected"}:
+            continue
+        try:
+            reviewed_at = int(value.get("reviewed_at"))
+        except (TypeError, ValueError):
+            reviewed_at = 0
+        approvals[clean_fingerprint] = MCPApprovalRecord(
+            status=status,
+            reviewed_at=max(0, reviewed_at),
+            alias=str(value.get("alias", "") or "").strip(),
+            source=str(value.get("source", "") or "").strip(),
+            server_type=str(value.get("server_type", "") or "").strip(),
+            url=str(value.get("url", "") or "").strip(),
+        )
+    return approvals
+
+
+def _render_mcp_approvals_toml(approvals: dict[str, MCPApprovalRecord]) -> str:
+    lines: list[str] = [
+        "# Loom MCP trust approvals",
+        "# User-scoped decisions for workspace-defined remote servers.",
+        "",
+    ]
+    for fingerprint in sorted(approvals):
+        record = approvals[fingerprint]
+        lines.append(f"[mcp.approvals.{_toml_escape(fingerprint)}]")
+        lines.append(f"status = {_toml_escape(record.status)}")
+        lines.append(f"reviewed_at = {max(0, int(record.reviewed_at or 0))}")
+        if record.alias:
+            lines.append(f"alias = {_toml_escape(record.alias)}")
+        if record.source:
+            lines.append(f"source = {_toml_escape(record.source)}")
+        if record.server_type:
+            lines.append(f"server_type = {_toml_escape(record.server_type)}")
+        if record.url:
+            lines.append(f"url = {_toml_escape(record.url)}")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def write_mcp_approvals(path: Path, approvals: dict[str, MCPApprovalRecord]) -> None:
+    """Atomically write MCP approval decisions."""
+    write_mcp_file_like(path, _render_mcp_approvals_toml(approvals))
+
+
+def _approval_required_for_view(view: MCPServerView) -> bool:
+    return view.source == "workspace" and view.server.type == MCP_SERVER_TYPE_REMOTE
+
+
+def _approval_state_for_view(
+    view: MCPServerView,
+    approvals: dict[str, MCPApprovalRecord],
+) -> tuple[bool, str, str]:
+    from loom.integrations.mcp.oauth import fingerprint_mcp_server
+
+    fingerprint = fingerprint_mcp_server(view.server)
+    if not _approval_required_for_view(view):
+        return False, "not_required", fingerprint
+    record = approvals.get(fingerprint)
+    if record is None:
+        return True, "pending", fingerprint
+    if record.status == "approved":
+        return True, "approved", fingerprint
+    return True, "rejected", fingerprint
+
+
+def _apply_mcp_approval_metadata(
+    *,
+    merged: MCPConfig,
+    sources: dict[str, MCPServerView],
+    approvals_path: Path,
+) -> tuple[MCPConfig, dict[str, MCPServerView]]:
+    approvals = load_mcp_approvals(approvals_path)
+    updated_servers: dict[str, MCPServerConfig] = {}
+    updated_sources: dict[str, MCPServerView] = {}
+    for alias, view in sources.items():
+        approval_required, approval_state, fingerprint = _approval_state_for_view(
+            view,
+            approvals,
+        )
+        next_server = replace(
+            view.server,
+            approval_required=approval_required,
+            approval_state=approval_state,
+            server_fingerprint=fingerprint,
+        )
+        updated_servers[alias] = next_server
+        updated_sources[alias] = replace(view, server=next_server)
+    return replace(merged, servers=updated_servers), updated_sources
 
 
 def default_workspace_mcp_path(workspace: Path) -> Path:
@@ -250,6 +391,7 @@ def load_merged_mcp_config(
     explicit_path: Path | None = None,
     user_path: Path | None = None,
     legacy_config_path: Path | None = None,
+    approvals_path: Path | None = None,
 ) -> MergedMCPConfig:
     """Load merged MCP config with precedence metadata.
 
@@ -285,6 +427,19 @@ def load_merged_mcp_config(
         workspace_path=workspace_cfg_path,
         explicit_path=explicit_cfg_path,
     )
+    resolved_approvals_path = (
+        approvals_path.expanduser().resolve()
+        if approvals_path is not None
+        else default_user_mcp_approvals_path(
+            explicit_path=explicit_cfg_path,
+            user_path=user_cfg_path,
+        )
+    )
+    merged, sources = _apply_mcp_approval_metadata(
+        merged=merged,
+        sources=sources,
+        approvals_path=resolved_approvals_path,
+    )
     return MergedMCPConfig(
         config=merged,
         sources=sources,
@@ -292,6 +447,7 @@ def load_merged_mcp_config(
         workspace_path=workspace_cfg_path,
         user_path=user_cfg_path,
         legacy_config_path=legacy_path,
+        approvals_path=resolved_approvals_path,
     )
 
 
@@ -302,6 +458,7 @@ def apply_mcp_overrides(
     explicit_path: Path | None = None,
     user_path: Path | None = None,
     legacy_config_path: Path | None = None,
+    approvals_path: Path | None = None,
 ) -> Config:
     """Return Config with merged MCP layers applied."""
     try:
@@ -311,6 +468,7 @@ def apply_mcp_overrides(
             explicit_path=explicit_path,
             user_path=user_path,
             legacy_config_path=legacy_config_path,
+            approvals_path=approvals_path,
         )
     except MCPConfigManagerError as e:
         raise ConfigError(str(e)) from e
@@ -534,12 +692,14 @@ class MCPConfigManager:
         explicit_path: Path | None = None,
         user_path: Path | None = None,
         legacy_config_path: Path | None = None,
+        approvals_path: Path | None = None,
     ) -> None:
         self._config = config
         self._workspace = workspace
         self._explicit_path = explicit_path
         self._user_path = user_path
         self._legacy_config_path = legacy_config_path
+        self._approvals_path = approvals_path
 
     def load(self) -> MergedMCPConfig:
         return load_merged_mcp_config(
@@ -548,6 +708,7 @@ class MCPConfigManager:
             explicit_path=self._explicit_path,
             user_path=self._user_path,
             legacy_config_path=self._legacy_config_path,
+            approvals_path=self._approvals_path,
         )
 
     def resolve_write_path(self) -> Path:
@@ -566,6 +727,49 @@ class MCPConfigManager:
 
     def get_view(self, alias: str) -> MCPServerView | None:
         return self.load().get(alias)
+
+    def resolve_approvals_path(self) -> Path:
+        merged = self.load()
+        if merged.approvals_path is not None:
+            return merged.approvals_path
+        return default_user_mcp_approvals_path(
+            explicit_path=self._explicit_path,
+            user_path=self._user_path,
+        )
+
+    def set_server_approval(
+        self,
+        alias: str,
+        *,
+        status: str,
+    ) -> Path:
+        clean_status = str(status or "").strip().lower()
+        if clean_status not in {"approved", "rejected"}:
+            raise MCPConfigManagerError(
+                "Approval status must be 'approved' or 'rejected'."
+            )
+        view = self.get_view(alias)
+        if view is None:
+            raise MCPConfigManagerError(f"MCP server alias not found: {alias}")
+        if not _approval_required_for_view(view):
+            raise MCPConfigManagerError(
+                f"MCP server '{alias}' does not require an approval decision."
+            )
+        approvals_path = self.resolve_approvals_path()
+        approvals = load_mcp_approvals(approvals_path)
+        fingerprint = str(view.server.server_fingerprint or "").strip()
+        if not fingerprint:
+            _, _, fingerprint = _approval_state_for_view(view, approvals)
+        approvals[fingerprint] = MCPApprovalRecord(
+            status=clean_status,
+            reviewed_at=int(time()),
+            alias=view.alias,
+            source=view.source,
+            server_type=view.server.type,
+            url=view.server.url,
+        )
+        write_mcp_approvals(approvals_path, approvals)
+        return approvals_path
 
     def add_server(self, alias: str, server: MCPServerConfig) -> Path:
         if self.get_view(alias) is not None:

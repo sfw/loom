@@ -6,12 +6,16 @@ Retrieval is deterministic SQL (by task, subtask, type, tags).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import sqlite3
+import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import ClassVar
 
 import aiosqlite
 
@@ -26,6 +30,15 @@ from loom.state.migrations import (
 )
 
 logger = logging.getLogger(__name__)
+
+_SQLITE_BUSY_TIMEOUT_MS = 5_000
+_SQLITE_WAL_AUTOCHECKPOINT_PAGES = 2_000
+_SQLITE_CACHE_SIZE_KIB = 16_384
+_SQLITE_READ_POOL_SIZE = 2
+_EVENT_INSERT_SQL = """INSERT INTO events
+               (task_id, run_id, correlation_id, event_id, sequence, timestamp, event_type,
+                source_component, schema_version, data)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
 
 
 @dataclass
@@ -91,12 +104,60 @@ class Database:
     All access is non-blocking via aiosqlite.
     """
 
+    _open_instances: ClassVar[set[Database]] = set()
+
     def __init__(self, db_path: str | Path):
         self._db_path = str(db_path)
+        self._write_db: aiosqlite.Connection | None = None
+        self._read_dbs: list[aiosqlite.Connection] = []
+        self._read_index = 0
+        self._lifecycle_lock = asyncio.Lock()
+        self._write_tx_lock = asyncio.Lock()
+        self._stats: dict[str, float | int] = {
+            "connection_open_count": 0,
+            "read_query_count": 0,
+            "read_query_total_ms": 0.0,
+            "write_query_count": 0,
+            "write_query_total_ms": 0.0,
+            "batch_write_count": 0,
+            "batch_row_count": 0,
+        }
+        self._open_instances.add(self)
 
     async def close(self) -> None:
-        """Close database connections. No-op for aiosqlite (per-query connections)."""
-        pass
+        """Close database connections."""
+        async with self._lifecycle_lock:
+            write_db = self._write_db
+            self._write_db = None
+            read_dbs = list(self._read_dbs)
+            self._read_dbs.clear()
+            self._read_index = 0
+
+        if write_db is not None:
+            await write_db.close()
+        for db in read_dbs:
+            await db.close()
+        self._open_instances.discard(self)
+
+    @classmethod
+    async def close_open_instances(cls) -> None:
+        """Close every still-open Database instance.
+
+        Tests use this as a safety net to avoid leaking aiosqlite worker
+        threads across event-loop teardown when a test forgets to close its DB.
+        """
+        errors: list[BaseException] = []
+        for instance in list(cls._iter_open_instances()):
+            try:
+                await instance.close()
+            except BaseException as exc:  # pragma: no cover - best effort cleanup
+                errors.append(exc)
+        if errors:
+            raise errors[0]
+
+    @classmethod
+    def _iter_open_instances(cls) -> Iterable[Database]:
+        return tuple(cls._open_instances)
 
     async def initialize(self) -> None:
         """Initialize database schema and apply ordered migrations."""
@@ -117,8 +178,7 @@ class Database:
             logger.info("db_migration_diagnostic %s", json.dumps(body, sort_keys=True))
 
         async with aiosqlite.connect(self._db_path) as db:
-            # Enable WAL mode for better concurrent read/write performance
-            await db.execute("PRAGMA journal_mode=WAL")
+            await self._configure_connection(db, role="migration")
             await db.execute("BEGIN IMMEDIATE")
             existing_db = False
             applied_now: list[str] = []
@@ -174,42 +234,233 @@ class Database:
                     },
                 )
                 raise
+        await self._open_runtime_connections()
+
+    async def _open_runtime_connections(self) -> None:
+        async with self._lifecycle_lock:
+            if self._write_db is not None and len(self._read_dbs) == _SQLITE_READ_POOL_SIZE:
+                return
+            await self._close_connections_locked()
+
+            self._write_db = await self._open_connection(role="write")
+            self._read_dbs = [
+                await self._open_connection(role=f"read-{index}")
+                for index in range(_SQLITE_READ_POOL_SIZE)
+            ]
+            self._read_index = 0
+
+    async def _close_connections_locked(self) -> None:
+        write_db = self._write_db
+        read_dbs = list(self._read_dbs)
+        self._write_db = None
+        self._read_dbs.clear()
+        self._read_index = 0
+
+        if write_db is not None:
+            await write_db.close()
+        for db in read_dbs:
+            await db.close()
+
+    async def _open_connection(self, *, role: str) -> aiosqlite.Connection:
+        db = await aiosqlite.connect(self._db_path)
+        await self._configure_connection(db, role=role)
+        self._stats["connection_open_count"] = int(self._stats["connection_open_count"]) + 1
+        return db
+
+    async def _configure_connection(
+        self,
+        db: aiosqlite.Connection,
+        *,
+        role: str,
+    ) -> None:
+        db.row_factory = aiosqlite.Row
+        await db.execute("PRAGMA journal_mode=WAL")
+        await db.execute(f"PRAGMA busy_timeout={_SQLITE_BUSY_TIMEOUT_MS}")
+        await db.execute("PRAGMA synchronous=NORMAL")
+        await db.execute(f"PRAGMA wal_autocheckpoint={_SQLITE_WAL_AUTOCHECKPOINT_PAGES}")
+        await db.execute("PRAGMA temp_store=MEMORY")
+        await db.execute(f"PRAGMA cache_size=-{_SQLITE_CACHE_SIZE_KIB}")
+        logger.debug("Configured SQLite connection for %s", role)
+
+    def _configure_sync_connection(
+        self,
+        db: sqlite3.Connection,
+        *,
+        role: str,
+    ) -> None:
+        db.row_factory = sqlite3.Row
+        db.execute("PRAGMA journal_mode=WAL")
+        db.execute(f"PRAGMA busy_timeout={_SQLITE_BUSY_TIMEOUT_MS}")
+        db.execute("PRAGMA synchronous=NORMAL")
+        db.execute(f"PRAGMA wal_autocheckpoint={_SQLITE_WAL_AUTOCHECKPOINT_PAGES}")
+        db.execute("PRAGMA temp_store=MEMORY")
+        db.execute(f"PRAGMA cache_size=-{_SQLITE_CACHE_SIZE_KIB}")
+        logger.debug("Configured SQLite sync connection for %s", role)
+
+    def _record_write_stats(
+        self,
+        *,
+        row_count: int,
+        elapsed_ms: float,
+        batch: bool = False,
+    ) -> None:
+        clean_row_count = max(0, int(row_count))
+        self._stats["write_query_count"] = int(self._stats["write_query_count"]) + clean_row_count
+        self._stats["write_query_total_ms"] = float(self._stats["write_query_total_ms"]) + max(
+            0.0,
+            float(elapsed_ms),
+        )
+        if batch:
+            self._stats["batch_write_count"] = int(self._stats["batch_write_count"]) + 1
+            self._stats["batch_row_count"] = int(self._stats["batch_row_count"]) + clean_row_count
+
+    async def _get_write_db(self) -> aiosqlite.Connection:
+        if self._write_db is None:
+            await self._open_runtime_connections()
+        if self._write_db is None:
+            raise RuntimeError("SQLite write connection is not initialized.")
+        return self._write_db
+
+    async def _get_read_db(self) -> aiosqlite.Connection:
+        if not self._read_dbs:
+            await self._open_runtime_connections()
+        if not self._read_dbs:
+            raise RuntimeError("SQLite read connection pool is not initialized.")
+        db = self._read_dbs[self._read_index % len(self._read_dbs)]
+        self._read_index = (self._read_index + 1) % len(self._read_dbs)
+        return db
+
+    def stats_snapshot(self) -> dict[str, float | int]:
+        """Return lightweight connection/query counters for perf diagnostics."""
+        return dict(self._stats)
+
+    async def _run_locked_write(
+        self,
+        operation,
+        *,
+        row_count: int,
+        batch: bool = False,
+    ) -> object:
+        """Serialize writes on the shared write connection and commit once."""
+        db = await self._get_write_db()
+        started = time.perf_counter()
+        async with self._write_tx_lock:
+            result = await operation(db)
+            await db.commit()
+        self._record_write_stats(
+            row_count=row_count,
+            elapsed_ms=(time.perf_counter() - started) * 1000.0,
+            batch=batch,
+        )
+        return result
 
     async def execute(self, sql: str, params: tuple = ()) -> None:
         """Execute a write query."""
-        async with aiosqlite.connect(self._db_path) as db:
-            await db.execute(sql, params)
-            await db.commit()
+        await self._run_locked_write(
+            lambda db: db.execute(sql, params),
+            row_count=1,
+        )
 
     async def execute_returning_id(self, sql: str, params: tuple = ()) -> int:
         """Execute an insert and return the lastrowid."""
-        async with aiosqlite.connect(self._db_path) as db:
-            cursor = await db.execute(sql, params)
-            await db.commit()
-            return cursor.lastrowid
+        cursor = await self._run_locked_write(
+            lambda db: db.execute(sql, params),
+            row_count=1,
+        )
+        return cursor.lastrowid
+
+    async def execute_rowcount(self, sql: str, params: tuple = ()) -> int:
+        """Execute a write query and return the affected row count."""
+        cursor = await self._run_locked_write(
+            lambda db: db.execute(sql, params),
+            row_count=1,
+        )
+        return int(cursor.rowcount or 0)
 
     async def execute_many_returning_ids(self, sql: str, params_list: list[tuple]) -> list[int]:
         """Execute multiple inserts in a single transaction and return lastrowids."""
-        async with aiosqlite.connect(self._db_path) as db:
+        async def _operation(db: aiosqlite.Connection) -> list[int]:
             ids = []
             for params in params_list:
                 cursor = await db.execute(sql, params)
                 ids.append(cursor.lastrowid)
-            await db.commit()
             return ids
+
+        ids = await self._run_locked_write(
+            _operation,
+            row_count=len(params_list),
+            batch=True,
+        )
+        return ids
+
+    async def execute_many(self, sql: str, params_list: list[tuple]) -> None:
+        """Execute multiple writes in a single committed transaction."""
+        if not params_list:
+            return
+        await self._run_locked_write(
+            lambda db: db.executemany(sql, params_list),
+            row_count=len(params_list),
+            batch=True,
+        )
+
+    async def run_write_transaction(self, callback) -> object:
+        """Run a callback inside one write-connection transaction."""
+        db = await self._get_write_db()
+        started = time.perf_counter()
+        async with self._write_tx_lock:
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                result = await callback(db)
+            except Exception:
+                await db.rollback()
+                raise
+            await db.commit()
+        self._record_write_stats(
+            row_count=1,
+            elapsed_ms=(time.perf_counter() - started) * 1000.0,
+            batch=True,
+        )
+        return result
 
     async def query(self, sql: str, params: tuple = ()) -> list[dict]:
         """Execute a read query and return results as dicts."""
-        async with aiosqlite.connect(self._db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute(sql, params)
-            rows = await cursor.fetchall()
-            return [dict(row) for row in rows]
+        db = await self._get_read_db()
+        started = time.perf_counter()
+        cursor = await db.execute(sql, params)
+        rows = await cursor.fetchall()
+        self._stats["read_query_count"] = int(self._stats["read_query_count"]) + 1
+        self._stats["read_query_total_ms"] = float(self._stats["read_query_total_ms"]) + (
+            (time.perf_counter() - started) * 1000.0
+        )
+        return [dict(row) for row in rows]
 
     async def query_one(self, sql: str, params: tuple = ()) -> dict | None:
         """Execute a read query and return the first result."""
-        results = await self.query(sql, params)
-        return results[0] if results else None
+        db = await self._get_read_db()
+        started = time.perf_counter()
+        cursor = await db.execute(sql, params)
+        row = await cursor.fetchone()
+        self._stats["read_query_count"] = int(self._stats["read_query_count"]) + 1
+        self._stats["read_query_total_ms"] = float(self._stats["read_query_total_ms"]) + (
+            (time.perf_counter() - started) * 1000.0
+        )
+        return dict(row) if row is not None else None
+
+    async def query_one_write(self, sql: str, params: tuple = ()) -> dict | None:
+        """Execute a read query on the write connection.
+
+        Use this sparingly for read-after-write paths that must observe the
+        latest committed row without depending on the pooled readers.
+        """
+        db = await self._get_write_db()
+        started = time.perf_counter()
+        cursor = await db.execute(sql, params)
+        row = await cursor.fetchone()
+        self._stats["read_query_count"] = int(self._stats["read_query_count"]) + 1
+        self._stats["read_query_total_ms"] = float(self._stats["read_query_total_ms"]) + (
+            (time.perf_counter() - started) * 1000.0
+        )
+        return dict(row) if row is not None else None
 
     # --- Task operations ---
 
@@ -286,6 +537,41 @@ class Database:
                 "SELECT * FROM tasks WHERE status=? ORDER BY created_at DESC", (status,)
             )
         return await self.query("SELECT * FROM tasks ORDER BY created_at DESC")
+
+    async def list_tasks_for_workspace(self, workspace_path: str) -> list[dict]:
+        """List tasks scoped to a workspace or source workspace root."""
+        return await self.query(
+            """
+            SELECT *
+            FROM tasks
+            WHERE COALESCE(
+                    NULLIF(json_extract(COALESCE(metadata, '{}'), '$.source_workspace_root'), ''),
+                    workspace_path
+                ) = ?
+            ORDER BY created_at DESC
+            """,
+            (workspace_path,),
+        )
+
+    async def get_tasks_by_ids(self, task_ids: list[str]) -> dict[str, dict]:
+        """Return task rows keyed by task ID."""
+        clean_ids = sorted({
+            str(task_id or "").strip()
+            for task_id in task_ids
+            if str(task_id or "").strip()
+        })
+        if not clean_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in clean_ids)
+        rows = await self.query(
+            f"SELECT * FROM tasks WHERE id IN ({placeholders})",
+            tuple(clean_ids),
+        )
+        return {
+            str(row.get("id", "") or "").strip(): dict(row)
+            for row in rows
+            if str(row.get("id", "") or "").strip()
+        }
 
     # --- Task run operations ---
 
@@ -519,34 +805,32 @@ class Database:
         # SQLite datetime() expects "YYYY-MM-DD HH:MM:SS"; replace "T" for compatibility.
         expires_expr = "datetime('now', ?)"
         expires_delta = f"+{ttl} seconds"
-        async with aiosqlite.connect(self._db_path) as db:
-            cursor = await db.execute(
-                f"""UPDATE task_runs
-                    SET status='running',
-                        lease_owner=?,
-                        lease_expires_at={expires_expr},
-                        heartbeat_at=?,
-                        started_at=COALESCE(started_at, ?),
-                        updated_at=?
-                    WHERE run_id=?
-                      AND (
-                        status='queued'
-                        OR lease_owner=?
-                        OR lease_expires_at IS NULL
-                        OR lease_expires_at < datetime('now')
-                      )""",
-                (
-                    lease_owner,
-                    expires_delta,
-                    now,
-                    now,
-                    now,
-                    run_id,
-                    lease_owner,
-                ),
-            )
-            await db.commit()
-            return bool(cursor.rowcount)
+        rowcount = await self.execute_rowcount(
+            f"""UPDATE task_runs
+                SET status='running',
+                    lease_owner=?,
+                    lease_expires_at={expires_expr},
+                    heartbeat_at=?,
+                    started_at=COALESCE(started_at, ?),
+                    updated_at=?
+                WHERE run_id=?
+                  AND (
+                    status='queued'
+                    OR lease_owner=?
+                    OR lease_expires_at IS NULL
+                    OR lease_expires_at < datetime('now')
+                  )""",
+            (
+                lease_owner,
+                expires_delta,
+                now,
+                now,
+                now,
+                run_id,
+                lease_owner,
+            ),
+        )
+        return bool(rowcount)
 
     async def heartbeat_task_run(
         self,
@@ -559,17 +843,15 @@ class Database:
         ttl = max(5, int(lease_seconds))
         expires_expr = "datetime('now', ?)"
         expires_delta = f"+{ttl} seconds"
-        async with aiosqlite.connect(self._db_path) as db:
-            cursor = await db.execute(
-                f"""UPDATE task_runs
-                    SET heartbeat_at=?,
-                        lease_expires_at={expires_expr},
-                        updated_at=?
-                    WHERE run_id=? AND lease_owner=?""",
-                (now, expires_delta, now, run_id, lease_owner),
-            )
-            await db.commit()
-            return bool(cursor.rowcount)
+        rowcount = await self.execute_rowcount(
+            f"""UPDATE task_runs
+                SET heartbeat_at=?,
+                    lease_expires_at={expires_expr},
+                    updated_at=?
+                WHERE run_id=? AND lease_owner=?""",
+            (now, expires_delta, now, run_id, lease_owner),
+        )
+        return bool(rowcount)
 
     async def complete_task_run(
         self,
@@ -608,6 +890,40 @@ class Database:
                LIMIT 1""",
             (task_id,),
         )
+
+    async def get_latest_task_runs_for_tasks(self, task_ids: list[str]) -> dict[str, dict]:
+        """Return the most recent task_run row for each task ID."""
+        clean_ids = sorted({
+            str(task_id or "").strip()
+            for task_id in task_ids
+            if str(task_id or "").strip()
+        })
+        if not clean_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in clean_ids)
+        rows = await self.query(
+            f"""
+            WITH ranked AS (
+                SELECT
+                    *,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY task_id
+                        ORDER BY created_at DESC, run_id DESC
+                    ) AS row_rank
+                FROM task_runs
+                WHERE task_id IN ({placeholders})
+            )
+            SELECT *
+            FROM ranked
+            WHERE row_rank = 1
+            """,
+            tuple(clean_ids),
+        )
+        return {
+            str(row.get("task_id", "") or "").strip(): dict(row)
+            for row in rows
+            if str(row.get("task_id", "") or "").strip()
+        }
 
     # --- Retry/remediation persistence ---
 
@@ -1449,10 +1765,7 @@ class Database:
         emitted_timestamp = str(timestamp or "").strip() or datetime.now(UTC).isoformat()
         payload = data if isinstance(data, dict) else {}
         return await self.execute_returning_id(
-            """INSERT INTO events
-               (task_id, run_id, correlation_id, event_id, sequence, timestamp, event_type,
-                source_component, schema_version, data)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            _EVENT_INSERT_SQL,
             (
                 task_id,
                 run_id,
@@ -1467,22 +1780,87 @@ class Database:
             ),
         )
 
+    @staticmethod
+    def _event_insert_params(rows: list[dict[str, object]]) -> list[tuple]:
+        params_list: list[tuple] = []
+        for row in rows:
+            payload = row.get("data") if isinstance(row.get("data"), dict) else {}
+            emitted_timestamp = (
+                str(row.get("timestamp", "") or "").strip()
+                or datetime.now(UTC).isoformat()
+            )
+            params_list.append(
+                (
+                    str(row.get("task_id", "") or ""),
+                    str(row.get("run_id", "") or ""),
+                    str(row.get("correlation_id", "") or ""),
+                    str(row.get("event_id", "") or ""),
+                    max(0, int(row.get("sequence", 0) or 0)),
+                    emitted_timestamp,
+                    str(row.get("event_type", "") or ""),
+                    str(row.get("source_component", "") or ""),
+                    max(1, int(row.get("schema_version", 1) or 1)),
+                    json.dumps(payload, ensure_ascii=False, default=str),
+                ),
+            )
+        return params_list
+
+    async def insert_events_batch(self, rows: list[dict[str, object]]) -> None:
+        """Insert multiple event log rows in one transaction."""
+        if not rows:
+            return
+        params_list = self._event_insert_params(rows)
+        await self.execute_many(
+            _EVENT_INSERT_SQL,
+            params_list,
+        )
+
+    def insert_events_batch_blocking(self, rows: list[dict[str, object]]) -> None:
+        """Insert event log rows synchronously for overload backpressure handling."""
+        if not rows:
+            return
+        params_list = self._event_insert_params(rows)
+        started = time.perf_counter()
+        with sqlite3.connect(
+            self._db_path,
+            timeout=_SQLITE_BUSY_TIMEOUT_MS / 1000.0,
+        ) as db:
+            self._configure_sync_connection(db, role="blocking-overflow-write")
+            self._stats["connection_open_count"] = int(self._stats["connection_open_count"]) + 1
+            db.executemany(_EVENT_INSERT_SQL, params_list)
+            db.commit()
+        self._record_write_stats(
+            row_count=len(params_list),
+            elapsed_ms=(time.perf_counter() - started) * 1000.0,
+            batch=True,
+        )
+
     async def query_events(
         self,
         task_id: str,
         event_type: str | None = None,
         limit: int = 100,
+        *,
+        after_id: int = 0,
+        after_sequence: int = 0,
+        ascending: bool = False,
     ) -> list[dict]:
         """Query events for a task."""
+        normalized_after_id = max(0, int(after_id))
+        normalized_after_sequence = max(0, int(after_sequence))
+        order = "ASC" if ascending else "DESC"
         if event_type:
             return await self.query(
-                """SELECT * FROM events WHERE task_id=? AND event_type=?
-                   ORDER BY sequence DESC, id DESC LIMIT ?""",
-                (task_id, event_type, limit),
+                f"""SELECT * FROM events
+                    WHERE task_id=? AND event_type=? AND id>? AND sequence>?
+                    ORDER BY sequence {order}, id {order} LIMIT ?""",
+                (task_id, event_type, normalized_after_id, normalized_after_sequence, limit),
             )
         return await self.query(
-            "SELECT * FROM events WHERE task_id=? ORDER BY sequence DESC, id DESC LIMIT ?",
-            (task_id, limit),
+            f"""SELECT * FROM events
+                WHERE task_id=? AND id>? AND sequence>?
+                ORDER BY sequence {order}, id {order} LIMIT ?""",
+            (task_id, normalized_after_id, normalized_after_sequence, limit),
         )
 
     def _row_to_entry(self, row: dict) -> MemoryEntry:
@@ -1684,6 +2062,12 @@ class MemoryManager:
 
     async def get_latest_task_run_for_task(self, task_id: str) -> dict | None:
         return await self._db.get_latest_task_run_for_task(task_id)
+
+    async def get_latest_task_runs_for_tasks(self, task_ids: list[str]) -> dict[str, dict]:
+        return await self._db.get_latest_task_runs_for_tasks(task_ids)
+
+    async def get_tasks_by_ids(self, task_ids: list[str]) -> dict[str, dict]:
+        return await self._db.get_tasks_by_ids(task_ids)
 
     async def insert_subtask_attempt(
         self,

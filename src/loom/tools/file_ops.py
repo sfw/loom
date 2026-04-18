@@ -75,6 +75,7 @@ class ReadFileTool(Tool):
             args["path"],
             ctx.workspace,
             ctx.read_roots,
+            ctx.read_path_map,
         )
         if not path.exists():
             return ToolResult.fail(f"File not found: {args['path']}")

@@ -34,7 +34,11 @@ from loom.models.request_diagnostics import (
     collect_request_diagnostics,
     collect_response_diagnostics,
 )
-from loom.models.retry import ModelRetryPolicy, call_with_model_retry
+from loom.models.retry import (
+    ModelRetryPolicy,
+    build_model_retry_event_payload,
+    call_with_model_retry,
+)
 from loom.recovery.errors import ErrorCategory, categorize_error
 from loom.recovery.retry import AttemptRecord, RetryStrategy
 from loom.state.evidence import merge_evidence_records
@@ -248,7 +252,7 @@ async def queue_remediation_work_item(
         )
         item["updated_at"] = now.isoformat()
         async with orchestrator._state_lock:
-            orchestrator._state.save(task)
+            await orchestrator._save_task_state(task)
         orchestrator._emit(UNCONFIRMED_DATA_QUEUED, task.id, {
             "remediation_id": str(item.get("id", "")).strip(),
             "subtask_id": subtask.id,
@@ -294,7 +298,7 @@ async def queue_remediation_work_item(
             "Queued remediation for "
             f"{subtask.id} ({strategy.value}, blocking={blocking})."
         )
-        orchestrator._state.save(task)
+        await orchestrator._save_task_state(task)
     orchestrator._emit(REMEDIATION_QUEUED, task.id, {
         "remediation_id": item["id"],
         "subtask_id": subtask.id,
@@ -496,7 +500,7 @@ async def process_remediation_queue(
 
     if changed:
         async with orchestrator._state_lock:
-            orchestrator._state.save(task)
+            await orchestrator._save_task_state(task)
 
 async def execute_remediation_item(
     orchestrator,
@@ -633,7 +637,10 @@ async def run_confirm_or_prune_remediation(
                 last_failure = deterministic_note
 
         prior_successful_tool_calls: list[ToolCallRecord] = []
-        prior_evidence_records = orchestrator._evidence_for_subtask(task.id, subtask.id)
+        prior_evidence_records = await orchestrator._evidence_for_subtask_async(
+            task.id,
+            subtask.id,
+        )
         for attempt in attempts:
             raw_calls = getattr(attempt, "successful_tool_calls", [])
             if isinstance(raw_calls, list):
@@ -834,7 +841,7 @@ async def run_confirm_or_prune_remediation(
                     if remediation_result.summary
                     else message
                 )
-        orchestrator._persist_subtask_evidence(
+        await orchestrator._persist_subtask_evidence_async(
             task.id,
             subtask.id,
             remediation_result.evidence_records,
@@ -1867,11 +1874,37 @@ async def _plan_failure_resolution(
             "retry_strategy": strategy.value,
         })
 
+    def _on_retry_scheduled(
+        attempt: int,
+        max_attempts: int,
+        error: BaseException,
+        remaining: int,
+        delay_seconds: float,
+    ) -> None:
+        self._emit(MODEL_INVOCATION, task.id, {
+            "subtask_id": subtask.id,
+            "model": model.name,
+            "phase": "done",
+            "operation": "failure_resolution_plan",
+            "invocation_attempt": attempt,
+            "invocation_max_attempts": max_attempts,
+            "retry_queue_remaining": remaining,
+            "origin": request_diag.origin if request_diag else "",
+            "error_type": type(error).__name__,
+            "error": str(error),
+            "retry_strategy": strategy.value,
+            **build_model_retry_event_payload(
+                error,
+                delay_seconds=delay_seconds,
+            ),
+        })
+
     try:
         response = await call_with_model_retry(
             _invoke_model,
             policy=policy,
             on_failure=_on_failure,
+            on_retry_scheduled=_on_retry_scheduled,
         )
     except Exception as e:
         logger.debug(
@@ -2091,7 +2124,7 @@ async def _hydrate_remediation_queue_from_db(self, task: Task) -> None:
         if not item_id or item_id in existing_ids:
             continue
         queue.append(item)
-    self._state.save(task)
+    await self._save_task_state(task)
 
 async def _persist_remediation_attempt(
     self,

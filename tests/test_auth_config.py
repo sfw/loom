@@ -110,7 +110,7 @@ token_ref = "file://~/.loom/mcp_oauth_tokens.json"
 """
     )
 
-    with pytest.raises(AuthConfigError, match="must not point to MCP alias token store"):
+    with pytest.raises(AuthConfigError, match="must not point to the legacy MCP alias token store"):
         load_auth_file(auth_path)
 
 
@@ -538,7 +538,16 @@ def test_sync_missing_drafts_creates_resource_binding_and_default(tmp_path: Path
 
     class _FakeMCPManager:
         def list_views(self):
-            return [types.SimpleNamespace(alias="notion")]
+            return [
+                types.SimpleNamespace(
+                    alias="notion",
+                    server=types.SimpleNamespace(
+                        command="",
+                        args=(),
+                        oauth=types.SimpleNamespace(enabled=False, scopes=[]),
+                    ),
+                )
+            ]
 
     result = sync_missing_drafts(
         workspace=workspace,
@@ -973,7 +982,7 @@ generated_from = "api_integration:youtube_data_api"
     assert store.workspace_defaults["res-youtube"] == "draft_api_integration_youtube_data_api"
 
 
-def test_discover_auth_resources_skips_mcp_remote_alias_without_explicit_requirement():
+def test_discover_auth_resources_discovers_mcp_remote_oauth_alias():
     class _FakeMCPManager:
         def list_views(self):
             return [
@@ -993,7 +1002,13 @@ def test_discover_auth_resources_skips_mcp_remote_alias_without_explicit_require
         mcp_manager=_FakeMCPManager(),
         scope="active",
     )
-    assert discovered == []
+    assert len(discovered) == 1
+    item = discovered[0]
+    assert item.resource_kind == "mcp"
+    assert item.resource_key == "notion"
+    assert item.provider == "notion"
+    assert item.modes == ("oauth2_pkce",)
+    assert item.scopes == ("read:content",)
 
 
 def test_discover_auth_resources_keeps_local_mcp_alias_without_external_oauth():

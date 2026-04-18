@@ -1032,6 +1032,13 @@ def _augment_retry_context_for_outputs(
             "Write/update only these deliverable filenames for this phase. "
             "If fixing verification issues, patch these files in place."
         )
+        if output_strategy != "fan_in":
+            lines.append(
+                "Direct-mode deliverable rule: gather all required evidence before "
+                "the first canonical write. Each listed deliverable may be written "
+                "at most once in a subtask attempt; after all are written, stop "
+                "calling tools and return your completion response."
+            )
     if (
         strategy in {
             RetryStrategy.RATE_LIMIT,
@@ -1054,8 +1061,8 @@ def _augment_retry_context_for_outputs(
 
 # Extracted task finalization orchestration
 
-def _finalize_task(self, task: Task) -> Task:
-    """Finalize task: set status, emit events."""
+def _apply_finalization_outcome(self, task: Task) -> None:
+    """Apply final task status, telemetry, and event emissions before persistence."""
     completed, total = task.progress
     run_validity_summary = self._refresh_run_validity_scorecard(task)
     blocking_remediation_failures: list[str] = []
@@ -1169,5 +1176,17 @@ def _finalize_task(self, task: Task) -> Task:
     self._emit_run_validity_scorecard(task)
     self._emit_telemetry_run_summary(task)
     self._export_validity_scorecard_json(task)
-    self._state.save(task)
+
+
+def _finalize_task(self, task: Task) -> Task:
+    """Finalize task: set status, emit events, and persist synchronously."""
+    _apply_finalization_outcome(self, task)
+    self._save_task_state_sync(task)
+    return task
+
+
+async def _finalize_task_async(self, task: Task) -> Task:
+    """Finalize task: set status, emit events, and persist without blocking the loop."""
+    _apply_finalization_outcome(self, task)
+    await self._save_task_state(task)
     return task

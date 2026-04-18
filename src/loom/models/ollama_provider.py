@@ -348,12 +348,14 @@ class OllamaProvider(ModelProvider):
         Ollama puts images in a separate 'images' field on the message,
         not in the content. Extracts image content blocks from tool results.
         """
-        if not self._capabilities.vision:
-            return messages
-
         result = []
         for msg in messages:
-            out = {"role": msg.get("role", "user"), "content": msg.get("content", "")}
+            out = {
+                "role": msg.get("role", "user"),
+                "content": self._build_user_message_text(msg)
+                if msg.get("role") == "user"
+                else msg.get("content", ""),
+            }
 
             # Copy tool_calls if present
             if msg.get("tool_calls"):
@@ -361,14 +363,78 @@ class OllamaProvider(ModelProvider):
             if msg.get("tool_call_id"):
                 out["tool_call_id"] = msg["tool_call_id"]
 
-            # Extract images from tool result content blocks
             if msg.get("role") == "tool":
                 images = self._extract_images_from_tool_result(msg.get("content", ""))
+                if images:
+                    out["images"] = images
+            elif msg.get("role") == "user" and self._capabilities.vision:
+                images = self._extract_images_from_user_message(msg)
                 if images:
                     out["images"] = images
 
             result.append(out)
         return result
+
+    @staticmethod
+    def _attachment_path_text(message: dict) -> str:
+        workspace_paths = message.get("workspace_paths")
+        if not isinstance(workspace_paths, list) or not workspace_paths:
+            return ""
+        lines = [
+            str(path or "").strip()
+            for path in workspace_paths
+            if str(path or "").strip()
+        ]
+        if not lines:
+            return ""
+        return "Attached workspace context:\n" + "\n".join(f"- {path}" for path in lines)
+
+    def _build_user_message_text(self, message: dict) -> str:
+        segments = [
+            str(message.get("content", "") or "").strip(),
+            self._attachment_path_text(message),
+        ]
+        blocks = message.get("content_blocks")
+        if isinstance(blocks, list):
+            for block in blocks:
+                if not isinstance(block, dict):
+                    continue
+                btype = str(block.get("type", "") or "").strip().lower()
+                if btype == "text":
+                    text = str(block.get("text", "") or "").strip()
+                    if text:
+                        segments.append(text)
+                    continue
+                fallback = str(block.get("text_fallback", "") or "").strip()
+                if fallback:
+                    segments.append(fallback)
+        return "\n\n".join(segment for segment in segments if segment)
+
+    def _extract_images_from_user_message(self, message: dict) -> list[str]:
+        blocks = message.get("content_blocks")
+        if not isinstance(blocks, list):
+            return []
+        images: list[str] = []
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            btype = str(block.get("type", "") or "").strip().lower()
+            if btype == "image":
+                source_path = str(block.get("source_path", "") or "").strip()
+                if source_path:
+                    data = encode_image_base64(Path(source_path))
+                    if data:
+                        images.append(data)
+            elif btype == "document":
+                source_path = str(block.get("source_path", "") or "").strip()
+                pr = block.get("page_range")
+                if source_path:
+                    page_images = pdf_pages_to_images(
+                        Path(source_path),
+                        tuple(pr) if isinstance(pr, list) else None,
+                    )
+                    images.extend(page_images)
+        return images
 
     def _extract_images_from_tool_result(self, content: str) -> list[str]:
         """Extract base64 images from a tool result JSON string."""

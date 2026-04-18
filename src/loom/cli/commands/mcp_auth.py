@@ -111,6 +111,23 @@ def _resolve_mcp_oauth_provider_config(
     )
 
 
+def _require_mcp_server_approval(view: MCPServerView) -> None:
+    if not bool(view.server.approval_required):
+        return
+    approval_state = str(view.server.approval_state or "").strip().lower()
+    if approval_state == "approved":
+        return
+    if approval_state == "rejected":
+        raise MCPOAuthFlowError(
+            "This workspace-defined remote MCP server is rejected. "
+            "Run `loom mcp approve <alias>` after re-checking provenance."
+        )
+    raise MCPOAuthFlowError(
+        "This workspace-defined remote MCP server needs approval first. "
+        "Run `loom mcp approve <alias>` before connecting an account."
+    )
+
+
 def attach_mcp_auth_commands(mcp_group: click.Group) -> click.Group:
     @mcp_group.group(name="auth")
     def mcp_auth() -> None:
@@ -221,6 +238,11 @@ def attach_mcp_auth_commands(mcp_group: click.Group) -> click.Group:
                 err=True,
             )
             sys.exit(1)
+        try:
+            _require_mcp_server_approval(view)
+        except MCPOAuthFlowError as e:
+            click.echo(f"MCP auth login failed: {e}", err=True)
+            sys.exit(1)
 
         manual_access_token = _resolve_access_token(
             access_token=access_token,
@@ -241,6 +263,7 @@ def attach_mcp_auth_commands(mcp_group: click.Group) -> click.Group:
             try:
                 path = upsert_mcp_oauth_token(
                     alias=clean_alias,
+                    server=view.server,
                     access_token=token,
                     refresh_token=refresh_token,
                     token_type=token_type,
@@ -357,6 +380,7 @@ def attach_mcp_auth_commands(mcp_group: click.Group) -> click.Group:
         try:
             path = upsert_mcp_oauth_token(
                 alias=clean_alias,
+                server=view.server,
                 access_token=access_token_value,
                 refresh_token=refresh_token_value,
                 token_type=token_type_value,
@@ -414,6 +438,7 @@ def attach_mcp_auth_commands(mcp_group: click.Group) -> click.Group:
         for view in selected:
             state = oauth_state_for_alias(
                 view.alias,
+                server=view.server,
                 store_path=oauth_store_path,
             )
             payload.append(
@@ -457,11 +482,24 @@ def attach_mcp_auth_commands(mcp_group: click.Group) -> click.Group:
         default=None,
         help="Override OAuth token store path.",
     )
-    def mcp_auth_logout(alias: str, oauth_store_path: Path | None) -> None:
+    @click.pass_context
+    def mcp_auth_logout(
+        ctx: click.Context,
+        alias: str,
+        oauth_store_path: Path | None,
+    ) -> None:
         """Delete stored OAuth token for one MCP alias."""
         try:
             clean_alias = ensure_valid_alias(alias)
-            path = remove_mcp_oauth_token(clean_alias, store_path=oauth_store_path)
+            manager = _mcp_manager(ctx)
+            view = manager.get_view(clean_alias)
+            if view is None:
+                raise MCPConfigManagerError(f"MCP server not found: {clean_alias}")
+            path = remove_mcp_oauth_token(
+                clean_alias,
+                server=view.server,
+                store_path=oauth_store_path,
+            )
         except (MCPConfigManagerError, MCPOAuthStoreError) as e:
             click.echo(f"MCP auth logout failed: {e}", err=True)
             sys.exit(1)
@@ -528,6 +566,11 @@ def attach_mcp_auth_commands(mcp_group: click.Group) -> click.Group:
         if view is None:
             click.echo(f"MCP server not found: {clean_alias}", err=True)
             sys.exit(1)
+        try:
+            _require_mcp_server_approval(view)
+        except MCPOAuthFlowError as e:
+            click.echo(f"MCP auth refresh failed: {e}", err=True)
+            sys.exit(1)
 
         token = _resolve_access_token(
             access_token=access_token,
@@ -541,6 +584,7 @@ def attach_mcp_auth_commands(mcp_group: click.Group) -> click.Group:
             try:
                 path = upsert_mcp_oauth_token(
                     alias=clean_alias,
+                    server=view.server,
                     access_token=token,
                     refresh_token=refresh_token,
                     token_type=token_type,
@@ -557,6 +601,7 @@ def attach_mcp_auth_commands(mcp_group: click.Group) -> click.Group:
 
         refreshed = refresh_mcp_oauth_token(
             clean_alias,
+            server=view.server,
             store_path=oauth_store_path,
             token_endpoint=token_url,
             client_id=client_id,

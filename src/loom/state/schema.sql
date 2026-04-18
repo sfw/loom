@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     plan TEXT,                                   -- JSON serialized plan
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    state_snapshot_updated_at TEXT,
     completed_at TEXT,
     approval_mode TEXT NOT NULL DEFAULT 'auto',
     callback_url TEXT,
@@ -74,6 +75,55 @@ CREATE TABLE IF NOT EXISTS learned_patterns (
 CREATE INDEX IF NOT EXISTS idx_patterns_type ON learned_patterns(pattern_type);
 CREATE INDEX IF NOT EXISTS idx_patterns_key ON learned_patterns(pattern_key);
 
+-- Workspace registry and workspace-local metadata
+CREATE TABLE IF NOT EXISTS workspaces (
+    id TEXT PRIMARY KEY,
+    canonical_path TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    workspace_type TEXT NOT NULL DEFAULT 'local',
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    last_opened_at TEXT,
+    is_archived INTEGER NOT NULL DEFAULT 0,
+    metadata TEXT NOT NULL DEFAULT '{}',          -- JSON
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_workspaces_path ON workspaces(canonical_path);
+CREATE INDEX IF NOT EXISTS idx_workspaces_archived_order
+    ON workspaces(is_archived, sort_order, display_name);
+
+CREATE TABLE IF NOT EXISTS workspace_settings (
+    workspace_id TEXT PRIMARY KEY,
+    settings_json TEXT NOT NULL DEFAULT '{}',     -- JSON
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (workspace_id) REFERENCES workspaces(id)
+);
+
+CREATE TABLE IF NOT EXISTS search_provider_state (
+    provider TEXT PRIMARY KEY,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    priority INTEGER NOT NULL DEFAULT 0,
+    min_interval_seconds REAL NOT NULL DEFAULT 0,
+    next_allowed_at REAL NOT NULL DEFAULT 0,
+    cooldown_until REAL NOT NULL DEFAULT 0,
+    lease_owner TEXT NOT NULL DEFAULT '',
+    lease_expires_at REAL NOT NULL DEFAULT 0,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    soft_block_count INTEGER NOT NULL DEFAULT 0,
+    last_status_code INTEGER,
+    last_started_at REAL NOT NULL DEFAULT 0,
+    last_finished_at REAL NOT NULL DEFAULT 0,
+    last_success_at REAL NOT NULL DEFAULT 0,
+    updated_at REAL NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_search_provider_enabled_priority
+    ON search_provider_state(enabled, priority DESC, provider);
+CREATE INDEX IF NOT EXISTS idx_search_provider_retry_windows
+    ON search_provider_state(cooldown_until, next_allowed_at, lease_expires_at);
+
 -- Cowork sessions
 CREATE TABLE IF NOT EXISTS cowork_sessions (
     id TEXT PRIMARY KEY,
@@ -85,6 +135,9 @@ CREATE TABLE IF NOT EXISTS cowork_sessions (
     total_tokens INTEGER DEFAULT 0,
     turn_count INTEGER DEFAULT 0,
     session_state TEXT,                              -- JSON: structured session state
+    session_state_through_turn INTEGER NOT NULL DEFAULT 0,
+    chat_journal_through_turn INTEGER NOT NULL DEFAULT 0,
+    chat_journal_through_seq INTEGER NOT NULL DEFAULT 0,
     is_active INTEGER DEFAULT 1
 );
 
@@ -95,6 +148,7 @@ CREATE TABLE IF NOT EXISTS conversation_turns (
     turn_number INTEGER NOT NULL,
     role TEXT NOT NULL,                              -- user | assistant | tool | system
     content TEXT,                                    -- message text (verbatim, no truncation)
+    metadata TEXT,                                   -- JSON: user attachment/context metadata
     tool_calls TEXT,                                 -- JSON array of tool calls (nullable)
     tool_call_id TEXT,                               -- for role=tool, the call this responds to
     tool_name TEXT,                                  -- for role=tool, which tool was called
@@ -125,6 +179,20 @@ CREATE INDEX IF NOT EXISTS idx_cce_session_created
     ON cowork_chat_events(session_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_cce_session_id
     ON cowork_chat_events(session_id, id);
+
+CREATE TABLE IF NOT EXISTS conversation_run_links (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,                         -- phase-0/1 API run id (task id)
+    link_type TEXT NOT NULL DEFAULT 'origin',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (session_id) REFERENCES cowork_sessions(id),
+    FOREIGN KEY (run_id) REFERENCES tasks(id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_crl_session_run_type
+    ON conversation_run_links(session_id, run_id, link_type);
+CREATE INDEX IF NOT EXISTS idx_crl_run ON conversation_run_links(run_id);
 
 -- Typed cowork memory index (marker-oriented conversation memory)
 CREATE TABLE IF NOT EXISTS cowork_memory_entries (

@@ -17,8 +17,17 @@ from click.testing import CliRunner
 
 from loom import __version__
 from loom.__main__ import cli
-from loom.config import Config, ProcessConfig
+from loom.auth.config import AuthConfig, MergedAuthConfig
+from loom.auth.resources import (
+    AuthBinding,
+    AuthResource,
+    AuthResourcesStore,
+    write_workspace_auth_resources,
+)
+from loom.config import Config, MCPConfig, ProcessConfig
+from loom.mcp.config import MergedMCPConfig
 from loom.processes.testing import ProcessCaseResult
+from loom.runtime.capabilities import OptionalAddonStatus
 
 
 @contextmanager
@@ -57,8 +66,84 @@ def _oauth_token_server(*, status_code: int = 200, payload: dict | None = None):
         thread.join(timeout=1.0)
 
 
+def _patch_fake_mcp_secret_resolver(monkeypatch) -> dict[str, str]:
+    import loom.integrations.mcp.oauth as mcp_oauth_mod
+
+    stored: dict[str, str] = {}
+
+    class _FakeSecretResolver:
+        def validate_writable(self, _secret_ref: str) -> None:
+            return
+
+        def store(self, secret_ref: str, secret_value: str) -> None:
+            stored[secret_ref] = secret_value
+
+        def resolve(self, secret_ref: str) -> str:
+            return stored.get(secret_ref, "")
+
+    monkeypatch.setattr(mcp_oauth_mod, "SecretResolver", _FakeSecretResolver)
+    return stored
+
+
 class TestCLI:
     """Test CLI commands."""
+
+    @staticmethod
+    def _patch_doctor_side_effects(monkeypatch, tmp_path: Path) -> None:
+        monkeypatch.setattr(
+            "loom.auth.config.load_merged_auth_config",
+            lambda **_kwargs: MergedAuthConfig(
+                config=AuthConfig(),
+                user_path=tmp_path / "auth.toml",
+                explicit_path=None,
+                workspace_defaults={},
+                workspace_defaults_path=tmp_path / ".loom" / "auth.defaults.toml",
+            ),
+        )
+        monkeypatch.setattr(
+            "loom.mcp.config.load_merged_mcp_config",
+            lambda **_kwargs: MergedMCPConfig(
+                config=MCPConfig(servers={}),
+                sources={},
+                explicit_path=None,
+                workspace_path=tmp_path / ".loom" / "mcp.toml",
+                user_path=tmp_path / "mcp.toml",
+                legacy_config_path=None,
+            ),
+        )
+
+    @staticmethod
+    def _doctor_statuses() -> list[OptionalAddonStatus]:
+        return [
+            OptionalAddonStatus(
+                key="browser",
+                label="Browser Addon",
+                installed=False,
+                required_for="Full JS-capable browser_session execution",
+                install_hint="uv sync --extra browser",
+                detail="Playwright package is not installed.",
+            ),
+            OptionalAddonStatus(
+                key="treesitter",
+                label="Tree-sitter Addon",
+                installed=True,
+                required_for=(
+                    "Structural code analysis and structured edit_file matching"
+                ),
+                install_hint="uv sync --extra treesitter",
+                detail="tree-sitter-language-pack importable.",
+            ),
+            OptionalAddonStatus(
+                key="mcp",
+                label="MCP Addon",
+                installed=False,
+                required_for=(
+                    "MCP-backed tool discovery and external MCP server integrations"
+                ),
+                install_hint="uv sync --extra mcp",
+                detail="MCP package is not installed.",
+            ),
+        ]
 
     def test_help(self):
         runner = CliRunner()
@@ -127,6 +212,190 @@ class TestCLI:
         assert "doctor" in result.output
         assert "backup" in result.output
 
+    def test_doctor_reports_runtime_sections(self, monkeypatch, tmp_path: Path) -> None:
+        self._patch_doctor_side_effects(monkeypatch, tmp_path)
+        cfg_path = tmp_path / "loom.toml"
+        db_path = tmp_path / "loom.db"
+        cfg_path.write_text(
+            "[models.local]\n"
+            "provider = \"ollama\"\n"
+            "model = \"llama3\"\n"
+            "roles = [\"executor\", \"planner\", \"verifier\"]\n"
+            "[memory]\n"
+            f"database_path = \"{db_path}\"\n",
+            encoding="utf-8",
+        )
+        statuses = self._doctor_statuses()
+        monkeypatch.setattr(
+            "loom.cli.commands.root.optional_addon_statuses",
+            lambda: statuses,
+        )
+        monkeypatch.setattr(
+            "loom.cli.commands.root.optional_addon_status_by_key",
+            lambda key: next((status for status in statuses if status.key == key), None),
+        )
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            ["--config", str(cfg_path), "doctor"],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0
+        assert "Runtime doctor" in result.output
+        assert "Environment" in result.output
+        assert "Configuration" in result.output
+        assert "Persistence" in result.output
+        assert "Auth" in result.output
+        assert "MCP" in result.output
+        assert "Optional Addons" in result.output
+        assert "Model role executor:" in result.output
+        assert "Database path:" in result.output
+        assert "Browser Addon (browser): missing" in result.output
+        assert "Tree-sitter Addon (treesitter): installed" in result.output
+        assert "Doctor passed" in result.output
+
+    def test_doctor_reports_tool_availability_details(
+        self,
+        monkeypatch,
+        tmp_path: Path,
+    ) -> None:
+        self._patch_doctor_side_effects(monkeypatch, tmp_path)
+        cfg_path = tmp_path / "loom.toml"
+        db_path = tmp_path / "loom.db"
+        cfg_path.write_text(
+            "[models.local]\n"
+            "provider = \"ollama\"\n"
+            "model = \"llama3\"\n"
+            "roles = [\"executor\", \"planner\", \"verifier\"]\n"
+            "[memory]\n"
+            f"database_path = \"{db_path}\"\n",
+            encoding="utf-8",
+        )
+        statuses = self._doctor_statuses()
+        monkeypatch.setattr(
+            "loom.cli.commands.root.optional_addon_statuses",
+            lambda: statuses,
+        )
+        monkeypatch.setattr(
+            "loom.cli.commands.root.optional_addon_status_by_key",
+            lambda key: next((status for status in statuses if status.key == key), None),
+        )
+
+        class _Registry:
+            def availability_rows(self, **_kwargs):
+                return [
+                    {
+                        "name": "shell_execute",
+                        "state": "available",
+                        "runnable": True,
+                        "reasons": [],
+                    },
+                    {
+                        "name": "openai_codex",
+                        "state": "unavailable",
+                        "runnable": False,
+                        "reasons": [
+                            {"message": "Binary not found: codex"},
+                        ],
+                    },
+                ]
+
+        monkeypatch.setattr(
+            "loom.cli.commands.root.create_default_registry",
+            lambda *_args, **_kwargs: _Registry(),
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            ["--config", str(cfg_path), "doctor"],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        assert "Tool Availability" in result.output
+        assert "Registered tools: 2" in result.output
+        assert "Runnable tools: 1" in result.output
+        assert "Unavailable tools: 1" in result.output
+        assert "openai_codex: Binary not found: codex" in result.output
+
+    def test_doctor_requires_installed_addon(self, monkeypatch, tmp_path: Path) -> None:
+        self._patch_doctor_side_effects(monkeypatch, tmp_path)
+        status = OptionalAddonStatus(
+            key="browser",
+            label="Browser Addon",
+            installed=False,
+            required_for="Full JS-capable browser_session execution",
+            install_hint="uv sync --extra browser",
+            detail="Playwright package is not installed.",
+        )
+        monkeypatch.setattr(
+            "loom.cli.commands.root.optional_addon_statuses",
+            lambda: [status],
+        )
+        monkeypatch.setattr(
+            "loom.cli.commands.root.optional_addon_status_by_key",
+            lambda key: status if key == "browser" else None,
+        )
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            ["doctor", "--require-addon", "browser"],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 1
+        assert "Missing required addon(s): browser" in result.output
+        assert "Doctor failed" in result.output
+
+    def test_doctor_rejects_unknown_addon_key(self, monkeypatch, tmp_path: Path) -> None:
+        self._patch_doctor_side_effects(monkeypatch, tmp_path)
+        monkeypatch.setattr(
+            "loom.cli.commands.root.optional_addon_statuses",
+            lambda: [],
+        )
+        monkeypatch.setattr(
+            "loom.cli.commands.root.optional_addon_status_by_key",
+            lambda _key: None,
+        )
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            ["doctor", "--require-addon", "unknown-addon"],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 1
+        assert "Unknown addon key: unknown-addon" in result.output
+        assert "Doctor failed" in result.output
+
+    def test_doctor_reports_invalid_config_without_preemptive_exit(
+        self,
+        monkeypatch,
+        tmp_path: Path,
+    ) -> None:
+        self._patch_doctor_side_effects(monkeypatch, tmp_path)
+        monkeypatch.setattr(
+            "loom.cli.commands.root.optional_addon_statuses",
+            lambda: [],
+        )
+        monkeypatch.setattr(
+            "loom.cli.commands.root.optional_addon_status_by_key",
+            lambda _key: None,
+        )
+        cfg_path = tmp_path / "broken.toml"
+        cfg_path.write_text("[models.bad\nprovider = 'ollama'\n", encoding="utf-8")
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            ["--config", str(cfg_path), "doctor"],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 1
+        assert "Configuration" in result.output
+        assert "Status: invalid" in result.output
+        assert "Invalid Loom config" in result.output
+        assert "Doctor failed" in result.output
+
     def test_db_status_missing_db(self, tmp_path):
         db_path = tmp_path / "loom.db"
         cfg_path = tmp_path / "loom.toml"
@@ -176,6 +445,61 @@ class TestCLI:
         )
         assert doctor_result.exit_code == 0
         assert "Doctor passed" in doctor_result.output
+
+    def test_db_doctor_warns_on_legacy_uncovered_chat_journal(self, tmp_path):
+        from loom.state.memory import Database
+
+        db_path = tmp_path / "loom.db"
+        database = Database(db_path)
+        asyncio.run(database.initialize())
+
+        async def _seed() -> None:
+            await database.execute(
+                """
+                INSERT INTO cowork_sessions (
+                    id,
+                    workspace_path,
+                    model_name,
+                    started_at,
+                    last_active_at
+                ) VALUES (?, ?, ?, datetime('now'), datetime('now'))
+                """,
+                ("sess-1", "/tmp/ws", "mock"),
+            )
+            await database.execute(
+                """
+                INSERT INTO conversation_turns (session_id, turn_number, role, content, token_count)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                ("sess-1", 1, "user", "hello", 1),
+            )
+            await database.execute(
+                """
+                INSERT INTO cowork_chat_events (session_id, seq, event_type, payload)
+                VALUES (?, ?, ?, ?)
+                """,
+                ("sess-1", 1, "assistant_text", "{\"text\":\"legacy\"}"),
+            )
+            await database.close()
+
+        asyncio.run(_seed())
+
+        cfg_path = tmp_path / "loom.toml"
+        cfg_path.write_text(
+            "[memory]\n"
+            f"database_path = \"{db_path}\"\n",
+            encoding="utf-8",
+        )
+        runner = CliRunner()
+
+        doctor_result = runner.invoke(
+            cli,
+            ["--config", str(cfg_path), "db", "doctor"],
+            catch_exceptions=False,
+        )
+        assert doctor_result.exit_code == 0
+        assert "Doctor passed with warnings" in doctor_result.output
+        assert "coverage markers" in doctor_result.output
 
     def test_db_migrate_bootstraps_database(self, tmp_path):
         db_path = tmp_path / "loom.db"
@@ -593,6 +917,72 @@ token_ref = "keychain://loom/notion/notion_marketing/tokens"
         )
         assert check_result.exit_code == 0
         assert "Auth config is valid." in check_result.output
+
+    def test_auth_explain_surfaces_linked_resources_and_next_action(self, tmp_path):
+        cfg = tmp_path / "loom.toml"
+        cfg.write_text("[server]\nport = 9000\n")
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        auth_cfg = tmp_path / "auth.toml"
+        auth_cfg.write_text(
+            """
+[auth.profiles.notion_marketing]
+provider = "notion"
+mode = "oauth2_pkce"
+account_label = "Marketing"
+mcp_server = "notion"
+token_ref = "keychain://loom/notion/notion_marketing/tokens"
+status = "draft"
+"""
+        )
+        loom_dir = workspace / ".loom"
+        loom_dir.mkdir()
+        write_workspace_auth_resources(
+            loom_dir / "auth.resources.toml",
+            AuthResourcesStore(
+                resources={
+                    "resource-mcp-notion": AuthResource(
+                        resource_id="resource-mcp-notion",
+                        resource_kind="mcp",
+                        resource_key="notion",
+                        display_name="MCP: notion",
+                        provider="notion",
+                        source="mcp",
+                        status="active",
+                    ),
+                },
+                bindings={
+                    "binding-notion": AuthBinding(
+                        binding_id="binding-notion",
+                        resource_id="resource-mcp-notion",
+                        profile_id="notion_marketing",
+                        status="active",
+                    ),
+                },
+                workspace_defaults={"resource-mcp-notion": "notion_marketing"},
+            ),
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--auth-config",
+                str(auth_cfg),
+                "--workspace",
+                str(workspace),
+                "auth",
+                "explain",
+                "notion_marketing",
+            ],
+        )
+        assert result.exit_code == 0
+        assert "Status: draft" in result.output
+        assert "Linked MCP aliases: notion" in result.output
+        assert "Linked resources: mcp:notion" in result.output
+        assert "Connect or complete this draft account before using it." in result.output
 
     def test_auth_check_with_explicit_config_ignores_user_overlay_profiles(self, tmp_path):
         cfg = tmp_path / "loom.toml"
@@ -1922,7 +2312,8 @@ for line in sys.stdin:
         assert payload["tool_count"] == 2
         assert payload["tools"] == ["echo", "ping"]
 
-    def test_mcp_auth_login_status_logout(self, tmp_path):
+    def test_mcp_auth_login_status_logout(self, tmp_path, monkeypatch):
+        secret_store = _patch_fake_mcp_secret_resolver(monkeypatch)
         cfg = tmp_path / "loom.toml"
         cfg.write_text("[server]\nport = 9000\n")
         mcp_cfg = tmp_path / "mcp.toml"
@@ -1962,6 +2353,10 @@ scopes = ["read:content"]
         )
         assert login_result.exit_code == 0
         assert oauth_store.exists()
+        saved = json.loads(oauth_store.read_text(encoding="utf-8"))
+        server_fingerprint = saved["alias_bindings"]["remote_demo"]["server_fingerprint"]
+        token_ref = saved["servers"][server_fingerprint]["token_ref"]
+        assert json.loads(secret_store[token_ref])["access_token"] == "token-123"
 
         status_result = runner.invoke(
             cli,
@@ -2000,6 +2395,7 @@ scopes = ["read:content"]
             ],
         )
         assert logout_result.exit_code == 0
+        assert secret_store[token_ref] == ""
 
         status_after_logout = runner.invoke(
             cli,
@@ -2021,7 +2417,8 @@ scopes = ["read:content"]
         after_payload = json.loads(status_after_logout.output)
         assert after_payload["aliases"][0]["state"] == "missing"
 
-    def test_mcp_auth_login_browser_flow_with_manual_callback_code(self, tmp_path):
+    def test_mcp_auth_login_browser_flow_with_manual_callback_code(self, tmp_path, monkeypatch):
+        secret_store = _patch_fake_mcp_secret_resolver(monkeypatch)
         cfg = tmp_path / "loom.toml"
         cfg.write_text("[server]\nport = 9000\n")
         mcp_cfg = tmp_path / "mcp.toml"
@@ -2074,7 +2471,8 @@ scopes = ["read:content"]
         assert result.exit_code == 0
         assert oauth_store.exists()
         raw = json.loads(oauth_store.read_text(encoding="utf-8"))
-        alias_payload = raw["aliases"]["remote_demo"]
+        server_fingerprint = raw["alias_bindings"]["remote_demo"]["server_fingerprint"]
+        alias_payload = json.loads(secret_store[raw["servers"][server_fingerprint]["token_ref"]])
         assert alias_payload["access_token"] == "browser-token"
         assert alias_payload["refresh_token"] == "refresh-browser"
         assert alias_payload["token_endpoint"] == token_url
@@ -2135,7 +2533,9 @@ enabled = true
     def test_mcp_auth_login_manual_token_still_works_when_browser_flag_disabled(
         self,
         tmp_path,
+        monkeypatch,
     ):
+        secret_store = _patch_fake_mcp_secret_resolver(monkeypatch)
         cfg = tmp_path / "loom.toml"
         cfg.write_text(
             """
@@ -2180,7 +2580,9 @@ enabled = true
         )
         assert result.exit_code == 0
         payload = json.loads(oauth_store.read_text(encoding="utf-8"))
-        assert payload["aliases"]["remote_demo"]["access_token"] == "manual-token-123"
+        server_fingerprint = payload["alias_bindings"]["remote_demo"]["server_fingerprint"]
+        token_ref = payload["servers"][server_fingerprint]["token_ref"]
+        assert json.loads(secret_store[token_ref])["access_token"] == "manual-token-123"
 
     def test_mcp_auth_status_redacts_stored_failure_reason(self, tmp_path):
         cfg = tmp_path / "loom.toml"
@@ -2233,7 +2635,12 @@ enabled = true
         assert "super-secret" not in result.output
         assert "<redacted>" in result.output
 
-    def test_mcp_auth_refresh_uses_refresh_token_grant_when_no_access_token(self, tmp_path):
+    def test_mcp_auth_refresh_uses_refresh_token_grant_when_no_access_token(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        secret_store = _patch_fake_mcp_secret_resolver(monkeypatch)
         cfg = tmp_path / "loom.toml"
         cfg.write_text("[server]\nport = 9000\n")
         mcp_cfg = tmp_path / "mcp.toml"
@@ -2295,12 +2702,165 @@ enabled = true
             )
         assert result.exit_code == 0
         saved = json.loads(oauth_store.read_text(encoding="utf-8"))
-        payload = saved["aliases"]["remote_demo"]
+        server_fingerprint = saved["alias_bindings"]["remote_demo"]["server_fingerprint"]
+        payload = json.loads(secret_store[saved["servers"][server_fingerprint]["token_ref"]])
         assert payload["access_token"] == "refreshed-token"
         assert payload["refresh_token"] == "refresh-2"
         assert payload["obtained_via"] == "refresh_token"
         assert captured[0]["grant_type"] == "refresh_token"
         assert captured[0]["refresh_token"] == "refresh-1"
+
+    def test_mcp_show_and_approve_workspace_remote_server(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        cfg = tmp_path / "loom.toml"
+        cfg.write_text("[server]\nport = 9000\n")
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        workspace_mcp = workspace / ".loom" / "mcp.toml"
+        workspace_mcp.parent.mkdir(parents=True)
+        workspace_mcp.write_text(
+            """
+[mcp.servers.remote_demo]
+type = "remote"
+url = "https://example.com/mcp"
+enabled = true
+
+[mcp.servers.remote_demo.oauth]
+enabled = true
+"""
+        )
+        runner = CliRunner()
+
+        before = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--workspace",
+                str(workspace),
+                "mcp",
+                "show",
+                "remote_demo",
+            ],
+        )
+        assert before.exit_code == 0
+        assert "Approval: pending" in before.output
+
+        approve = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--workspace",
+                str(workspace),
+                "mcp",
+                "approve",
+                "remote_demo",
+            ],
+        )
+        assert approve.exit_code == 0
+        assert "Approved MCP server 'remote_demo'" in approve.output
+
+        after = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--workspace",
+                str(workspace),
+                "mcp",
+                "show",
+                "remote_demo",
+            ],
+        )
+        assert after.exit_code == 0
+        assert "Approval: approved" in after.output
+
+    def test_mcp_explain_surfaces_pending_approval_next_action(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        cfg = tmp_path / "loom.toml"
+        cfg.write_text("[server]\nport = 9000\n")
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        workspace_mcp = workspace / ".loom" / "mcp.toml"
+        workspace_mcp.parent.mkdir(parents=True)
+        workspace_mcp.write_text(
+            """
+[mcp.servers.remote_demo]
+type = "remote"
+url = "https://example.com/mcp"
+enabled = true
+
+[mcp.servers.remote_demo.oauth]
+enabled = true
+"""
+        )
+        runner = CliRunner()
+
+        result = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--workspace",
+                str(workspace),
+                "mcp",
+                "explain",
+                "remote_demo",
+            ],
+        )
+        assert result.exit_code == 0
+        assert "Runtime: pending approval" in result.output
+        assert (
+            "Why: This workspace-defined remote server needs approval before Loom will use it."
+            in result.output
+        )
+        assert "Run `loom mcp approve remote_demo` to trust this server." in result.output
+
+    def test_mcp_auth_login_requires_approval_for_workspace_remote_server(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        cfg = tmp_path / "loom.toml"
+        cfg.write_text("[server]\nport = 9000\n")
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        workspace_mcp = workspace / ".loom" / "mcp.toml"
+        workspace_mcp.parent.mkdir(parents=True)
+        workspace_mcp.write_text(
+            """
+[mcp.servers.remote_demo]
+type = "remote"
+url = "https://example.com/mcp"
+enabled = true
+
+[mcp.servers.remote_demo.oauth]
+enabled = true
+"""
+        )
+        runner = CliRunner()
+
+        result = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(cfg),
+                "--workspace",
+                str(workspace),
+                "mcp",
+                "auth",
+                "login",
+                "remote_demo",
+                "--manual-token",
+                "--access-token",
+                "token-123",
+            ],
+        )
+
+        assert result.exit_code == 1
+        assert "needs approval first" in result.output
 
     def test_mcp_status_command_reports_runtime(self, tmp_path):
         cfg = tmp_path / "loom.toml"

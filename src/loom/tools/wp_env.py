@@ -2,10 +2,20 @@
 
 from __future__ import annotations
 
-import shutil
 from pathlib import Path
 
-from loom.tools.registry import Tool, ToolContext, ToolResult
+from loom.tools.registry import (
+    Tool,
+    ToolAvailabilityReason,
+    ToolAvailabilityStatus,
+    ToolContext,
+    ToolResult,
+)
+from loom.tools.tooling_common.binary_resolution import (
+    configured_binary_override,
+    normalize_binary_overrides,
+    resolve_binary,
+)
 from loom.tools.tooling_common.command_runner import constrained_env, run_command
 
 
@@ -41,8 +51,14 @@ class WpEnvTool(Tool):
         "required": ["operation"],
     }
 
-    def __init__(self, *, enabled: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        enabled: bool = True,
+        binary_overrides: dict[str, str] | None = None,
+    ) -> None:
         self._enabled = bool(enabled)
+        self._binary_overrides = normalize_binary_overrides(binary_overrides or {})
 
     @property
     def is_mutating(self) -> bool:
@@ -51,6 +67,56 @@ class WpEnvTool(Tool):
     @property
     def timeout_seconds(self) -> int:
         return 240
+
+    def _resolve_npx_binary(self):
+        return resolve_binary(
+            "npx",
+            override=configured_binary_override(
+                self._binary_overrides,
+                self.name,
+                "npx",
+            ),
+        )
+
+    def availability(
+        self,
+        *,
+        execution_surface: object = "tui",
+    ) -> ToolAvailabilityStatus:
+        base = super().availability(execution_surface=execution_surface)
+        if not base.runnable:
+            return base
+        if not self._enabled:
+            return ToolAvailabilityStatus(
+                state="unavailable",
+                reasons=(
+                    ToolAvailabilityReason(
+                        code="feature_disabled",
+                        message="WordPress tools are disabled by configuration.",
+                    ),
+                ),
+            )
+        resolution = self._resolve_npx_binary()
+        if resolution.found:
+            return ToolAvailabilityStatus(
+                state="available",
+                metadata={
+                    "binary": "npx",
+                    "binary_path": resolution.path,
+                    "binary_source": resolution.source,
+                },
+            )
+        return ToolAvailabilityStatus(
+            state="unavailable",
+            reasons=(
+                ToolAvailabilityReason(
+                    code=resolution.error_code or "binary_not_found",
+                    message=resolution.message or "Binary not found: npx",
+                    metadata=dict(resolution.metadata or {}),
+                ),
+            ),
+            metadata={"binary": "npx"},
+        )
 
     async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
         if not self._enabled:
@@ -74,9 +140,14 @@ class WpEnvTool(Tool):
                 "wp_env destroy requires confirm_high_risk=true.",
             )
 
-        npx = shutil.which("npx")
+        resolution = self._resolve_npx_binary()
+        npx = resolution.path
         if not npx:
-            return self._error("binary_not_found", "Binary not found: npx")
+            return self._error(
+                resolution.error_code or "binary_not_found",
+                resolution.message or "Binary not found: npx",
+                extra_data={"reason_code": "tool_runtime_capability_unavailable"},
+            )
 
         argv = [npx, "-y", "@wordpress/env", operation]
         if operation == "run":
@@ -132,10 +203,13 @@ class WpEnvTool(Tool):
         )
 
     @staticmethod
-    def _error(code: str, message: str) -> ToolResult:
+    def _error(code: str, message: str, *, extra_data: dict | None = None) -> ToolResult:
+        data = {"error_code": code}
+        if isinstance(extra_data, dict):
+            data.update(extra_data)
         return ToolResult(
             success=False,
             output="",
             error=message,
-            data={"error_code": code},
+            data=data,
         )

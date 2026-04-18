@@ -107,6 +107,12 @@ class ConversationRecallTool(Tool):
         "required": ["action"],
     }
 
+    @property
+    def timeout_seconds(self) -> int:
+        # Larger recall slices can trigger semantic compaction, so the default
+        # 30s tool timeout is too aggressive for legitimate requests.
+        return 90
+
     def __init__(
         self,
         store: ConversationStore | None = None,

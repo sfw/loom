@@ -290,7 +290,7 @@ def _validate_profile(profile: AuthProfile, *, path: Path | None = None) -> None
     ):
         raise AuthConfigError(
             f"Auth profile '{profile_id}'{location} token_ref must not "
-            "point to MCP alias token store."
+            "point to the legacy MCP alias token store."
         )
 
     if status == "draft":

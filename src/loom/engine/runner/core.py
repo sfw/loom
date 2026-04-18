@@ -12,6 +12,7 @@ import hashlib
 import json
 import logging
 import time
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,10 @@ from loom.events.types import (
 from loom.models.base import ModelResponse
 from loom.models.router import ModelRouter, ResponseValidator
 from loom.prompts.assembler import PromptAssembler
+from loom.read_scope import (
+    resolve_read_path_map_from_metadata,
+    resolve_read_roots_from_metadata,
+)
 from loom.recovery.questions import QuestionAnswer, QuestionManager, QuestionRequest
 from loom.state.memory import MemoryEntry, MemoryManager
 from loom.state.task_state import Subtask, Task, TaskStateManager, TaskStatus
@@ -191,6 +196,7 @@ class SubtaskRunner:
         config: Config,
         event_bus: EventBus | None = None,
         question_manager: QuestionManager | None = None,
+        task_snapshot_writer: Callable[[Task], Awaitable[None]] | None = None,
     ):
         self._router = model_router
         self._tools = tool_registry
@@ -202,6 +208,7 @@ class SubtaskRunner:
         self._validator = ResponseValidator()
         self._event_bus = event_bus
         self._question_manager = question_manager
+        self._task_snapshot_writer = task_snapshot_writer
         settings = RunnerSettings.from_config(config, runner_defaults=self)
         self._max_tool_iterations = settings.max_tool_iterations
         self._max_subtask_wall_clock_seconds = settings.max_subtask_wall_clock_seconds
@@ -398,7 +405,13 @@ class SubtaskRunner:
                 return "tui"
         return normalize_tool_execution_surface(raw_surface, default="api")
 
-    def _set_waiting_for_user_input(
+    async def _persist_task_snapshot(self, task: Task) -> None:
+        if self._task_snapshot_writer is not None:
+            await self._task_snapshot_writer(task)
+            return
+        await asyncio.to_thread(self._state.save, task)
+
+    async def _set_waiting_for_user_input(
         self,
         *,
         task: Task,
@@ -415,7 +428,7 @@ class SubtaskRunner:
             "requested_at": datetime.now().isoformat(),
         }
         try:
-            self._state.save(task)
+            await self._persist_task_snapshot(task)
         except Exception:
             logger.debug(
                 "Failed to persist awaiting_user_input marker for %s/%s",
@@ -424,7 +437,7 @@ class SubtaskRunner:
                 exc_info=True,
             )
 
-    def _clear_waiting_for_user_input(
+    async def _clear_waiting_for_user_input(
         self,
         *,
         task: Task,
@@ -445,7 +458,7 @@ class SubtaskRunner:
         metadata.pop("awaiting_user_input", None)
         task.metadata = metadata
         try:
-            self._state.save(task)
+            await self._persist_task_snapshot(task)
         except Exception:
             logger.debug(
                 "Failed clearing awaiting_user_input marker for %s",
@@ -529,7 +542,7 @@ class SubtaskRunner:
                 subtask.id,
                 exc_info=True,
             )
-        self._record_task_clarification_decision(
+        await self._record_task_clarification_decision(
             task=task,
             subtask=subtask,
             request=request,
@@ -543,7 +556,7 @@ class SubtaskRunner:
             return value
         return f"{value[: max(0, limit - 1)].rstrip()}…"
 
-    def _record_task_clarification_decision(
+    async def _record_task_clarification_decision(
         self,
         *,
         task: Task,
@@ -577,7 +590,7 @@ class SubtaskRunner:
         metadata["clarification_history"] = history[-20:]
         task.metadata = metadata
         try:
-            self._state.save(task)
+            await self._persist_task_snapshot(task)
         except Exception:
             logger.debug(
                 "Failed persisting clarification decision to task state for %s/%s",
@@ -981,38 +994,17 @@ class SubtaskRunner:
     def _read_roots_for_task(task: Task, workspace: Path | None) -> list[Path]:
         """Resolve additional read-only roots for this task.
 
-        Only accepts roots that are ancestors of the task workspace so reads
-        can widen safely to parent trees without becoming arbitrary.
+        Accepts workspace ancestors and explicitly attached sibling directories
+        scoped under the source workspace root.
         """
-        if workspace is None:
-            return []
         metadata = task.metadata if isinstance(task.metadata, dict) else {}
-        raw_roots = metadata.get("read_roots", [])
-        if isinstance(raw_roots, str):
-            raw_roots = [raw_roots]
-        if not isinstance(raw_roots, list):
-            return []
+        return resolve_read_roots_from_metadata(workspace, metadata)
 
-        resolved_workspace = workspace.resolve()
-        roots: list[Path] = []
-        seen: set[Path] = set()
-        for raw in raw_roots:
-            try:
-                candidate = Path(str(raw)).expanduser().resolve()
-            except Exception:
-                continue
-            # Disallow filesystem-root grants.
-            if candidate == Path(candidate.anchor):
-                continue
-            try:
-                resolved_workspace.relative_to(candidate)
-            except ValueError:
-                continue
-            if candidate in seen:
-                continue
-            seen.add(candidate)
-            roots.append(candidate)
-        return roots
+    @staticmethod
+    def _read_path_map_for_task(task: Task, workspace: Path | None) -> dict[str, Path]:
+        """Resolve exact attached read paths for this task."""
+        metadata = task.metadata if isinstance(task.metadata, dict) else {}
+        return resolve_read_path_map_from_metadata(workspace, metadata)
 
     async def run(
         self,
@@ -1366,6 +1358,7 @@ class SubtaskRunner:
         allowed_output_prefixes: list[str],
         enforce_deliverable_paths: bool,
         edit_existing_only: bool,
+        already_touched_deliverables: set[str] | None = None,
     ) -> str | None:
         return runner_policy.validate_deliverable_write_policy(
             tool_name=tool_name,
@@ -1378,6 +1371,7 @@ class SubtaskRunner:
             allowed_output_prefixes=allowed_output_prefixes,
             enforce_deliverable_paths=enforce_deliverable_paths,
             edit_existing_only=edit_existing_only,
+            already_touched_deliverables=already_touched_deliverables,
             normalize_deliverable_paths=cls._normalize_deliverable_paths,
             target_paths_for_policy=cls._target_paths_for_policy,
             looks_like_deliverable_variant=cls._looks_like_deliverable_variant,

@@ -9,11 +9,15 @@ import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 import httpx
+
+from loom.auth.secrets import SecretResolutionError, SecretResolver
+from loom.config import MCPServerConfig
 
 
 class MCPOAuthStoreError(Exception):
@@ -78,6 +82,7 @@ _REDACT_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
 _REFRESH_ATTEMPT_LOCK = threading.RLock()
 _REFRESH_LAST_ATTEMPT: dict[tuple[str, str], float] = {}
 _DEFAULT_REFRESH_COOLDOWN_SECONDS = 30
+_MCP_OAUTH_STORE_VERSION = 2
 
 
 def default_mcp_oauth_store_path() -> Path:
@@ -133,8 +138,15 @@ def _atomic_write_text(path: Path, content: str) -> None:
 
 
 def _coerce_store_payload(raw: object) -> dict[str, Any]:
+    payload = {
+        "version": _MCP_OAUTH_STORE_VERSION,
+        "aliases": {},
+        "servers": {},
+        "alias_bindings": {},
+    }
     if not isinstance(raw, dict):
-        return {"aliases": {}}
+        return payload
+
     aliases_raw = raw.get("aliases", {})
     aliases: dict[str, dict[str, Any]] = {}
     if isinstance(aliases_raw, dict):
@@ -143,14 +155,74 @@ def _coerce_store_payload(raw: object) -> dict[str, Any]:
             if not alias or not isinstance(value, dict):
                 continue
             aliases[alias] = dict(value)
-    return {"aliases": aliases}
+    payload["aliases"] = aliases
+
+    servers_raw = raw.get("servers", {})
+    servers: dict[str, dict[str, Any]] = {}
+    if isinstance(servers_raw, dict):
+        for key, value in servers_raw.items():
+            server_fingerprint = str(key or "").strip()
+            if not server_fingerprint or not isinstance(value, dict):
+                continue
+            entry = dict(value)
+            token_ref = str(entry.get("token_ref", "") or "").strip()
+            aliases_for_server = [
+                str(item).strip()
+                for item in list(entry.get("aliases", []) or [])
+                if str(item).strip()
+            ]
+            sanitized: dict[str, Any] = {}
+            if token_ref:
+                sanitized["token_ref"] = token_ref
+            if aliases_for_server:
+                sanitized["aliases"] = list(dict.fromkeys(aliases_for_server))
+            for key_name in (
+                "credential_fingerprint",
+                "authorization_endpoint",
+                "token_endpoint",
+                "client_id",
+            ):
+                value_text = str(entry.get(key_name, "") or "").strip()
+                if value_text:
+                    sanitized[key_name] = value_text
+            for key_name in ("updated_at", "migrated_from_legacy_at"):
+                try:
+                    value_int = int(entry.get(key_name))
+                except (TypeError, ValueError):
+                    continue
+                if value_int > 0:
+                    sanitized[key_name] = value_int
+            if sanitized:
+                servers[server_fingerprint] = sanitized
+    payload["servers"] = servers
+
+    bindings_raw = raw.get("alias_bindings", {})
+    bindings: dict[str, dict[str, Any]] = {}
+    if isinstance(bindings_raw, dict):
+        for key, value in bindings_raw.items():
+            alias = str(key or "").strip()
+            if not alias or not isinstance(value, dict):
+                continue
+            server_fingerprint = str(value.get("server_fingerprint", "") or "").strip()
+            if not server_fingerprint:
+                continue
+            binding: dict[str, Any] = {"server_fingerprint": server_fingerprint}
+            try:
+                updated_at = int(value.get("updated_at"))
+            except (TypeError, ValueError):
+                updated_at = 0
+            if updated_at > 0:
+                binding["updated_at"] = updated_at
+            bindings[alias] = binding
+    payload["alias_bindings"] = bindings
+    return payload
 
 
 def load_mcp_oauth_store(path: Path | None = None) -> dict[str, Any]:
     """Load token store payload."""
     target = (path or default_mcp_oauth_store_path()).expanduser().resolve()
     if not target.exists():
-        return {"aliases": {}}
+        return _coerce_store_payload({})
     try:
         raw = json.loads(target.read_text(encoding="utf-8"))
     except json.JSONDecodeError as e:
@@ -177,10 +249,313 @@ def redact_oauth_error_text(value: object) -> str:
     return text
 
 
+def _canonical_remote_server_url(raw_url: str) -> str:
+    parsed = urlparse(str(raw_url or "").strip())
+    scheme = str(parsed.scheme or "").strip().lower()
+    hostname = str(parsed.hostname or "").strip().lower()
+    if not scheme or not hostname:
+        return str(raw_url or "").strip()
+    port = parsed.port
+    default_port = 443 if scheme == "https" else 80 if scheme == "http" else None
+    netloc = hostname
+    if port is not None and port != default_port:
+        netloc = f"{hostname}:{port}"
+    path = parsed.path or ""
+    if path != "/":
+        path = path.rstrip("/")
+    return urlunparse((scheme, netloc, path, "", parsed.query, ""))
+
+
+def fingerprint_mcp_server(server: MCPServerConfig | None) -> str:
+    """Return a stable credential-binding fingerprint for one MCP server config."""
+    if server is None:
+        return ""
+    payload = {
+        "type": str(server.type or "").strip().lower(),
+        "url": _canonical_remote_server_url(server.url),
+        "headers": [
+            [str(key).strip().lower(), str(value)]
+            for key, value in sorted(
+                (server.headers or {}).items(),
+                key=lambda item: str(item[0]).strip().lower(),
+            )
+            if str(key).strip()
+        ],
+        "oauth": {
+            "enabled": bool(getattr(server.oauth, "enabled", False)),
+            "scopes": sorted(
+                {
+                    str(scope).strip()
+                    for scope in list(getattr(server.oauth, "scopes", []) or [])
+                    if str(scope).strip()
+                }
+            ),
+        },
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return sha256(encoded).hexdigest()
+
+
+def _alias_fingerprint(alias: str) -> str:
+    encoded = json.dumps(
+        {"kind": "legacy_alias", "alias": str(alias or "").strip()},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return sha256(encoded).hexdigest()
+
+
+def _credential_fingerprint(
+    *,
+    server_fingerprint: str,
+    authorization_endpoint: str,
+    token_endpoint: str,
+    client_id: str,
+) -> str:
+    encoded = json.dumps(
+        {
+            "server_fingerprint": server_fingerprint,
+            "authorization_endpoint": str(authorization_endpoint or "").strip(),
+            "token_endpoint": str(token_endpoint or "").strip(),
+            "client_id": str(client_id or "").strip(),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return sha256(encoded).hexdigest()
+
+
+def _token_ref_for_server_fingerprint(server_fingerprint: str) -> str:
+    return f"keychain://loom/mcp/oauth/{server_fingerprint}/tokens"
+
+
+def _wrap_secret_storage_error(error: SecretResolutionError) -> MCPOAuthStoreError:
+    return MCPOAuthStoreError(
+        "MCP OAuth token persistence requires writable keychain storage. "
+        f"{error}"
+    )
+
+
+def _server_entry_for_alias(
+    *,
+    alias: str,
+    server: MCPServerConfig | None,
+    store: dict[str, Any],
+) -> tuple[str, dict[str, Any] | None]:
+    server_fingerprint = fingerprint_mcp_server(server) if server is not None else ""
+    servers = store.get("servers", {})
+    if server_fingerprint:
+        raw = servers.get(server_fingerprint)
+        return server_fingerprint, dict(raw) if isinstance(raw, dict) else None
+
+    binding = store.get("alias_bindings", {}).get(alias)
+    if not isinstance(binding, dict):
+        return "", None
+    server_fingerprint = str(binding.get("server_fingerprint", "") or "").strip()
+    if not server_fingerprint:
+        return "", None
+    raw = servers.get(server_fingerprint)
+    return server_fingerprint, dict(raw) if isinstance(raw, dict) else None
+
+
+def _legacy_alias_payload(alias: str, *, store: dict[str, Any]) -> dict[str, Any] | None:
+    raw = store.get("aliases", {}).get(alias)
+    if not isinstance(raw, dict):
+        return None
+    return dict(raw)
+
+
+def _resolve_bound_token_payload(
+    *,
+    entry: dict[str, Any],
+    resolver: SecretResolver | None = None,
+) -> tuple[dict[str, Any] | None, str]:
+    token_ref = str(entry.get("token_ref", "") or "").strip()
+    if not token_ref:
+        return None, "token_ref is missing."
+    secret_resolver = resolver or SecretResolver()
+    try:
+        token_value = secret_resolver.resolve(token_ref).strip()
+    except SecretResolutionError as e:
+        return None, str(e)
+    if not token_value:
+        return None, "Stored token value is empty."
+    try:
+        payload = json.loads(token_value)
+    except json.JSONDecodeError as e:
+        return None, f"Stored token payload is not valid JSON: {e}"
+    if not isinstance(payload, dict):
+        return None, "Stored token payload must be a JSON object."
+    return dict(payload), ""
+
+
+def _unbind_alias(store: dict[str, Any], alias: str) -> None:
+    clean_alias = str(alias or "").strip()
+    if not clean_alias:
+        return
+    bindings = store.setdefault("alias_bindings", {})
+    binding = bindings.pop(clean_alias, None)
+    if not isinstance(binding, dict):
+        return
+    server_fingerprint = str(binding.get("server_fingerprint", "") or "").strip()
+    if not server_fingerprint:
+        return
+    servers = store.setdefault("servers", {})
+    raw_entry = servers.get(server_fingerprint)
+    if not isinstance(raw_entry, dict):
+        return
+    entry = dict(raw_entry)
+    aliases = [
+        item
+        for item in list(entry.get("aliases", []) or [])
+        if str(item).strip() and str(item).strip() != clean_alias
+    ]
+    if aliases:
+        entry["aliases"] = aliases
+    else:
+        entry.pop("aliases", None)
+    servers[server_fingerprint] = entry
+
+
+def _remove_server_binding(
+    *,
+    store: dict[str, Any],
+    server_fingerprint: str,
+) -> None:
+    clean_fingerprint = str(server_fingerprint or "").strip()
+    if not clean_fingerprint:
+        return
+    store.setdefault("servers", {}).pop(clean_fingerprint, None)
+    bindings = store.setdefault("alias_bindings", {})
+    aliases_to_remove = [
+        alias
+        for alias, raw in bindings.items()
+        if isinstance(raw, dict)
+        and str(raw.get("server_fingerprint", "") or "").strip() == clean_fingerprint
+    ]
+    for alias in aliases_to_remove:
+        bindings.pop(alias, None)
+
+
+def _store_bound_token_payload(
+    *,
+    target: Path,
+    alias: str,
+    server: MCPServerConfig | None,
+    token_payload: dict[str, Any],
+    authorization_endpoint: str,
+    token_endpoint: str,
+    client_id: str,
+    secret_resolver: SecretResolver | None = None,
+    migrated_from_legacy: bool = False,
+) -> Path:
+    clean_alias = str(alias or "").strip()
+    if not clean_alias:
+        raise MCPOAuthStoreError("Alias cannot be empty.")
+    server_fingerprint = fingerprint_mcp_server(server) if server is not None else ""
+    if not server_fingerprint:
+        server_fingerprint = _alias_fingerprint(clean_alias)
+    token_ref = _token_ref_for_server_fingerprint(server_fingerprint)
+    resolver = secret_resolver or SecretResolver()
+    try:
+        resolver.validate_writable(token_ref)
+        resolver.store(
+            token_ref,
+            json.dumps(token_payload, sort_keys=True) + "\n",
+        )
+    except SecretResolutionError as e:
+        raise _wrap_secret_storage_error(e) from e
+
+    now = int(time.time())
+    lock_path = target.with_suffix(target.suffix + ".lock")
+    with _file_lock(lock_path):
+        store = load_mcp_oauth_store(target)
+        _unbind_alias(store, clean_alias)
+        servers = store.setdefault("servers", {})
+        aliases = [
+            str(item).strip()
+            for item in list(dict(servers.get(server_fingerprint) or {}).get("aliases", []) or [])
+            if str(item).strip()
+        ]
+        if clean_alias not in aliases:
+            aliases.append(clean_alias)
+        servers[server_fingerprint] = {
+            "token_ref": token_ref,
+            "aliases": aliases,
+            "updated_at": now,
+            "credential_fingerprint": _credential_fingerprint(
+                server_fingerprint=server_fingerprint,
+                authorization_endpoint=authorization_endpoint,
+                token_endpoint=token_endpoint,
+                client_id=client_id,
+            ),
+            "authorization_endpoint": authorization_endpoint,
+            "token_endpoint": token_endpoint,
+            "client_id": client_id,
+            **(
+                {"migrated_from_legacy_at": now}
+                if migrated_from_legacy
+                else {}
+            ),
+        }
+        store.setdefault("alias_bindings", {})[clean_alias] = {
+            "server_fingerprint": server_fingerprint,
+            "updated_at": now,
+        }
+        _write_store(target, store)
+    return target
+
+
+def _maybe_migrate_legacy_alias_token(
+    *,
+    alias: str,
+    server: MCPServerConfig | None,
+    store_path: Path | None,
+    resolver: SecretResolver | None = None,
+) -> dict[str, Any] | None:
+    if server is None:
+        return None
+    target = (store_path or default_mcp_oauth_store_path()).expanduser().resolve()
+    store = load_mcp_oauth_store(target)
+    legacy_payload = _legacy_alias_payload(alias, store=store)
+    if legacy_payload is None:
+        return None
+    server_fingerprint, entry = _server_entry_for_alias(alias=alias, server=server, store=store)
+    if server_fingerprint and entry is not None:
+        payload, _ = _resolve_bound_token_payload(entry=entry, resolver=resolver)
+        if payload is not None:
+            return payload
+    try:
+        _store_bound_token_payload(
+            target=target,
+            alias=alias,
+            server=server,
+            token_payload=legacy_payload,
+            authorization_endpoint=str(
+                legacy_payload.get("authorization_endpoint", "") or ""
+            ).strip(),
+            token_endpoint=str(
+                legacy_payload.get("token_endpoint", "") or ""
+            ).strip(),
+            client_id=str(legacy_payload.get("client_id", "") or "").strip(),
+            secret_resolver=resolver,
+            migrated_from_legacy=True,
+        )
+    except MCPOAuthStoreError:
+        return legacy_payload
+    migrated_store = load_mcp_oauth_store(target)
+    _, migrated_entry = _server_entry_for_alias(alias=alias, server=server, store=migrated_store)
+    if migrated_entry is None:
+        return legacy_payload
+    payload, _ = _resolve_bound_token_payload(entry=migrated_entry, resolver=resolver)
+    return payload or legacy_payload
+
+
 def upsert_mcp_oauth_token(
     *,
     alias: str,
     access_token: str,
+    server: MCPServerConfig | None = None,
     refresh_token: str = "",
     token_type: str = "Bearer",
     scopes: list[str] | None = None,
@@ -191,8 +566,9 @@ def upsert_mcp_oauth_token(
     obtained_via: str = "",
     extra_fields: dict[str, Any] | None = None,
     store_path: Path | None = None,
+    secret_resolver: SecretResolver | None = None,
 ) -> Path:
-    """Insert or update one alias token payload."""
+    """Insert or update one MCP OAuth token payload."""
     clean_alias = str(alias or "").strip()
     if not clean_alias:
         raise MCPOAuthStoreError("Alias cannot be empty.")
@@ -200,90 +576,128 @@ def upsert_mcp_oauth_token(
     if not token:
         raise MCPOAuthStoreError("Access token cannot be empty.")
 
+    payload: dict[str, Any] = {
+        "access_token": token,
+        "refresh_token": str(refresh_token or "").strip(),
+        "token_type": str(token_type or "Bearer").strip() or "Bearer",
+        "scopes": [
+            str(scope).strip()
+            for scope in (scopes or [])
+            if str(scope).strip()
+        ],
+        "obtained_at": int(time.time()),
+        "expires_at": (
+            int(expires_at_unix)
+            if expires_at_unix is not None and int(expires_at_unix) > 0
+            else None
+        ),
+    }
+
+    token_ep = str(token_endpoint or "").strip()
+    if token_ep:
+        payload["token_endpoint"] = token_ep
+    authorization_ep = str(authorization_endpoint or "").strip()
+    if authorization_ep:
+        payload["authorization_endpoint"] = authorization_ep
+    clean_client_id = str(client_id or "").strip()
+    if clean_client_id:
+        payload["client_id"] = clean_client_id
+    via = str(obtained_via or "").strip()
+    if via:
+        payload["obtained_via"] = via
+    if extra_fields:
+        payload.update({
+            str(key): value
+            for key, value in extra_fields.items()
+            if str(key).strip()
+        })
+    payload.pop("last_failure_reason", None)
+    payload.pop("last_failure_at", None)
+
     target = (store_path or default_mcp_oauth_store_path()).expanduser().resolve()
-    lock_path = target.with_suffix(target.suffix + ".lock")
-    with _file_lock(lock_path):
-        store = load_mcp_oauth_store(target)
-        aliases = store.setdefault("aliases", {})
-        existing = aliases.get(clean_alias)
-        payload = dict(existing) if isinstance(existing, dict) else {}
-
-        payload.update(
-            {
-                "access_token": token,
-                "refresh_token": str(refresh_token or "").strip(),
-                "token_type": str(token_type or "Bearer").strip() or "Bearer",
-                "scopes": [
-                    str(scope).strip()
-                    for scope in (scopes or [])
-                    if str(scope).strip()
-                ],
-                "obtained_at": int(time.time()),
-                "expires_at": (
-                    int(expires_at_unix)
-                    if expires_at_unix is not None and int(expires_at_unix) > 0
-                    else None
-                ),
-            }
-        )
-
-        token_ep = str(token_endpoint or "").strip()
-        if token_ep:
-            payload["token_endpoint"] = token_ep
-        authorization_ep = str(authorization_endpoint or "").strip()
-        if authorization_ep:
-            payload["authorization_endpoint"] = authorization_ep
-        clean_client_id = str(client_id or "").strip()
-        if clean_client_id:
-            payload["client_id"] = clean_client_id
-        via = str(obtained_via or "").strip()
-        if via:
-            payload["obtained_via"] = via
-        if extra_fields:
-            payload.update({
-                str(key): value
-                for key, value in extra_fields.items()
-                if str(key).strip()
-            })
-        # Successful write clears stale failure markers.
-        payload.pop("last_failure_reason", None)
-        payload.pop("last_failure_at", None)
-
-        aliases[clean_alias] = payload
-        _write_store(target, store)
-    return target
+    return _store_bound_token_payload(
+        target=target,
+        alias=clean_alias,
+        server=server,
+        token_payload=payload,
+        authorization_endpoint=authorization_ep,
+        token_endpoint=token_ep,
+        client_id=clean_client_id,
+        secret_resolver=secret_resolver,
+    )
 
 
 def _annotate_alias_payload(
     *,
     alias: str,
     store_path: Path | None,
+    server: MCPServerConfig | None,
     fields: dict[str, Any],
 ) -> None:
     clean_alias = str(alias or "").strip()
     if not clean_alias:
         return
     target = (store_path or default_mcp_oauth_store_path()).expanduser().resolve()
+    store = load_mcp_oauth_store(target)
+    payload: dict[str, Any] | None = None
+    _, entry = _server_entry_for_alias(
+        alias=clean_alias,
+        server=server,
+        store=store,
+    )
+    if entry is not None:
+        payload, _ = _resolve_bound_token_payload(entry=entry)
+    if payload is None:
+        payload = _legacy_alias_payload(clean_alias, store=store)
+    if payload is None:
+        return
+    sanitized_fields = dict(fields)
+    if "last_failure_reason" in sanitized_fields:
+        sanitized_fields["last_failure_reason"] = redact_oauth_error_text(
+            sanitized_fields.get("last_failure_reason", ""),
+        )
+    payload.update(sanitized_fields)
+    if entry is not None:
+        try:
+            _store_bound_token_payload(
+                target=target,
+                alias=clean_alias,
+                server=server,
+                token_payload=payload,
+                authorization_endpoint=str(
+                    entry.get("authorization_endpoint", "")
+                    or payload.get("authorization_endpoint", "")
+                    or ""
+                ).strip(),
+                token_endpoint=str(
+                    entry.get("token_endpoint", "")
+                    or payload.get("token_endpoint", "")
+                    or ""
+                ).strip(),
+                client_id=str(
+                    entry.get("client_id", "")
+                    or payload.get("client_id", "")
+                    or ""
+                ).strip(),
+            )
+        except MCPOAuthStoreError:
+            return
+        return
     lock_path = target.with_suffix(target.suffix + ".lock")
     with _file_lock(lock_path):
         store = load_mcp_oauth_store(target)
-        aliases = store.setdefault("aliases", {})
-        payload = aliases.get(clean_alias)
-        if not isinstance(payload, dict):
-            return
-        payload = dict(payload)
-        sanitized_fields = dict(fields)
-        if "last_failure_reason" in sanitized_fields:
-            sanitized_fields["last_failure_reason"] = redact_oauth_error_text(
-                sanitized_fields.get("last_failure_reason", ""),
-            )
-        payload.update(sanitized_fields)
-        aliases[clean_alias] = payload
+        store.setdefault("aliases", {})[clean_alias] = payload
         _write_store(target, store)
 
 
-def remove_mcp_oauth_token(alias: str, *, store_path: Path | None = None) -> Path:
-    """Delete one alias token entry."""
+def remove_mcp_oauth_token(
+    alias: str,
+    *,
+    server: MCPServerConfig | None = None,
+    store_path: Path | None = None,
+    secret_resolver: SecretResolver | None = None,
+) -> Path:
+    """Delete one MCP OAuth token entry."""
     clean_alias = str(alias or "").strip()
     if not clean_alias:
         raise MCPOAuthStoreError("Alias cannot be empty.")
@@ -291,25 +705,54 @@ def remove_mcp_oauth_token(alias: str, *, store_path: Path | None = None) -> Pat
     lock_path = target.with_suffix(target.suffix + ".lock")
     with _file_lock(lock_path):
         store = load_mcp_oauth_store(target)
+        server_fingerprint, entry = _server_entry_for_alias(
+            alias=clean_alias,
+            server=server,
+            store=store,
+        )
+        if entry is not None:
+            token_ref = str(entry.get("token_ref", "") or "").strip()
+            if token_ref:
+                resolver = secret_resolver or SecretResolver()
+                try:
+                    resolver.validate_writable(token_ref)
+                    resolver.store(token_ref, "")
+                except SecretResolutionError as e:
+                    raise _wrap_secret_storage_error(e) from e
+            _remove_server_binding(store=store, server_fingerprint=server_fingerprint)
+        _unbind_alias(store, clean_alias)
         aliases = store.setdefault("aliases", {})
         aliases.pop(clean_alias, None)
         _write_store(target, store)
     return target
 
 
-def get_mcp_oauth_token(alias: str, *, store_path: Path | None = None) -> dict[str, Any] | None:
+def get_mcp_oauth_token(
+    alias: str,
+    *,
+    server: MCPServerConfig | None = None,
+    store_path: Path | None = None,
+    secret_resolver: SecretResolver | None = None,
+) -> dict[str, Any] | None:
     """Return token payload for one alias."""
     clean_alias = str(alias or "").strip()
     if not clean_alias:
         return None
     store = load_mcp_oauth_store(store_path)
-    aliases = store.get("aliases", {})
-    if not isinstance(aliases, dict):
-        return None
-    raw = aliases.get(clean_alias)
-    if not isinstance(raw, dict):
-        return None
-    return dict(raw)
+    _, entry = _server_entry_for_alias(alias=clean_alias, server=server, store=store)
+    if entry is not None:
+        payload, _ = _resolve_bound_token_payload(entry=entry, resolver=secret_resolver)
+        if payload is not None:
+            return payload
+    migrated = _maybe_migrate_legacy_alias_token(
+        alias=clean_alias,
+        server=server,
+        store_path=store_path,
+        resolver=secret_resolver,
+    )
+    if migrated is not None:
+        return migrated
+    return _legacy_alias_payload(clean_alias, store=store)
 
 
 def token_expired(token_payload: dict[str, Any], *, skew_seconds: int = 30) -> bool:
@@ -330,10 +773,31 @@ def token_expired(token_payload: dict[str, Any], *, skew_seconds: int = 30) -> b
 def oauth_state_for_alias(
     alias: str,
     *,
+    server: MCPServerConfig | None = None,
     store_path: Path | None = None,
 ) -> dict[str, Any]:
     """Summarize OAuth readiness for one alias."""
-    token_payload = get_mcp_oauth_token(alias, store_path=store_path)
+    clean_alias = str(alias or "").strip()
+    store = load_mcp_oauth_store(store_path)
+    _, entry = _server_entry_for_alias(alias=clean_alias, server=server, store=store)
+    token_payload: dict[str, Any] | None = None
+    resolution_error = ""
+    storage = "missing"
+    if entry is not None:
+        token_payload, resolution_error = _resolve_bound_token_payload(entry=entry)
+        storage = "secret_ref"
+    if token_payload is None:
+        token_payload = _maybe_migrate_legacy_alias_token(
+            alias=clean_alias,
+            server=server,
+            store_path=store_path,
+        )
+        if token_payload is not None:
+            storage = "secret_ref" if server is not None else "legacy_alias_store"
+    if token_payload is None:
+        token_payload = _legacy_alias_payload(clean_alias, store=store)
+        if token_payload is not None:
+            storage = "legacy_alias_store"
     if token_payload is None:
         return {
             "state": "missing",
@@ -342,8 +806,9 @@ def oauth_state_for_alias(
             "expires_at": None,
             "token_type": None,
             "scopes": [],
-            "last_failure_reason": "",
+            "last_failure_reason": resolution_error,
             "last_failure_at": None,
+            "storage": storage,
         }
     expired = token_expired(token_payload)
     return {
@@ -358,16 +823,18 @@ def oauth_state_for_alias(
         ),
         "last_failure_at": token_payload.get("last_failure_at"),
         "last_refresh_at": token_payload.get("last_refresh_at"),
+        "storage": storage,
     }
 
 
 def bearer_auth_header_for_alias(
     alias: str,
     *,
+    server: MCPServerConfig | None = None,
     store_path: Path | None = None,
 ) -> str | None:
     """Return Authorization header value when a usable token is present."""
-    token_payload = get_mcp_oauth_token(alias, store_path=store_path)
+    token_payload = get_mcp_oauth_token(alias, server=server, store_path=store_path)
     if token_payload is None or token_expired(token_payload):
         return None
     access_token = str(token_payload.get("access_token", "")).strip()
@@ -379,9 +846,14 @@ def bearer_auth_header_for_alias(
     return f"{token_type} {access_token}"
 
 
-def _refresh_attempt_key(alias: str, store_path: Path | None) -> tuple[str, str]:
+def _refresh_attempt_key(
+    alias: str,
+    store_path: Path | None,
+    server: MCPServerConfig | None,
+) -> tuple[str, str]:
     target = (store_path or default_mcp_oauth_store_path()).expanduser().resolve()
-    return str(target), str(alias or "").strip()
+    server_fingerprint = fingerprint_mcp_server(server) if server is not None else ""
+    return str(target), server_fingerprint or str(alias or "").strip()
 
 
 def _parse_expiry_unix(raw: object) -> int | None:
@@ -399,6 +871,7 @@ def _parse_expiry_unix(raw: object) -> int | None:
 def refresh_mcp_oauth_token(
     alias: str,
     *,
+    server: MCPServerConfig | None = None,
     store_path: Path | None = None,
     token_endpoint: str | None = None,
     client_id: str | None = None,
@@ -415,7 +888,7 @@ def refresh_mcp_oauth_token(
             reason="Alias cannot be empty.",
         )
 
-    payload = get_mcp_oauth_token(clean_alias, store_path=store_path)
+    payload = get_mcp_oauth_token(clean_alias, server=server, store_path=store_path)
     if payload is None:
         return MCPOAuthRefreshResult(status="failed", reason="Missing OAuth token.")
 
@@ -428,6 +901,7 @@ def refresh_mcp_oauth_token(
         _annotate_alias_payload(
             alias=clean_alias,
             store_path=store_path,
+            server=server,
             fields={
                 "last_failure_reason": reason,
                 "last_failure_at": int(time.time()),
@@ -442,6 +916,7 @@ def refresh_mcp_oauth_token(
         _annotate_alias_payload(
             alias=clean_alias,
             store_path=store_path,
+            server=server,
             fields={
                 "last_failure_reason": reason,
                 "last_failure_at": int(time.time()),
@@ -450,7 +925,7 @@ def refresh_mcp_oauth_token(
         return MCPOAuthRefreshResult(status="failed", reason=reason)
 
     cooldown = max(1, int(min_interval_seconds))
-    key = _refresh_attempt_key(clean_alias, store_path)
+    key = _refresh_attempt_key(clean_alias, store_path, server)
     now = time.monotonic()
     with _REFRESH_ATTEMPT_LOCK:
         last_attempt = _REFRESH_LAST_ATTEMPT.get(key)
@@ -488,6 +963,7 @@ def refresh_mcp_oauth_token(
         _annotate_alias_payload(
             alias=clean_alias,
             store_path=store_path,
+            server=server,
             fields={
                 "last_failure_reason": reason,
                 "last_failure_at": int(time.time()),
@@ -515,6 +991,7 @@ def refresh_mcp_oauth_token(
         _annotate_alias_payload(
             alias=clean_alias,
             store_path=store_path,
+            server=server,
             fields={
                 "last_failure_reason": reason,
                 "last_failure_at": int(time.time()),
@@ -528,6 +1005,7 @@ def refresh_mcp_oauth_token(
         _annotate_alias_payload(
             alias=clean_alias,
             store_path=store_path,
+            server=server,
             fields={
                 "last_failure_reason": reason,
                 "last_failure_at": int(time.time()),
@@ -569,6 +1047,7 @@ def refresh_mcp_oauth_token(
     try:
         upsert_mcp_oauth_token(
             alias=clean_alias,
+            server=server,
             access_token=access_token,
             refresh_token=next_refresh_token,
             token_type=token_type,
@@ -595,6 +1074,7 @@ def refresh_mcp_oauth_token(
 def ensure_mcp_oauth_ready(
     alias: str,
     *,
+    server: MCPServerConfig | None = None,
     store_path: Path | None = None,
     refresh_timeout_seconds: int = 15,
     refresh_cooldown_seconds: int = _DEFAULT_REFRESH_COOLDOWN_SECONDS,
@@ -608,7 +1088,7 @@ def ensure_mcp_oauth_ready(
             reason="Alias cannot be empty.",
         )
 
-    payload = get_mcp_oauth_token(clean_alias, store_path=store_path)
+    payload = get_mcp_oauth_token(clean_alias, server=server, store_path=store_path)
     if payload is None:
         return MCPOAuthReadiness(
             ready=False,
@@ -628,6 +1108,7 @@ def ensure_mcp_oauth_ready(
 
     refreshed = refresh_mcp_oauth_token(
         clean_alias,
+        server=server,
         store_path=store_path,
         timeout_seconds=refresh_timeout_seconds,
         min_interval_seconds=refresh_cooldown_seconds,

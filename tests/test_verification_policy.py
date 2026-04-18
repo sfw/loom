@@ -136,6 +136,26 @@ def test_decision_matrix_warns_non_research_inconclusive_coverage() -> None:
     assert decision.action == "pass_with_warnings"
 
 
+def test_decision_matrix_warns_dev_verifier_timeout_for_coding() -> None:
+    decision = resolve_policy_decision(
+        severity_class="infra",
+        reason_code="dev_verifier_timeout",
+        profile="coding",
+        mode="enforce",
+    )
+    assert decision.action == "pass_with_warnings"
+
+
+def test_decision_matrix_retries_targeted_for_dev_test_failures() -> None:
+    decision = resolve_policy_decision(
+        severity_class="semantic",
+        reason_code="dev_test_failed",
+        profile="coding",
+        mode="enforce",
+    )
+    assert decision.action == "retry_targeted"
+
+
 def test_decision_matrix_shadow_mode_keeps_legacy_action() -> None:
     decision = resolve_policy_decision(
         severity_class="semantic",

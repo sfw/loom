@@ -125,3 +125,24 @@ class TestGlobFind:
         result = await tool.execute({"pattern": "*.md", "path": "docs"}, ctx)
         assert result.success
         assert "creative-brief.md" in result.output
+
+    async def test_relative_path_resolves_from_attached_directory_map(self, tool, tmp_path):
+        root = tmp_path / "project"
+        run_ws = root / "run-1"
+        audit_dir = root / "seo-geo-review"
+        root.mkdir()
+        run_ws.mkdir()
+        audit_dir.mkdir()
+        (audit_dir / "report.md").write_text("brief")
+
+        ctx = ToolContext(
+            workspace=run_ws,
+            read_roots=[audit_dir],
+            read_path_map={"seo-geo-review": audit_dir},
+        )
+        result = await tool.execute(
+            {"pattern": "*.md", "path": "seo-geo-review"},
+            ctx,
+        )
+        assert result.success
+        assert "report.md" in result.output

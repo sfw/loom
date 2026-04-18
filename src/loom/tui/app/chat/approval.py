@@ -6,6 +6,7 @@ import asyncio
 
 from loom.cowork.approval import ApprovalDecision
 from loom.tui.screens import ToolApprovalScreen
+from loom.tui.widgets import ChatLog
 from loom.tui.widgets.tool_call import tool_args_preview
 
 
@@ -23,6 +24,19 @@ async def approval_callback(
     approval_event = asyncio.Event()
     self._approval_event = approval_event
     self._approval_result = ApprovalDecision.DENY
+    prompt_id = f"approval:{id(approval_event)}"
+
+    try:
+        chat = self.query_one("#chat-log", ChatLog)
+    except Exception:
+        chat = None
+    if chat is not None:
+        chat.add_approval_prompt(
+            prompt_id,
+            tool_name,
+            preview,
+            risk_info=risk_info,
+        )
 
     def handle_result(result: str) -> None:
         if result == "approve":
@@ -39,6 +53,8 @@ async def approval_callback(
     )
 
     await approval_event.wait()
+    if chat is not None:
+        chat.clear_info_line(prompt_id)
     if self._approval_event is approval_event:
         self._approval_event = None
     return self._approval_result

@@ -100,6 +100,7 @@ CONFIG_RUNTIME_ENTRIES: tuple[ConfigRuntimeEntry, ...] = (
         ),
         aliases=("ask_policy",),
         search_terms=("ask_user", "questions", "policy"),
+        exposure_level="basic",
     ),
     ConfigRuntimeEntry(
         path="execution.agent_tools_max_timeout_seconds",
@@ -130,6 +131,7 @@ CONFIG_RUNTIME_ENTRIES: tuple[ConfigRuntimeEntry, ...] = (
         parser=lambda raw: _parse_enum(raw, choices=("full", "adaptive", "hybrid")),
         aliases=("tool_exposure",),
         search_terms=("cowork", "tool", "exposure"),
+        exposure_level="basic",
     ),
     ConfigRuntimeEntry(
         path="telemetry.mode",

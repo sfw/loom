@@ -173,6 +173,43 @@ class TestRetryManager:
         assert markets == []
 
     @pytest.mark.parametrize("reason_code", [
+        "tool_capability_unavailable",
+        "provider_binary_not_found",
+        "provider_binary_unsupported",
+        "tool_runtime_capability_unavailable",
+    ])
+    def test_classify_failure_routes_capability_unavailable_to_unconfirmed_data(
+        self,
+        reason_code: str,
+    ):
+        strategy, markets = RetryManager.classify_failure(
+            verification_feedback="runtime capability unavailable",
+            execution_error="",
+            verification={"reason_code": reason_code, "severity_class": "infra"},
+        )
+        assert strategy == RetryStrategy.UNCONFIRMED_DATA
+        assert markets == []
+
+    @pytest.mark.parametrize("reason_code", [
+        "tool_method_failed",
+        "tool_transient_failure",
+        "tool_upstream_unavailable",
+        "tool_write_retryable",
+        "tool_runtime_retryable",
+    ])
+    def test_classify_failure_routes_method_failure_to_unconfirmed_data(
+        self,
+        reason_code: str,
+    ):
+        strategy, markets = RetryManager.classify_failure(
+            verification_feedback="tool method failed",
+            execution_error="",
+            verification={"reason_code": reason_code},
+        )
+        assert strategy == RetryStrategy.UNCONFIRMED_DATA
+        assert markets == []
+
+    @pytest.mark.parametrize("reason_code", [
         "incomplete_deliverable_placeholder",
         "incomplete_deliverable_content",
         "unsupported_claims_and_incomplete_evidence",
@@ -209,6 +246,15 @@ class TestRetryManager:
             verification={"reason_code": "forbidden_output_path"},
         )
         assert strategy == RetryStrategy.GENERIC
+        assert markets == []
+
+    def test_classify_failure_dev_verifier_timeout_is_verifier_parse(self):
+        strategy, markets = RetryManager.classify_failure(
+            verification_feedback="Development browser verification timed out.",
+            execution_error="",
+            verification={"reason_code": "dev_verifier_timeout"},
+        )
+        assert strategy == RetryStrategy.VERIFIER_PARSE
         assert markets == []
 
     def test_classify_failure_routes_recoverable_placeholder_hard_invariant(self):
@@ -282,6 +328,36 @@ class TestRetryManager:
 
         assert "TARGETED RETRY PLAN" in context
         assert "Resolve verification findings" in context
+
+    def test_build_retry_context_includes_capability_unavailable_plan(self):
+        mgr = RetryManager()
+        attempts = [
+            AttemptRecord(
+                attempt=1,
+                tier=2,
+                feedback="provider binary missing",
+                retry_strategy=RetryStrategy.UNCONFIRMED_DATA,
+                reason_code="provider_binary_not_found",
+            ),
+        ]
+        context = mgr.build_retry_context(attempts)
+        assert "runtime capability is unavailable" in context
+        assert "Do not reuse the unavailable tool or provider" in context
+
+    def test_build_retry_context_includes_method_failure_plan(self):
+        mgr = RetryManager()
+        attempts = [
+            AttemptRecord(
+                attempt=1,
+                tier=2,
+                feedback="web fetch failed",
+                retry_strategy=RetryStrategy.UNCONFIRMED_DATA,
+                reason_code="tool_upstream_unavailable",
+            ),
+        ]
+        context = mgr.build_retry_context(attempts)
+        assert "previous method failed" in context.lower()
+        assert "alternate tools" in context.lower()
 
     def test_build_retry_context_includes_edit_in_place_file_guidance(self):
         class _Call:
