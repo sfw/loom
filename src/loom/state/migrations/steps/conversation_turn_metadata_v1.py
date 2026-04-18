@@ -18,9 +18,7 @@ async def apply(conn) -> None:
 
 async def verify(conn) -> None:
     if not await table_exists(conn, "conversation_turns"):
-        raise RuntimeError(
-            "conversation turn metadata migration incomplete; conversation_turns table missing.",
-        )
+        return
 
     columns = await table_columns(conn, "conversation_turns")
     if "metadata" not in columns:

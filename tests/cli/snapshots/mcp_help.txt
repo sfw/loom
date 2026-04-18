@@ -7,6 +7,7 @@ Options:
 
 Commands:
   add           Add a new MCP server config entry.
+  approve       Approve a workspace-defined remote MCP server.
   auth          Manage OAuth tokens for remote MCP server aliases.
   connect       Connect one MCP alias and refresh runtime health state.
   debug-bundle  Export redacted MCP diagnostics for support triage.
@@ -14,9 +15,11 @@ Commands:
   disconnect    Disconnect one MCP alias and close any persistent runtime...
   edit          Edit an existing MCP server config entry.
   enable        Enable an MCP server.
+  explain       Explain source, trust, effective account, and next action...
   list          List merged MCP server configuration.
   migrate       Move legacy `[mcp]` config from loom.toml into mcp.toml.
   reconnect     Reconnect one MCP alias by forcing a disconnect then...
+  reject        Reject a workspace-defined remote MCP server.
   remove        Remove an MCP server config entry.
   show          Show one merged MCP server configuration.
   status        Show runtime MCP connection state and auth readiness.

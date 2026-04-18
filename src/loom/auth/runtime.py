@@ -719,6 +719,15 @@ def build_run_auth_context(
     except AuthConfigError as e:
         raise AuthResolutionError(str(e)) from e
 
+    profiles = dict(merged.config.profiles)
+    if chosen_explicit is not None:
+        explicit_profile_ids = set(getattr(merged, "explicit_profile_ids", ()))
+        profiles = {
+            profile_id: profile
+            for profile_id, profile in profiles.items()
+            if profile_id in explicit_profile_ids
+        }
+
     resource_store = load_workspace_auth_resources(
         default_workspace_auth_resources_path(chosen_workspace.resolve())
     ) if chosen_workspace is not None else load_workspace_auth_resources(
@@ -793,7 +802,7 @@ def build_run_auth_context(
         return resolved is not None
 
     for selector, profile_id in selections.items():
-        profile = merged.config.profiles.get(profile_id)
+        profile = profiles.get(profile_id)
         if profile is None:
             if selector in explicit_selectors:
                 raise AuthResolutionError(
@@ -824,7 +833,7 @@ def build_run_auth_context(
 
     # Auto-select single unambiguous provider profiles.
     profiles_by_provider: dict[str, list[AuthProfile]] = {}
-    for profile in merged.config.profiles.values():
+    for profile in profiles.values():
         if not _is_profile_candidate(profile):
             continue
         profiles_by_provider.setdefault(profile.provider, []).append(profile)
@@ -956,7 +965,7 @@ def build_run_auth_context(
                                 resource_store,
                                 resolved_resource.resource_id,
                             )
-                            if binding.profile_id in merged.config.profiles
+                            if binding.profile_id in profiles
                         ),
                         modes=effective_requirement.modes,
                         required_env_keys=effective_requirement.required_env_keys,
@@ -971,6 +980,7 @@ def build_run_auth_context(
             candidates = sorted(
                 (
                     merged.config.profiles.get(binding.profile_id)
+                    if binding.profile_id in profiles else None
                     for binding in active_bindings_for_resource(
                         resource_store,
                         resolved_resource.resource_id,
@@ -987,9 +997,9 @@ def build_run_auth_context(
             ]
         else:
             candidates = sorted(
-                (
+                    (
                     profile
-                    for profile in merged.config.profiles.values()
+                    for profile in profiles.values()
                     if _is_profile_candidate(profile)
                     and _profile_matches_requirement(profile, effective_requirement)
                 ),
@@ -1043,7 +1053,7 @@ def build_run_auth_context(
                 provider_candidates = sorted(
                     (
                         profile
-                        for profile in merged.config.profiles.values()
+                        for profile in profiles.values()
                         if _is_profile_candidate(profile)
                         and _profile_matches_requirement(profile, effective_requirement)
                     ),
@@ -1240,7 +1250,7 @@ def build_run_auth_context(
         )
 
     return RunAuthContext(
-        profiles=dict(merged.config.profiles),
+        profiles=profiles,
         selected_by_selector=selected_by_selector,
         selected_by_provider=selected_by_provider,
         selected_by_mcp_alias=selected_by_mcp_alias,

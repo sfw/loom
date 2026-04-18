@@ -9,6 +9,7 @@ as namespaced Loom tools:
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -63,6 +64,27 @@ _MCP_CIRCUIT_COOLDOWN_SECONDS = 30.0
 _MCP_GLOBAL_MAX_IN_FLIGHT = 64
 _MCP_PER_SERVER_MAX_IN_FLIGHT = 8
 _MCP_PER_SERVER_MAX_QUEUE = 32
+
+
+def _call_with_optional_server_arg(
+    func: Callable[..., Any],
+    alias: str,
+    *,
+    server: MCPServerConfig,
+) -> Any:
+    """Call OAuth helpers compatibly across old and new signatures."""
+    try:
+        signature = inspect.signature(func)
+    except (TypeError, ValueError):
+        signature = None
+    if signature is not None:
+        params = signature.parameters.values()
+        if any(
+            param.kind is inspect.Parameter.VAR_KEYWORD or param.name == "server"
+            for param in params
+        ):
+            return func(alias, server=server)
+    return func(alias)
 
 
 def _sanitize_segment(raw: str, fallback: str) -> str:
@@ -718,7 +740,11 @@ class _MCPRemoteHTTPClient:
         if env_overrides:
             base_env.update(env_overrides)
         headers = _resolve_env_map(self.server.headers, base_env=base_env)
-        auth_header = bearer_auth_header_for_alias(self.alias, server=self.server)
+        auth_header = _call_with_optional_server_arg(
+            bearer_auth_header_for_alias,
+            self.alias,
+            server=self.server,
+        )
         had_authorization = any(str(key).lower() == "authorization" for key in headers)
         if auth_header:
             if self.server.oauth.enabled:
@@ -1403,7 +1429,11 @@ class MCPConnectionManager:
     def _remote_oauth_ready(self, alias: str, server: MCPServerConfig) -> bool:
         if not server.oauth.enabled:
             return True
-        readiness = ensure_mcp_oauth_ready(alias, server=server)
+        readiness = _call_with_optional_server_arg(
+            ensure_mcp_oauth_ready,
+            alias,
+            server=server,
+        )
         if not readiness.ready:
             self._set_state(
                 alias=alias,

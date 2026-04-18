@@ -650,9 +650,16 @@ class OpenAICompatibleProvider(ModelProvider):
         injected as a follow-up user message with image_url/file content.
         """
         result = []
+        supports_multimodal_tool_followups = bool(
+            self._capabilities
+            and (self._capabilities.vision or self._capabilities.native_pdf)
+        )
         for msg in messages:
             role = str(msg.get("role", "") or "").strip()
             if role == "tool":
+                if not supports_multimodal_tool_followups:
+                    result.append(self._strip_internal_message_fields(msg))
+                    continue
                 raw_content = msg.get("content", "")
                 text_content = self._build_tool_result_content(raw_content)
                 out = self._strip_internal_message_fields(msg)
