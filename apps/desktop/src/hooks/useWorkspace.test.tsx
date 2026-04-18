@@ -743,6 +743,111 @@ describe("useWorkspace", () => {
     expect(result.current.approvalInbox).toEqual([]);
   });
 
+  it("removes back-to-back conversation approval notifications without drifting the count", async () => {
+    vi.useFakeTimers();
+    let notificationEvent: ((event: any) => void) | undefined;
+    apiMocks.subscribeNotificationsStream.mockImplementation(((
+      _workspaceId: string,
+      onEvent: (event: unknown) => void,
+    ) => {
+      notificationEvent = onEvent as (event: any) => void;
+      return () => {};
+    }) as any);
+
+    const { result } = renderHook(() => {
+      const [workspaces, setWorkspaces] = useState([{
+        id: "workspace-1",
+        canonical_path: "/tmp/workspace",
+        display_name: "Workspace 1",
+        metadata: {},
+        is_archived: false,
+        sort_order: 0,
+        conversation_count: 1,
+        run_count: 0,
+        active_run_count: 0,
+      }] as any);
+      return useWorkspace({
+        selectedWorkspaceId: "workspace-1",
+        selectedConversationId: "",
+        selectedRunId: "",
+        setSelectedWorkspaceId: vi.fn(),
+        showArchivedWorkspaces: false,
+        setShowArchivedWorkspaces: vi.fn(),
+        createParentPath: "/tmp",
+        setCreateParentPath: vi.fn(),
+        workspaces,
+        setWorkspaces,
+        runtime: null,
+        setError: vi.fn(),
+        setNotice: vi.fn(),
+        activeTab: "overview",
+        setActiveTab: vi.fn(),
+        setSelectedConversationId: vi.fn(),
+        setSelectedRunId: vi.fn(),
+      });
+    });
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    apiMocks.fetchApprovals.mockClear();
+
+    act(() => {
+      notificationEvent?.({
+        id: "evt-conversation-req",
+        stream_id: 21,
+        event_type: "approval_requested",
+        created_at: "2026-04-18T00:00:00Z",
+        workspace_id: "workspace-1",
+        workspace_path: "/tmp/workspace",
+        workspace_display_name: "Workspace 1",
+        task_id: "",
+        conversation_id: "conversation-1",
+        approval_id: "approval-1",
+        kind: "conversation_approval",
+        title: "approval requested",
+        summary: "mcp.notion.notion-search",
+        payload: {
+          tool_name: "mcp.notion.notion-search",
+        },
+      });
+      notificationEvent?.({
+        id: "evt-conversation-ok",
+        stream_id: 22,
+        event_type: "approval_received",
+        created_at: "2026-04-18T00:00:01Z",
+        workspace_id: "workspace-1",
+        workspace_path: "/tmp/workspace",
+        workspace_display_name: "Workspace 1",
+        task_id: "",
+        conversation_id: "conversation-1",
+        approval_id: "approval-1",
+        kind: "conversation_approval",
+        title: "approval received",
+        summary: "mcp.notion.notion-search",
+        payload: {
+          tool_name: "mcp.notion.notion-search",
+          decision: "approve",
+        },
+      });
+    });
+
+    expect(result.current.overview?.pending_approvals_count).toBe(0);
+    expect(result.current.approvalInbox).toEqual([]);
+
+    act(() => {
+      vi.advanceTimersByTime(200);
+    });
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(apiMocks.fetchApprovals).not.toHaveBeenCalled();
+  });
+
   it("preserves the loaded workspace surface during a disconnect and refreshes on reconnect", async () => {
     const initialProps: { connectionState: "connected" | "failed" } = {
       connectionState: "connected",

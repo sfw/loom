@@ -759,6 +759,7 @@ export function useWorkspace(deps: {
     if (selectedWorkspaceIdRef.current !== workspaceId) {
       return;
     }
+    approvalInboxRef.current = approvalPayload;
     setApprovalInbox(approvalPayload);
     setOverview((current) => {
       if (!current || current.workspace.id !== workspaceId) {
@@ -1024,12 +1025,12 @@ export function useWorkspace(deps: {
       return;
     }
     const exists = approvalInboxRef.current.some((currentItem) => currentItem.id === item.id);
-    setApprovalInbox((current) => (
-      [
-        item,
-        ...current.filter((currentItem) => currentItem.id !== item.id),
-      ].sort((left, right) => String(right.created_at || "").localeCompare(String(left.created_at || "")))
-    ));
+    const nextInbox = [
+      item,
+      ...approvalInboxRef.current.filter((currentItem) => currentItem.id !== item.id),
+    ].sort((left, right) => String(right.created_at || "").localeCompare(String(left.created_at || "")));
+    approvalInboxRef.current = nextInbox;
+    setApprovalInbox(nextInbox);
     if (!exists && options?.incrementCount !== false) {
       patchPendingApprovalCount(workspaceId, 1);
     }
@@ -1044,7 +1045,9 @@ export function useWorkspace(deps: {
     if (!exists) {
       return;
     }
-    setApprovalInbox((current) => current.filter((currentItem) => currentItem.id !== itemId));
+    const nextInbox = approvalInboxRef.current.filter((currentItem) => currentItem.id !== itemId);
+    approvalInboxRef.current = nextInbox;
+    setApprovalInbox(nextInbox);
     patchPendingApprovalCount(nextWorkspaceId, -1);
   });
 
@@ -1308,7 +1311,11 @@ export function useWorkspace(deps: {
       }
 
       if (itemId) {
-        removeApprovalItem(itemId, workspaceId);
+        if (approvalInboxRef.current.some((item) => item.id === itemId)) {
+          removeApprovalItem(itemId, workspaceId);
+        } else {
+          scheduleNotificationRepair(workspaceId, { approvals: true });
+        }
       } else if (event.event_type.startsWith("approval_")) {
         patchPendingApprovalCount(workspaceId, -1);
         scheduleNotificationRepair(workspaceId, { approvals: true });
