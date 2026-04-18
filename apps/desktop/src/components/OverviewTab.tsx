@@ -170,7 +170,7 @@ export default function OverviewTab() {
           />
           <Metric
             icon={<Clock size={14} />}
-            label="Pending"
+            label="Approvals"
             value={pendingApprovals}
             warn={pendingApprovals > 0}
           />

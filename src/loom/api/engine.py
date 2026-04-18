@@ -329,15 +329,24 @@ class Engine:
         request = self._conversation_approvals.get(clean_id)
         if request is None or request.event.is_set():
             return None
+        if not self.conversation_turn_inflight(clean_id):
+            self._conversation_approvals.pop(clean_id, None)
+            return None
         return request.to_dict()
 
     def list_pending_conversation_approvals(self) -> list[dict[str, object]]:
-        """Return all pending cowork approvals across active conversations."""
+        """Return pending cowork approvals for conversations that are still inflight."""
         pending: list[dict[str, object]] = []
-        for request in self._conversation_approvals.values():
+        stale_session_ids: list[str] = []
+        for session_id, request in self._conversation_approvals.items():
             if request.event.is_set():
                 continue
+            if not self.conversation_turn_inflight(session_id):
+                stale_session_ids.append(session_id)
+                continue
             pending.append(request.to_dict())
+        for session_id in stale_session_ids:
+            self._conversation_approvals.pop(session_id, None)
         pending.sort(key=lambda item: str(item.get("created_at", "") or ""), reverse=True)
         return pending
 

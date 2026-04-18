@@ -1158,6 +1158,7 @@ class TestWorkspaceFirstEndpoints:
         self,
         client,
         engine,
+        monkeypatch,
         tmp_path,
         database,
         memory_manager,
@@ -1213,6 +1214,11 @@ class TestWorkspaceFirstEndpoints:
             session_id,
             tool_name="shell_execute",
             args={"command": "rm -rf build"},
+        )
+        monkeypatch.setattr(
+            engine,
+            "conversation_turn_inflight",
+            lambda conversation_id: conversation_id == session_id,
         )
 
         list_response = await client.get(f"/approvals?workspace_id={workspace['id']}")
@@ -1310,6 +1316,7 @@ class TestWorkspaceFirstEndpoints:
         self,
         client,
         engine,
+        monkeypatch,
         tmp_path,
         conversation_store,
         workspace_registry,
@@ -1330,10 +1337,60 @@ class TestWorkspaceFirstEndpoints:
             tool_name="write_file",
             args={"path": "README.md"},
         )
+        monkeypatch.setattr(
+            engine,
+            "conversation_turn_inflight",
+            lambda conversation_id: conversation_id == session_id,
+        )
 
         response = await client.get(f"/workspaces/{workspace['id']}/overview")
         assert response.status_code == 200
         assert response.json()["pending_approvals_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_workspace_overview_ignores_stale_pending_conversation_approvals(
+        self,
+        client,
+        engine,
+        tmp_path,
+        conversation_store,
+        workspace_registry,
+    ):
+        workspace_path = tmp_path / "stale-pending-overview-ws"
+        workspace_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(
+            str(workspace_path),
+            display_name="Stale Pending Overview WS",
+        )
+        assert workspace is not None
+        session_id = await conversation_store.create_session(
+            workspace=str(workspace_path),
+            model_name="overview-model",
+        )
+        request = engine.begin_conversation_approval(
+            session_id,
+            tool_name="write_file",
+            args={"path": "README.md"},
+        )
+
+        overview_response = await client.get(f"/workspaces/{workspace['id']}/overview")
+        assert overview_response.status_code == 200
+        assert overview_response.json()["pending_approvals_count"] == 0
+
+        approvals_response = await client.get(f"/approvals?workspace_id={workspace['id']}")
+        assert approvals_response.status_code == 200
+        assert approvals_response.json() == []
+
+        status_response = await client.get(f"/conversations/{session_id}/status")
+        assert status_response.status_code == 200
+        assert status_response.json()["awaiting_approval"] is False
+        assert status_response.json()["pending_approval"] is None
+
+        resolve_response = await client.post(
+            f"/conversations/{session_id}/approvals/{request.approval_id}",
+            json={"decision": "approve"},
+        )
+        assert resolve_response.status_code == 404
 
     @pytest.mark.asyncio
     async def test_workspace_inventory_includes_processes_tools_and_mcp(
