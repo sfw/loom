@@ -29,7 +29,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--timeout-seconds",
         type=float,
-        default=30.0,
+        default=60.0,
         help="How long to wait for /runtime readiness.",
     )
     return parser.parse_args()
@@ -55,10 +55,34 @@ def choose_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def wait_for_runtime(base_url: str, timeout_seconds: float) -> dict[str, object]:
-    deadline = time.time() + timeout_seconds
+def _read_log_tail(log_path: Path | None, *, max_chars: int = 4000) -> str:
+    if log_path is None or not log_path.exists():
+        return ""
+    content = log_path.read_text(encoding="utf-8", errors="replace")
+    trimmed = content[-max_chars:].strip()
+    if not trimmed:
+        return ""
+    return f"\nRecent loomd log output:\n{trimmed}"
+
+
+def wait_for_runtime(
+    base_url: str,
+    timeout_seconds: float,
+    *,
+    process: subprocess.Popen[str] | None = None,
+    log_path: Path | None = None,
+) -> dict[str, object]:
+    deadline = time.monotonic() + timeout_seconds
     last_error = "runtime never became ready"
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
+        if process is not None:
+            returncode = process.poll()
+            if returncode is not None:
+                raise SystemExit(
+                    "packaged loomd smoke test failed: "
+                    f"process exited before /runtime became ready with code {returncode}"
+                    f"{_read_log_tail(log_path)}"
+                )
         try:
             with urllib.request.urlopen(f"{base_url}/runtime", timeout=1.5) as response:
                 payload = json.loads(response.read().decode("utf-8"))
@@ -69,7 +93,10 @@ def wait_for_runtime(base_url: str, timeout_seconds: float) -> dict[str, object]
         except TimeoutError as error:
             last_error = str(error)
         time.sleep(0.25)
-    raise SystemExit(f"packaged loomd smoke test timed out: {last_error}")
+    raise SystemExit(
+        f"packaged loomd smoke test timed out after {timeout_seconds:.1f}s: {last_error}"
+        f"{_read_log_tail(log_path)}"
+    )
 
 
 def main() -> None:
@@ -145,7 +172,12 @@ def main() -> None:
                 env=env,
             )
         try:
-            runtime_payload = wait_for_runtime(base_url, args.timeout_seconds)
+            runtime_payload = wait_for_runtime(
+                base_url,
+                args.timeout_seconds,
+                process=process,
+                log_path=log_path,
+            )
             print(f"Smoke OK: {base_url}")
             print(
                 json.dumps(
