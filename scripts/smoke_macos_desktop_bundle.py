@@ -10,10 +10,14 @@ import signal
 import socket
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+
+DESKTOP_LEASE_TTL_SECONDS = 20
+DESKTOP_LEASE_HEARTBEAT_SECONDS = 5
 
 
 def parse_args() -> argparse.Namespace:
@@ -53,6 +57,105 @@ def choose_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
+
+
+def _now_unix_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _write_json_atomic(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        prefix=f"{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+        delete=False,
+    ) as handle:
+        json.dump(payload, handle, sort_keys=True)
+        handle.flush()
+        os.fsync(handle.fileno())
+        tmp_path = Path(handle.name)
+    try:
+        os.replace(tmp_path, path)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def write_desktop_lease_record(
+    lease_path: Path,
+    instance_id: str,
+    *,
+    ttl_seconds: int = DESKTOP_LEASE_TTL_SECONDS,
+) -> None:
+    now_ms = _now_unix_ms()
+    _write_json_atomic(
+        lease_path,
+        {
+            "instance_id": instance_id,
+            "desktop_pid": os.getpid(),
+            "created_at_unix_ms": now_ms,
+            "updated_at_unix_ms": now_ms,
+            "lease_expires_unix_ms": now_ms + max(1, int(ttl_seconds)) * 1000,
+        },
+    )
+
+
+def remove_desktop_lease_if_owned(lease_path: Path, instance_id: str) -> None:
+    try:
+        payload = json.loads(lease_path.read_text(encoding="utf-8"))
+    except Exception:
+        payload = None
+    if isinstance(payload, dict) and str(payload.get("instance_id", "")) != instance_id:
+        return
+    lease_path.unlink(missing_ok=True)
+
+
+class DesktopLeaseHeartbeater:
+    def __init__(
+        self,
+        *,
+        lease_path: Path,
+        instance_id: str,
+        ttl_seconds: int = DESKTOP_LEASE_TTL_SECONDS,
+        heartbeat_seconds: int = DESKTOP_LEASE_HEARTBEAT_SECONDS,
+    ) -> None:
+        self._lease_path = lease_path
+        self._instance_id = instance_id
+        self._ttl_seconds = max(1, int(ttl_seconds))
+        self._heartbeat_seconds = max(1, int(heartbeat_seconds))
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        write_desktop_lease_record(
+            self._lease_path,
+            self._instance_id,
+            ttl_seconds=self._ttl_seconds,
+        )
+
+        def _heartbeat() -> None:
+            while not self._stop.wait(self._heartbeat_seconds):
+                write_desktop_lease_record(
+                    self._lease_path,
+                    self._instance_id,
+                    ttl_seconds=self._ttl_seconds,
+                )
+
+        self._thread = threading.Thread(
+            target=_heartbeat,
+            name="loom-desktop-lease-heartbeat",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def close(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=self._heartbeat_seconds + 1)
+        remove_desktop_lease_if_owned(self._lease_path, self._instance_id)
 
 
 def _read_log_tail(log_path: Path | None, *, max_chars: int = 4000) -> str:
@@ -171,6 +274,11 @@ def main() -> None:
                 start_new_session=True,
                 env=env,
             )
+        lease_heartbeater = DesktopLeaseHeartbeater(
+            lease_path=lease_path,
+            instance_id=instance_token,
+        )
+        lease_heartbeater.start()
         try:
             runtime_payload = wait_for_runtime(
                 base_url,
@@ -193,6 +301,7 @@ def main() -> None:
                 )
             )
         finally:
+            lease_heartbeater.close()
             if process.poll() is None:
                 os.killpg(process.pid, signal.SIGTERM)
                 try:

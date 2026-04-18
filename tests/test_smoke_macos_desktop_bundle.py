@@ -46,6 +46,26 @@ def test_wait_for_runtime_returns_payload_on_success(monkeypatch: pytest.MonkeyP
     assert payload == {"status": "ok", "ready": True}
 
 
+def test_desktop_lease_heartbeater_writes_and_cleans_up(tmp_path: Path) -> None:
+    lease_path = tmp_path / "desktop.instance.json"
+    heartbeater = smoke.DesktopLeaseHeartbeater(
+        lease_path=lease_path,
+        instance_id="desktop-bundle-smoke",
+        ttl_seconds=20,
+        heartbeat_seconds=1,
+    )
+
+    heartbeater.start()
+    try:
+        payload = smoke.json.loads(lease_path.read_text(encoding="utf-8"))
+    finally:
+        heartbeater.close()
+
+    assert payload["instance_id"] == "desktop-bundle-smoke"
+    assert payload["lease_expires_unix_ms"] > payload["updated_at_unix_ms"]
+    assert not lease_path.exists()
+
+
 def test_wait_for_runtime_fails_fast_when_process_exits(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
