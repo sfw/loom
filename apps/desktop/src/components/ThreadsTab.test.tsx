@@ -745,6 +745,41 @@ describe("ThreadsTab", () => {
     expect(container.querySelectorAll(".group.relative.pr-8").length).toBeGreaterThanOrEqual(1);
   });
 
+  it("repairs soft-wrapped live text without flattening real markdown structure", () => {
+    mockApp.conversationStatus = {
+      conversation_id: "conversation-1",
+      processing: true,
+    };
+    mockApp.conversationStreaming = true;
+    mockApp.conversationIsProcessing = true;
+    mockApp.conversationPhaseLabel = "Running";
+    mockApp.visibleConversationEvents = [
+      makeEvent(1, "user_message", { text: "hello" }),
+    ];
+    mockApp.streamingThinking = [
+      'The user is asking me to search for "',
+      "edmonton",
+      '" in Notion.',
+      "",
+      "- first check prior context",
+      "- rerun the search",
+    ].join("\n");
+    mockApp.streamingText = [
+      'I already searched for "',
+      "edmonton",
+      '" in the previous message.',
+    ].join("\n");
+
+    const { container } = render(<ThreadsTab />);
+    const livePanel = container.querySelector(".group.relative.pr-8");
+
+    expect(livePanel).not.toBeNull();
+    expect(livePanel).toHaveTextContent('The user is asking me to search for "edmonton" in Notion.');
+    expect(livePanel).toHaveTextContent('I already searched for "edmonton" in the previous message.');
+    expect(screen.getByText("first check prior context")).toBeInTheDocument();
+    expect(screen.getByText("rerun the search")).toBeInTheDocument();
+  });
+
   it("renders optimistic outgoing user bubbles immediately with a sending state", () => {
     mockApp.visibleConversationEvents = [
       {

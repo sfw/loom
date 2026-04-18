@@ -124,6 +124,97 @@ function ThinkingIndicator({
   );
 }
 
+function isLiveMarkdownStructuralLine(line: string, inFence: boolean): boolean {
+  if (inFence) {
+    return true;
+  }
+  const trimmed = line.trim();
+  if (!trimmed) {
+    return false;
+  }
+  return Boolean(
+    /^(```|~~~)/.test(trimmed)
+    || /^#{1,6}\s/.test(trimmed)
+    || /^>\s?/.test(trimmed)
+    || /^([-*+])\s/.test(trimmed)
+    || /^\d+\.\s/.test(trimmed)
+    || /^\|/.test(trimmed)
+    || /^:{1,3}[-| :]+$/.test(trimmed)
+    || /^([-*_]){3,}$/.test(trimmed)
+    || /^\s{4,}\S/.test(line)
+  );
+}
+
+function normalizeLiveInlineSpacing(text: string): string {
+  return text
+    .replace(/\s+([,.;:!?])/g, "$1")
+    .replace(/([(\[{])\s+/g, "$1")
+    .replace(/\s+([)\]}])/g, "$1")
+    .replace(/(["'`])\s+([^"'`\n]+?)\s+\1/g, "$1$2$1")
+    .replace(/(\S)\s+(["'`])(?=$|[.,;:!?)}\]])/g, "$1$2")
+    .replace(/(^|[\s([{])(["'`])\s+(\S)/g, "$1$2$3");
+}
+
+function joinLiveMarkdownParagraph(lines: string[]): string {
+  return normalizeLiveInlineSpacing(
+    lines
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .join(" "),
+  );
+}
+
+function normalizeLiveMarkdown(text: string): string {
+  const normalized = String(text || "").replace(/\r\n?/g, "\n");
+  if (!normalized.trim()) {
+    return "";
+  }
+
+  const lines = normalized.split("\n");
+  const output: string[] = [];
+  let paragraphLines: string[] = [];
+  let inFence = false;
+
+  const flushParagraph = () => {
+    if (paragraphLines.length === 0) {
+      return;
+    }
+    output.push(joinLiveMarkdownParagraph(paragraphLines));
+    paragraphLines = [];
+  };
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    const fenceLine = /^(```|~~~)/.test(trimmed);
+
+    if (!trimmed) {
+      flushParagraph();
+      if (output[output.length - 1] !== "") {
+        output.push("");
+      }
+      continue;
+    }
+
+    if (isLiveMarkdownStructuralLine(line, inFence)) {
+      flushParagraph();
+      output.push(inFence ? line : line.trimEnd());
+      if (fenceLine) {
+        inFence = !inFence;
+      }
+      continue;
+    }
+
+    paragraphLines.push(line);
+  }
+
+  flushParagraph();
+
+  return output
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
 function LiveFeedbackPanel({
   text,
   draftText,
@@ -133,8 +224,13 @@ function LiveFeedbackPanel({
   draftText?: string;
   markdownComponents: Parameters<typeof Markdown>[0]["components"];
 }) {
-  const hasThinking = Boolean(text.trim());
-  const hasDraft = Boolean((draftText || "").trim());
+  const normalizedThinking = useMemo(() => normalizeLiveMarkdown(text), [text]);
+  const normalizedDraft = useMemo(
+    () => normalizeLiveMarkdown(draftText || ""),
+    [draftText],
+  );
+  const hasThinking = Boolean(normalizedThinking);
+  const hasDraft = Boolean(normalizedDraft);
 
   return (
     <div className="group relative pr-8">
@@ -160,7 +256,7 @@ function LiveFeedbackPanel({
             "prose-th:text-zinc-300 prose-td:text-zinc-400",
             "text-zinc-300",
           )}>
-            <Markdown remarkPlugins={[remarkGfm]} components={markdownComponents}>{text}</Markdown>
+            <Markdown remarkPlugins={[remarkGfm]} components={markdownComponents}>{normalizedThinking}</Markdown>
           </div>
         )}
         {hasDraft && (
@@ -183,7 +279,7 @@ function LiveFeedbackPanel({
               "prose-th:text-zinc-300 prose-td:text-zinc-400",
               "text-zinc-300",
             )}>
-              <Markdown remarkPlugins={[remarkGfm]} components={markdownComponents}>{draftText || ""}</Markdown>
+              <Markdown remarkPlugins={[remarkGfm]} components={markdownComponents}>{normalizedDraft}</Markdown>
               <span className="ml-0.5 inline-block h-4 w-1 rounded-full bg-[#a3b396]/70 align-[-0.15em] animate-pulse" />
             </div>
           </div>
