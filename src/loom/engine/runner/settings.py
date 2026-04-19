@@ -35,6 +35,8 @@ class RunnerSettings:
     extractor_tool_trace_max_chars: int
     extractor_prompt_max_chars: int
     compaction_churn_warning_calls: int
+    compaction_compactor_call_max_per_turn: int
+    compaction_circuit_breaker_failure_limit: int
     enable_filetype_ingest_router: bool
     enable_artifact_telemetry_events: bool
     artifact_telemetry_max_metadata_chars: int
@@ -264,6 +266,26 @@ class RunnerSettings:
                     runner_limits,
                     "compaction_churn_warning_calls",
                     runner_defaults.COMPACTION_CHURN_WARNING_CALLS,
+                ),
+            ),
+        )
+        compaction_compactor_call_max_per_turn = max(
+            1,
+            int(
+                getattr(
+                    runner_limits,
+                    "compaction_compactor_call_max_per_turn",
+                    runner_defaults.COMPACTION_COMPACTOR_CALL_MAX_PER_TURN,
+                ),
+            ),
+        )
+        compaction_circuit_breaker_failure_limit = max(
+            1,
+            int(
+                getattr(
+                    runner_limits,
+                    "compaction_circuit_breaker_failure_limit",
+                    runner_defaults.COMPACTION_CIRCUIT_BREAKER_FAILURE_LIMIT,
                 ),
             ),
         )
@@ -517,6 +539,8 @@ class RunnerSettings:
             extractor_tool_trace_max_chars=extractor_tool_trace_max_chars,
             extractor_prompt_max_chars=extractor_prompt_max_chars,
             compaction_churn_warning_calls=compaction_churn_warning_calls,
+            compaction_compactor_call_max_per_turn=compaction_compactor_call_max_per_turn,
+            compaction_circuit_breaker_failure_limit=compaction_circuit_breaker_failure_limit,
             enable_filetype_ingest_router=enable_filetype_ingest_router,
             enable_artifact_telemetry_events=enable_artifact_telemetry_events,
             artifact_telemetry_max_metadata_chars=artifact_telemetry_max_metadata_chars,

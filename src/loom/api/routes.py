@@ -8304,6 +8304,30 @@ async def get_conversation_events(
         return []
 
 
+def _conversation_context_status_from_session_row(
+    session: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not isinstance(session, dict):
+        return None
+    raw_state = session.get("session_state")
+    state = raw_state if isinstance(raw_state, dict) else _json_object(raw_state)
+    if not isinstance(state, dict):
+        return None
+    ui_state = state.get("ui_state")
+    if not isinstance(ui_state, dict):
+        return None
+    context_status = ui_state.get("context_status")
+    if not isinstance(context_status, dict):
+        return None
+    return dict(context_status)
+
+
+def _conversation_compaction_policy_mode(engine: Engine) -> str:
+    limits = getattr(getattr(engine.config, "limits", None), "runner", None)
+    mode = str(getattr(limits, "runner_compaction_policy_mode", "off") or "off").strip().lower()
+    return mode if mode in {"legacy", "tiered", "off"} else "off"
+
+
 @router.get("/conversations/{conversation_id}/status")
 async def get_conversation_status(
     request: Request,
@@ -8329,6 +8353,18 @@ async def get_conversation_status(
             if processing or pending_approval is not None
             else await _conversation_pending_prompt(engine, conversation_id)
         )
+        compaction_policy_mode = _conversation_compaction_policy_mode(engine)
+        compaction_enabled = compaction_policy_mode != "off"
+        context_status = (
+            engine.conversation_context_status(conversation_id)
+            or _conversation_context_status_from_session_row(session)
+        )
+        if context_status is not None:
+            context_status = {
+                **context_status,
+                "compaction_enabled": bool(compaction_enabled),
+                "compaction_policy_mode": compaction_policy_mode,
+            }
         return {
             "conversation_id": conversation_id,
             "processing": processing,
@@ -8338,6 +8374,7 @@ async def get_conversation_status(
             "pending_approval": pending_approval,
             "awaiting_user_input": pending_prompt is not None,
             "pending_prompt": pending_prompt,
+            "context_status": context_status,
         }
 
 

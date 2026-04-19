@@ -114,6 +114,8 @@ class SubtaskRunner:
     EXTRACTOR_TOOL_TRACE_MAX_CHARS = 3600
     EXTRACTOR_PROMPT_MAX_CHARS = 9000
     COMPACTION_CHURN_WARNING_CALLS = 10
+    COMPACTION_COMPACTOR_CALL_MAX_PER_TURN = 6
+    COMPACTION_CIRCUIT_BREAKER_FAILURE_LIMIT = 3
     ENABLE_FILETYPE_INGEST_ROUTER = True
     ENABLE_ARTIFACT_TELEMETRY_EVENTS = True
     ARTIFACT_TELEMETRY_MAX_METADATA_CHARS = 1200
@@ -273,7 +275,8 @@ class SubtaskRunner:
             model_event_hook=self._emit_compactor_model_event,
             role="compactor",
             tier=1,
-            allow_role_fallback=True,
+            # Keep runner compaction on the dedicated compactor lane by default.
+            allow_role_fallback=False,
             **settings.compactor_kwargs,
         )
         self._subtask_deadline_monotonic: float | None = None
@@ -281,8 +284,18 @@ class SubtaskRunner:
         self._runner_compaction_cache: dict[tuple[str, int, str], str] = {}
         self._runner_compaction_no_gain: dict[tuple[str, int, str], int] = {}
         self._runner_compaction_overshoot: set[tuple[str, int, str]] = set()
+        self._compaction_compactor_call_max_per_turn = (
+            settings.compaction_compactor_call_max_per_turn
+        )
+        self._compaction_circuit_breaker_failure_limit = (
+            settings.compaction_circuit_breaker_failure_limit
+        )
         self._compaction_runtime_stats: dict[str, Any] = {
             "compactor_calls": 0,
+            "compactor_failures": 0,
+            "circuit_breaker_tripped": False,
+            "microcompact_hits": 0,
+            "microcompact_chars_reduced": 0,
             "skip_reasons": {},
         }
         self._active_subtask_telemetry_counters: dict[str, int] | None = None
@@ -290,6 +303,10 @@ class SubtaskRunner:
     def _reset_compaction_runtime_stats(self) -> None:
         self._compaction_runtime_stats = {
             "compactor_calls": 0,
+            "compactor_failures": 0,
+            "circuit_breaker_tripped": False,
+            "microcompact_hits": 0,
+            "microcompact_chars_reduced": 0,
             "skip_reasons": {},
         }
 
@@ -308,6 +325,34 @@ class SubtaskRunner:
         if not isinstance(stats, dict):
             return
         stats["compactor_calls"] = int(stats.get("compactor_calls", 0)) + 1
+
+    def _record_compaction_failure(self) -> None:
+        stats = getattr(self, "_compaction_runtime_stats", None)
+        if not isinstance(stats, dict):
+            return
+        failures = int(stats.get("compactor_failures", 0)) + 1
+        stats["compactor_failures"] = failures
+        limit = max(
+            1,
+            int(
+                getattr(
+                    self,
+                    "_compaction_circuit_breaker_failure_limit",
+                    self.COMPACTION_CIRCUIT_BREAKER_FAILURE_LIMIT,
+                ),
+            ),
+        )
+        if failures >= limit:
+            stats["circuit_breaker_tripped"] = True
+
+    def _record_compaction_microcompact(self, chars_reduced: int = 0) -> None:
+        stats = getattr(self, "_compaction_runtime_stats", None)
+        if not isinstance(stats, dict):
+            return
+        stats["microcompact_hits"] = int(stats.get("microcompact_hits", 0)) + 1
+        stats["microcompact_chars_reduced"] = int(
+            stats.get("microcompact_chars_reduced", 0),
+        ) + max(0, int(chars_reduced))
 
     def _ensure_runner_compaction_state(self) -> None:
         if not isinstance(getattr(self, "_runner_compaction_cache", None), dict):
@@ -1908,15 +1953,50 @@ class SubtaskRunner:
     def _set_compaction_diagnostics(self, payload: dict[str, Any]) -> None:
         runner_compaction.set_compaction_diagnostics(self, payload)
 
+    def _prune_tool_schemas_for_request_fit(
+        self,
+        messages: list[dict],
+        tool_schemas: list[dict],
+        *,
+        context_budget: int | None = None,
+    ) -> tuple[list[dict], dict[str, Any]]:
+        return runner_compaction.prune_tool_schemas_for_fit(
+            self,
+            messages,
+            tool_schemas,
+            context_budget=int(
+                context_budget
+                if context_budget is not None
+                else getattr(
+                    self,
+                    "_max_model_context_tokens",
+                    self.MAX_MODEL_CONTEXT_TOKENS,
+                ),
+            ),
+        )
+
     async def _compact_messages_for_model(
         self,
         messages: list[dict],
         *,
+        tools: list[dict] | None = None,
         remaining_seconds: float | None = None,
     ) -> list[dict]:
         mode = self._runner_compaction_mode()
         if mode == "off":
-            estimate = self._estimate_message_tokens(messages)
+            estimate = runner_compaction.compute_request_budget(
+                messages=messages,
+                tools=tools,
+                context_budget_tokens=int(
+                    getattr(
+                        self,
+                        "_max_model_context_tokens",
+                        self.MAX_MODEL_CONTEXT_TOKENS,
+                    ),
+                ),
+                target_ratio=1.0,
+                origin="runner.compaction.disabled",
+            ).request_est_tokens
             self._set_compaction_diagnostics({
                 "compaction_policy_mode": mode,
                 "compaction_stage": "none",
@@ -1930,19 +2010,22 @@ class SubtaskRunner:
         if mode == "tiered":
             return await self._compact_messages_for_model_tiered(
                 messages,
+                tools=tools,
                 remaining_seconds=remaining_seconds,
             )
-        return await self._compact_messages_for_model_legacy(messages)
+        return await self._compact_messages_for_model_legacy(messages, tools=tools)
 
     async def _compact_messages_for_model_tiered(
         self,
         messages: list[dict],
         *,
+        tools: list[dict] | None = None,
         remaining_seconds: float | None = None,
     ) -> list[dict]:
         return await runner_compaction.compact_messages_for_model_tiered(
             self,
             messages,
+            tools=tools,
             remaining_seconds=remaining_seconds,
             logger=logger,
         )
@@ -1950,8 +2033,11 @@ class SubtaskRunner:
     async def _compact_messages_for_model_legacy(
         self,
         messages: list[dict],
+        *,
+        tools: list[dict] | None = None,
     ) -> list[dict]:
         return await runner_compaction.compact_messages_for_model_legacy(
             self,
             messages,
+            tools=tools,
         )

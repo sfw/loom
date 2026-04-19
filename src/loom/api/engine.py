@@ -307,6 +307,28 @@ class Engine:
         except Exception:
             return 0
 
+    def conversation_context_status(self, session_id: str) -> dict[str, object] | None:
+        """Return live context-pressure status for an active cowork session."""
+        clean_id = str(session_id or "").strip()
+        if not clean_id:
+            return None
+        worker = self._conversation_workers.get(clean_id)
+        if worker is None:
+            return None
+        getter = getattr(worker.session, "context_status_snapshot", None)
+        if not callable(getter):
+            return None
+        try:
+            snapshot = getter()
+        except Exception:
+            logger.debug(
+                "Failed reading live conversation context status for %s",
+                clean_id,
+                exc_info=True,
+            )
+            return None
+        return dict(snapshot) if isinstance(snapshot, dict) else None
+
     def queue_conversation_inject_instruction(self, session_id: str, text: str) -> int:
         """Queue a steering instruction for the active cowork turn."""
         clean_id = str(session_id or "").strip()

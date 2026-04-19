@@ -59,6 +59,35 @@ def test_emit_compaction_policy_decision_from_diagnostics_emits_event() -> None:
     assert runner._active_subtask_telemetry_counters["compaction_policy_decisions"] == 1
 
 
+def test_emit_compaction_policy_decision_reports_tool_schema_pruning() -> None:
+    runner = _TelemetryRunnerStub()
+    runner._last_compaction_diagnostics = {
+        "compaction_policy_mode": "tiered",
+        "compaction_pressure_ratio": 1.04,
+        "compaction_stage": "tool_schema_prune",
+        "compaction_tool_schema_pruned": True,
+        "compaction_skipped_reason": "",
+    }
+    events = []
+    runner._event_bus.subscribe_all(lambda event: events.append(event))
+
+    runner_telemetry.emit_compaction_policy_decision_from_diagnostics(
+        runner,
+        task_id="task-1",
+        subtask_id="subtask-1",
+    )
+
+    decision_events = [
+        event for event in events
+        if event.event_type == COMPACTION_POLICY_DECISION
+    ]
+    assert len(decision_events) == 1
+    payload = decision_events[0].data
+    assert payload["decision"] == "compact_tool"
+    assert payload["reason"] == "tool_schema_pruned"
+    assert payload["tool_schema_pruned"] is True
+
+
 def test_emit_overflow_fallback_telemetry_emits_dual_events() -> None:
     runner = _TelemetryRunnerStub()
     events = []

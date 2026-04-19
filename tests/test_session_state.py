@@ -149,6 +149,24 @@ class TestSessionState:
         assert restored.open_questions[0]["entry_type"] == "open_question"
         assert restored.memory_index_last_indexed_turn == 18
 
+    def test_compact_memory_round_trip(self):
+        state = SessionState(session_id="test", workspace="/tmp", model_name="m")
+        state.update_compact_memory(
+            summary="- Older user topics: auth flow\n- Older tool activity: read_file, rg_search",
+            boundary_message_count=24,
+            message_count=24,
+            tool_message_count=7,
+        )
+
+        raw = state.to_dict()
+        restored = SessionState.from_dict(raw)
+
+        assert restored.has_compact_memory is True
+        assert restored.compact_boundary_message_count == 24
+        assert restored.compact_summary_message_count == 24
+        assert restored.compact_summary_tool_message_count == 7
+        assert "Older tool activity" in restored.compact_summary
+
     def test_to_yaml_includes_active_memory_sections(self):
         state = SessionState(session_id="x", workspace="/tmp", model_name="m")
         state.update_memory_snapshot({
@@ -164,6 +182,21 @@ class TestSessionState:
         rendered = state.to_yaml()
         assert "active_memory" in rendered
         assert "DECISION" in rendered
+
+    def test_to_yaml_includes_compact_memory(self):
+        state = SessionState(session_id="x", workspace="/tmp", model_name="m")
+        state.update_compact_memory(
+            summary="- Older user topics: onboarding\n- Older assistant context: follow-up summary",
+            boundary_message_count=18,
+            message_count=18,
+            tool_message_count=4,
+        )
+
+        rendered = state.to_yaml()
+
+        assert "compact_memory" in rendered
+        assert "boundary_message_count: 18" in rendered
+        assert "Older assistant context" in rendered
 
     def test_from_json(self):
         state = SessionState(session_id="x", workspace="/tmp", model_name="m")

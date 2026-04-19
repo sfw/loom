@@ -20,6 +20,7 @@ import {
   writeScratchFile,
   type ConversationMessageAttachments,
   type ConversationApproval,
+  type ConversationContextStatus,
   type ConversationContentBlock,
   type ConversationDetail,
   type ConversationMessage,
@@ -119,6 +120,154 @@ function ThinkingIndicator({
         {live && (
           <span className="text-[10px] text-zinc-700/80 tabular-nums">{formatElapsed(elapsed)}</span>
         )}
+      </div>
+    </div>
+  );
+}
+
+function formatContextTokenCount(value: number): string {
+  const safeValue = Math.max(0, Number(value || 0));
+  if (safeValue >= 100_000) {
+    return `${Math.round(safeValue / 1000)}k`;
+  }
+  if (safeValue >= 1_000) {
+    return `${(safeValue / 1000).toFixed(1)}k`;
+  }
+  return `${safeValue}`;
+}
+
+function contextPressurePresentation(
+  contextStatus: ConversationContextStatus | null | undefined,
+): {
+  label: string;
+  tone: string;
+  chipClassName: string;
+  badgeClassName: string;
+  ringClassName: string;
+  dotClassName: string;
+} {
+  const pressureState = String(contextStatus?.pressure_state || "").trim().toLowerCase();
+  switch (pressureState) {
+    case "compacted":
+      return {
+        label: "Compacted",
+        tone: "Context compacted recently",
+        chipClassName: "border-sky-500/20 bg-sky-500/8 text-sky-300",
+        badgeClassName: "bg-sky-500/15 text-sky-300",
+        ringClassName: "stroke-sky-400",
+        dotClassName: "bg-sky-400",
+      };
+    case "near_limit":
+      return {
+        label: "Near limit",
+        tone: "Very full context window",
+        chipClassName: "border-amber-500/20 bg-amber-500/8 text-amber-200",
+        badgeClassName: "bg-amber-500/15 text-amber-300",
+        ringClassName: "stroke-amber-300",
+        dotClassName: "bg-amber-300",
+      };
+    case "approaching":
+      return {
+        label: "Approaching compaction",
+        tone: "Context window is filling",
+        chipClassName: "border-amber-500/20 bg-amber-500/8 text-amber-200",
+        badgeClassName: "bg-amber-500/15 text-amber-300",
+        ringClassName: "stroke-amber-300",
+        dotClassName: "bg-amber-300",
+      };
+    case "degraded":
+      return {
+        label: "Degraded",
+        tone: "Context recall degraded",
+        chipClassName: "border-red-500/20 bg-red-500/8 text-red-200",
+        badgeClassName: "bg-red-500/15 text-red-300",
+        ringClassName: "stroke-red-300",
+        dotClassName: "bg-red-300",
+      };
+    default:
+      return {
+        label: "Normal",
+        tone: "Context window healthy",
+        chipClassName: "border-zinc-800 bg-zinc-950/70 text-zinc-300",
+        badgeClassName: "bg-zinc-800 text-zinc-300",
+        ringClassName: "stroke-zinc-300",
+        dotClassName: "bg-zinc-300",
+      };
+  }
+}
+
+function ContextPressureMeter({
+  contextStatus,
+}: {
+  contextStatus: ConversationContextStatus;
+}) {
+  const presentation = contextPressurePresentation(contextStatus);
+  const percentUsed = Math.max(0, Math.min(100, Number(contextStatus.percent_used || 0)));
+  const radius = 9;
+  const strokeWidth = 2;
+  const circumference = 2 * Math.PI * radius;
+  const dashOffset = circumference - (percentUsed / 100) * circumference;
+  const compactedSummary = contextStatus.compacted_message_count > 0
+    ? `${contextStatus.compacted_message_count.toLocaleString()} older msg${contextStatus.compacted_message_count === 1 ? "" : "s"} compacted`
+    : "No compacted history yet";
+  const ariaLabel = `${presentation.label}. Context window ${formatContextTokenCount(contextStatus.estimated_tokens)} / ${formatContextTokenCount(contextStatus.max_tokens)} tokens (${Math.round(percentUsed)}% full).`;
+
+  return (
+    <div className="group relative">
+      <button
+        type="button"
+        aria-label={ariaLabel}
+        className="inline-flex h-8 w-8 items-center justify-center rounded-full border border-zinc-800 bg-zinc-950/80 text-zinc-300 transition-colors hover:border-zinc-700 focus:outline-none focus:ring-1 focus:ring-[#8a9a7b]"
+      >
+        <svg width="24" height="24" viewBox="0 0 24 24" className="block">
+          <circle
+            cx="12"
+            cy="12"
+            r={radius}
+            fill="none"
+            strokeWidth={strokeWidth}
+            className="stroke-zinc-800"
+          />
+          <circle
+            cx="12"
+            cy="12"
+            r={radius}
+            fill="none"
+            strokeWidth={strokeWidth}
+            strokeLinecap="round"
+            strokeDasharray={circumference}
+            strokeDashoffset={dashOffset}
+            transform="rotate(-90 12 12)"
+            className={presentation.ringClassName}
+          />
+        </svg>
+        <span className={cn(
+          "pointer-events-none absolute h-1.5 w-1.5 rounded-full",
+          presentation.dotClassName,
+        )} />
+      </button>
+
+      <div className="pointer-events-none absolute bottom-full right-0 z-50 mb-2 w-64 translate-y-1 rounded-xl border border-zinc-800 bg-zinc-950/96 px-3 py-3 text-left opacity-0 shadow-2xl transition-all duration-150 group-hover:translate-y-0 group-hover:opacity-100 group-focus-within:translate-y-0 group-focus-within:opacity-100">
+        <div className="flex items-center gap-2">
+          <span className={cn(
+            "inline-flex rounded-full px-2 py-0.5 text-[10px] font-medium",
+            presentation.badgeClassName,
+          )}>
+            {presentation.label}
+          </span>
+          <span className="text-[11px] text-zinc-400">{presentation.tone}</span>
+        </div>
+        <div className="mt-2 text-sm text-zinc-200">
+          {formatContextTokenCount(contextStatus.estimated_tokens)} / {formatContextTokenCount(contextStatus.max_tokens)} tokens
+        </div>
+        <div className="mt-1 text-[11px] text-zinc-500">
+          {Math.round(percentUsed)}% full
+        </div>
+        <div className="mt-3 space-y-1 text-[11px] text-zinc-400">
+          <div>{compactedSummary}</div>
+          {contextStatus.recall_index_used && <div>Recall index active</div>}
+          {contextStatus.memory_index_degraded && <div>Recall degraded</div>}
+        </div>
       </div>
     </div>
   );
@@ -922,6 +1071,19 @@ export default function ThreadsTab() {
     : conversationAwaitingInput && pendingConversationPrompt
       ? "Choose a reply option below to continue, or send a message if you want to answer in free text."
       : "";
+  const contextStatus = conversationStatus?.context_status || null;
+  const contextIndicatorVisible = Boolean(
+    contextStatus && contextStatus.compaction_enabled !== false,
+  );
+  const showContextCompactionInProgress = Boolean(
+    contextIndicatorVisible
+    && conversationIsProcessing
+    && !conversationAwaitingApproval
+    && !conversationAwaitingInput
+    && !conversationStreaming
+    && streamingToolCalls.length === 0
+    && contextStatus?.likely_compaction_next_turn,
+  );
   // Scroll to bottom when content changes and pinned (debounced)
   useEffect(() => {
     if (!isPinnedRef.current || userScrollingRef.current) return;
@@ -1640,6 +1802,15 @@ export default function ThreadsTab() {
           </div>
         ))}
 
+        {showContextCompactionInProgress && (
+          <div className="pr-8">
+            <div className="inline-flex items-center gap-2 rounded-full border border-zinc-800/90 bg-zinc-950/70 px-3 py-1.5 text-[11px] text-zinc-500">
+              <Loader2 size={11} className="shrink-0 animate-spin text-zinc-600" />
+              <span>Compacting context…</span>
+            </div>
+          </div>
+        )}
+
         {/* ===== Live thinking placeholder ===== */}
         {showLiveFeedback && (
           <LiveFeedbackPanel
@@ -1979,9 +2150,14 @@ export default function ThreadsTab() {
           </div>
         </form>
 
-        <p className="text-[10px] text-zinc-600 mt-1.5 text-right">
-          Enter to send · {navigator.platform?.includes("Mac") ? "⌘" : "Ctrl"}+Enter inject · ⇧+{navigator.platform?.includes("Mac") ? "⌘" : "Ctrl"}+Enter redirect
-        </p>
+        <div className="mt-1.5 flex items-center justify-between gap-3">
+          <p className="text-[10px] text-zinc-600">
+            Enter to send · {navigator.platform?.includes("Mac") ? "⌘" : "Ctrl"}+Enter inject · ⇧+{navigator.platform?.includes("Mac") ? "⌘" : "Ctrl"}+Enter redirect
+          </p>
+          {contextIndicatorVisible && contextStatus && (
+            <ContextPressureMeter contextStatus={contextStatus} />
+          )}
+        </div>
       </div>
     </div>
   );

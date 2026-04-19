@@ -46,6 +46,10 @@ class SessionState:
     memory_index_degraded: bool = False
     memory_index_failure_count: int = 0
     memory_index_last_error: str = ""
+    compact_boundary_message_count: int = 0
+    compact_summary_message_count: int = 0
+    compact_summary_tool_message_count: int = 0
+    compact_summary: str = ""
     # UI-only metadata (not injected into prompts), e.g. restored TUI tab state.
     ui_state: dict = field(default_factory=dict)
 
@@ -95,6 +99,10 @@ class SessionState:
             or self.open_questions
         )
 
+    @property
+    def has_compact_memory(self) -> bool:
+        return bool(str(self.compact_summary or "").strip())
+
     def update_memory_snapshot(self, snapshot: dict[str, list[dict]]) -> None:
         """Update compact marker-oriented memory slices used in prompts."""
         if not isinstance(snapshot, dict):
@@ -132,6 +140,28 @@ class SessionState:
             self.memory_index_failure_count = max(0, int(failure_count))
         if last_error is not None:
             self.memory_index_last_error = _normalize_inline(last_error)
+
+    def update_compact_memory(
+        self,
+        *,
+        summary: str,
+        boundary_message_count: int | None = None,
+        message_count: int | None = None,
+        tool_message_count: int | None = None,
+    ) -> None:
+        self.compact_summary = _normalize_multiline(summary)
+        if boundary_message_count is not None:
+            self.compact_boundary_message_count = max(0, int(boundary_message_count))
+        if message_count is not None:
+            self.compact_summary_message_count = max(0, int(message_count))
+        if tool_message_count is not None:
+            self.compact_summary_tool_message_count = max(0, int(tool_message_count))
+
+    def clear_compact_memory(self) -> None:
+        self.compact_boundary_message_count = 0
+        self.compact_summary_message_count = 0
+        self.compact_summary_tool_message_count = 0
+        self.compact_summary = ""
 
     def to_yaml(self) -> str:
         """Render as compact YAML for system prompt injection."""
@@ -183,6 +213,13 @@ class SessionState:
             ]
         if active_memory:
             data["active_memory"] = active_memory
+        if self.has_compact_memory:
+            data["compact_memory"] = {
+                "boundary_message_count": self.compact_boundary_message_count,
+                "message_count": self.compact_summary_message_count,
+                "tool_message_count": self.compact_summary_tool_message_count,
+                "summary": self.compact_summary.splitlines(),
+            }
         if self.memory_index_degraded or self.memory_index_last_indexed_turn > 0:
             data["memory_index"] = {
                 "last_indexed_turn": self.memory_index_last_indexed_turn,
@@ -215,6 +252,10 @@ class SessionState:
             "memory_index_degraded": self.memory_index_degraded,
             "memory_index_failure_count": self.memory_index_failure_count,
             "memory_index_last_error": self.memory_index_last_error,
+            "compact_boundary_message_count": self.compact_boundary_message_count,
+            "compact_summary_message_count": self.compact_summary_message_count,
+            "compact_summary_tool_message_count": self.compact_summary_tool_message_count,
+            "compact_summary": self.compact_summary,
             "ui_state": self.ui_state,
         }
 
@@ -257,6 +298,21 @@ class SessionState:
             ),
             memory_index_last_error=_normalize_inline(
                 str(data.get("memory_index_last_error", "") or "")
+            ),
+            compact_boundary_message_count=max(
+                0,
+                int(data.get("compact_boundary_message_count", 0) or 0),
+            ),
+            compact_summary_message_count=max(
+                0,
+                int(data.get("compact_summary_message_count", 0) or 0),
+            ),
+            compact_summary_tool_message_count=max(
+                0,
+                int(data.get("compact_summary_tool_message_count", 0) or 0),
+            ),
+            compact_summary=_normalize_multiline(
+                str(data.get("compact_summary", "") or ""),
             ),
             ui_state=(
                 data.get("ui_state", {})
@@ -412,3 +468,13 @@ def extract_state_from_tool_events(
 def _normalize_inline(value: str) -> str:
     """Collapse whitespace for inline session-state fields."""
     return " ".join(str(value or "").split())
+
+
+def _normalize_multiline(value: str) -> str:
+    """Normalize multiline summaries while preserving line boundaries."""
+    lines = [
+        _normalize_inline(line)
+        for line in str(value or "").splitlines()
+        if _normalize_inline(line)
+    ]
+    return "\n".join(lines)

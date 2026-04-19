@@ -739,6 +739,120 @@ class TestCoworkSession:
         assert "id=108" in recall_content
         assert "decision_context" in recall_content
 
+    async def test_context_window_preserves_latest_tool_exchange_when_history_is_trimmed(
+        self,
+        workspace,
+        tools,
+    ):
+        provider = MockProvider([
+            ModelResponse(text="ok", usage=TokenUsage(total_tokens=2)),
+        ])
+        session = CoworkSession(
+            model=provider,
+            tools=tools,
+            workspace=workspace,
+            system_prompt="test",
+            max_context_messages=8,
+            max_context_tokens=5200,
+        )
+
+        session._messages = [{"role": "system", "content": "test"}]
+        for idx in range(10):
+            session._messages.append({
+                "role": "user",
+                "content": f"Older context {idx}: " + ("archive " * 60),
+            })
+            session._messages.append({
+                "role": "assistant",
+                "content": f"Older reply {idx}: " + ("detail " * 40),
+            })
+
+        session._messages.extend([
+            {
+                "role": "assistant",
+                "content": "Checking the latest workspace state.",
+                "tool_calls": [
+                    {
+                        "id": "tc-latest",
+                        "type": "function",
+                        "function": {"name": "ripgrep_search", "arguments": "{}"},
+                    },
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "tc-latest",
+                "content": json.dumps({
+                    "success": True,
+                    "output": "latest tool output",
+                    "error": "",
+                    "files_changed": [],
+                }),
+            },
+            {"role": "assistant", "content": "LATEST CRITICAL: preserve exact matching paths."},
+            {"role": "user", "content": "LATEST USER: keep the newest search result in context."},
+        ])
+
+        context = session._context_window()
+
+        assert any(
+            msg.get("role") == "assistant"
+            and any(
+                call.get("id") == "tc-latest"
+                for call in list(msg.get("tool_calls", []))
+                if isinstance(call, dict)
+            )
+            for msg in context
+            if isinstance(msg, dict)
+        )
+        assert any(
+            msg.get("role") == "tool" and msg.get("tool_call_id") == "tc-latest"
+            for msg in context
+            if isinstance(msg, dict)
+        )
+        assert session.session_state.has_compact_memory is True
+        assert "Older user topics" in session.session_state.compact_summary
+
+    async def test_context_window_reuses_persisted_compact_memory_on_recent_tail_only(
+        self,
+        workspace,
+        tools,
+    ):
+        provider = MockProvider([
+            ModelResponse(text="ok", usage=TokenUsage(total_tokens=2)),
+        ])
+        session = CoworkSession(
+            model=provider,
+            tools=tools,
+            workspace=workspace,
+            system_prompt="test",
+            max_context_messages=8,
+            max_context_tokens=9000,
+        )
+        session.session_state.update_compact_memory(
+            summary=(
+                "- Older user topics: auth edge cases\n"
+                "- Older tool activity: ripgrep_search, read_file"
+            ),
+            boundary_message_count=40,
+            message_count=40,
+            tool_message_count=11,
+        )
+        session._messages = [
+            {"role": "system", "content": "test"},
+            {"role": "assistant", "content": "Recent assistant note."},
+            {"role": "user", "content": "Recent user follow-up."},
+        ]
+
+        context = session._context_window()
+
+        assert any(
+            msg.get("role") == "system"
+            and "Compact archive index" in str(msg.get("content", ""))
+            and "Older tool activity" in str(msg.get("content", ""))
+            for msg in context[1:]
+        )
+
     async def test_context_window_repairs_dangling_assistant_tool_calls(
         self,
         workspace,

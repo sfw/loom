@@ -70,6 +70,22 @@ describe("ThreadsTab", () => {
       conversationStatus: {
         conversation_id: "conversation-1",
         processing: false,
+        context_status: {
+          estimated_tokens: 18400,
+          max_tokens: 24000,
+          percent_used: 76.7,
+          pressure_state: "approaching",
+          compaction_enabled: true,
+          compaction_policy_mode: "tiered",
+          compacted: false,
+          compacted_message_count: 0,
+          compacted_tool_message_count: 0,
+          recall_index_used: false,
+          memory_index_degraded: false,
+          likely_compaction_next_turn: false,
+          last_compaction_at: "",
+          updated_at: "2026-03-27T00:00:00Z",
+        },
       },
       conversationStreaming: false,
       conversationIsProcessing: false,
@@ -147,6 +163,50 @@ describe("ThreadsTab", () => {
       expect(mockApp.setSelectedConversationId).toHaveBeenCalledWith("conversation-1");
     });
     expect(screen.getByText("Opening thread...")).toBeInTheDocument();
+  });
+
+  it("shows the context window indicator in the composer footer", () => {
+    render(<ThreadsTab />);
+
+    expect(
+      screen.getByLabelText("Approaching compaction. Context window 18.4k / 24.0k tokens (77% full)."),
+    ).toBeInTheDocument();
+  });
+
+  it("shows a transient compaction message before live output starts", () => {
+    mockApp.conversationIsProcessing = true;
+    mockApp.conversationStatus = {
+      ...mockApp.conversationStatus,
+      processing: true,
+      context_status: {
+        ...mockApp.conversationStatus.context_status,
+        likely_compaction_next_turn: true,
+        pressure_state: "compacted",
+        compacted: true,
+        compacted_message_count: 14,
+      },
+    };
+
+    render(<ThreadsTab />);
+
+    expect(screen.getByText("Compacting context…")).toBeInTheDocument();
+  });
+
+  it("hides the context meter when compaction is off", () => {
+    mockApp.conversationStatus = {
+      ...mockApp.conversationStatus,
+      context_status: {
+        ...mockApp.conversationStatus.context_status,
+        compaction_enabled: false,
+        compaction_policy_mode: "off",
+      },
+    };
+
+    render(<ThreadsTab />);
+
+    expect(
+      screen.queryByLabelText("Approaching compaction. Context window 18.4k / 24.0k tokens (77% full)."),
+    ).not.toBeInTheDocument();
   });
 
   it("shows a thread chooser when the workspace has multiple threads", async () => {

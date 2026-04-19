@@ -4336,6 +4336,116 @@ class TestWorkspaceFirstEndpoints:
         assert payload["pending_prompt"] is None
 
     @pytest.mark.asyncio
+    async def test_conversation_status_includes_persisted_context_status(
+        self,
+        client,
+        tmp_path,
+        conversation_store,
+        workspace_registry,
+    ):
+        workspace_path = tmp_path / "chat-context-status-ws"
+        workspace_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(str(workspace_path))
+        assert workspace is not None
+        session_id = await conversation_store.create_session(
+            workspace=str(workspace_path),
+            model_name="chat-model",
+        )
+
+        await conversation_store.patch_session_state_metadata(
+            session_id,
+            ui_state={
+                "context_status": {
+                    "estimated_tokens": 18600,
+                    "max_tokens": 24000,
+                    "percent_used": 77.5,
+                    "pressure_state": "approaching",
+                    "compacted": False,
+                    "compacted_message_count": 0,
+                    "compacted_tool_message_count": 0,
+                    "recall_index_used": False,
+                    "memory_index_degraded": False,
+                    "likely_compaction_next_turn": False,
+                    "last_compaction_at": "",
+                    "updated_at": "2026-04-18T00:00:00Z",
+                },
+            },
+        )
+
+        response = await client.get(f"/conversations/{session_id}/status")
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["context_status"]["estimated_tokens"] == 18600
+        assert payload["context_status"]["pressure_state"] == "approaching"
+        assert payload["context_status"]["compaction_enabled"] is False
+        assert payload["context_status"]["compaction_policy_mode"] == "off"
+
+    @pytest.mark.asyncio
+    async def test_conversation_status_prefers_live_context_status(
+        self,
+        client,
+        engine,
+        tmp_path,
+        conversation_store,
+        workspace_registry,
+        monkeypatch,
+    ):
+        workspace_path = tmp_path / "chat-live-context-status-ws"
+        workspace_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(str(workspace_path))
+        assert workspace is not None
+        session_id = await conversation_store.create_session(
+            workspace=str(workspace_path),
+            model_name="chat-model",
+        )
+
+        await conversation_store.patch_session_state_metadata(
+            session_id,
+            ui_state={
+                "context_status": {
+                    "estimated_tokens": 12000,
+                    "max_tokens": 24000,
+                    "percent_used": 50.0,
+                    "pressure_state": "normal",
+                    "compacted": False,
+                    "compacted_message_count": 0,
+                    "compacted_tool_message_count": 0,
+                    "recall_index_used": False,
+                    "memory_index_degraded": False,
+                    "likely_compaction_next_turn": False,
+                    "last_compaction_at": "",
+                    "updated_at": "2026-04-18T00:00:00Z",
+                },
+            },
+        )
+        monkeypatch.setattr(
+            engine,
+            "conversation_context_status",
+            lambda conversation_id: {
+                "estimated_tokens": 22800,
+                "max_tokens": 24000,
+                "percent_used": 95.0,
+                "pressure_state": "compacted",
+                "compacted": True,
+                "compacted_message_count": 18,
+                "compacted_tool_message_count": 6,
+                "recall_index_used": True,
+                "memory_index_degraded": False,
+                "likely_compaction_next_turn": True,
+                "last_compaction_at": "2026-04-18T01:00:00Z",
+                "updated_at": "2026-04-18T01:00:00Z",
+            } if conversation_id == session_id else None,
+        )
+
+        response = await client.get(f"/conversations/{session_id}/status")
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["context_status"]["estimated_tokens"] == 22800
+        assert payload["context_status"]["pressure_state"] == "compacted"
+        assert payload["context_status"]["compacted_message_count"] == 18
+        assert payload["context_status"]["compaction_enabled"] is False
+
+    @pytest.mark.asyncio
     async def test_conversation_events_ignore_uncovered_partial_journal_rows(
         self,
         client,
