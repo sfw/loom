@@ -439,6 +439,8 @@ class RunnerLimitsConfig:
     extractor_tool_trace_max_chars: int = 3600
     extractor_prompt_max_chars: int = 9000
     compaction_churn_warning_calls: int = 10
+    compaction_compactor_call_max_per_turn: int = 6
+    compaction_circuit_breaker_failure_limit: int = 3
 
 
 @dataclass(frozen=True)
@@ -1817,6 +1819,20 @@ def load_config(path: Path | None = None) -> Config:
             RunnerLimitsConfig.compaction_churn_warning_calls,
             minimum=1,
             maximum=500,
+        ),
+        compaction_compactor_call_max_per_turn=_int_from(
+            runner_limits_data,
+            "compaction_compactor_call_max_per_turn",
+            RunnerLimitsConfig.compaction_compactor_call_max_per_turn,
+            minimum=1,
+            maximum=128,
+        ),
+        compaction_circuit_breaker_failure_limit=_int_from(
+            runner_limits_data,
+            "compaction_circuit_breaker_failure_limit",
+            RunnerLimitsConfig.compaction_circuit_breaker_failure_limit,
+            minimum=1,
+            maximum=64,
         ),
     )
 

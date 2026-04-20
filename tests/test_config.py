@@ -163,6 +163,8 @@ class TestDefaultConfig:
         assert config.limits.runner.ingest_artifact_retention_max_files_per_scope == 96
         assert config.limits.runner.ingest_artifact_retention_max_bytes_per_scope == 268_435_456
         assert config.limits.runner.compaction_pressure_ratio_soft == 0.86
+        assert config.limits.runner.compaction_compactor_call_max_per_turn == 6
+        assert config.limits.runner.compaction_circuit_breaker_failure_limit == 3
         assert config.limits.verifier.max_verifier_prompt_tokens == 12000
         assert config.limits.compactor.response_tokens_ratio == 0.55
         assert config.limits.compactor.json_headroom_chars_floor == 128
@@ -778,6 +780,8 @@ extractor_tool_args_max_chars = 420
 extractor_tool_trace_max_chars = 5100
 extractor_prompt_max_chars = 12000
 compaction_churn_warning_calls = 14
+compaction_compactor_call_max_per_turn = 5
+compaction_circuit_breaker_failure_limit = 7
 
 [limits.verifier]
 max_verifier_prompt_tokens = 20000
@@ -819,6 +823,8 @@ target_chars_ratio = 0.6
         assert config.limits.runner.extractor_tool_trace_max_chars == 5100
         assert config.limits.runner.extractor_prompt_max_chars == 12000
         assert config.limits.runner.compaction_churn_warning_calls == 14
+        assert config.limits.runner.compaction_compactor_call_max_per_turn == 5
+        assert config.limits.runner.compaction_circuit_breaker_failure_limit == 7
         assert config.limits.verifier.max_verifier_prompt_tokens == 20000
         assert config.limits.verifier.max_tool_output_excerpt_chars == 1800
         assert config.limits.compactor.response_tokens_floor == 512

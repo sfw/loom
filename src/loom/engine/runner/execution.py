@@ -201,17 +201,8 @@ async def run_subtask(
                     f"({runner._max_subtask_wall_clock_seconds}s) before completion."
                 )
                 break
-            session.messages = await runner._compact_messages_for_model(
-                session.messages,
-                remaining_seconds=remaining_seconds,
-            )
-            messages = session.messages
-            runner._emit_compaction_policy_decision_from_diagnostics(
-                task_id=task.id,
-                subtask_id=subtask.id,
-            )
             if completion_only_after_deliverables and not completion_only_instruction_sent:
-                messages.append({
+                session.messages.append({
                     "role": "user",
                     "content": (
                         "CANONICAL DELIVERABLE WRITE COMPLETE: all required deliverables "
@@ -229,6 +220,63 @@ async def run_subtask(
                     execution_surface=execution_surface,
                     runnable_only=True,
                 )
+            session.messages = await runner._compact_messages_for_model(
+                session.messages,
+                tools=tool_schemas,
+                remaining_seconds=remaining_seconds,
+            )
+            if tool_schemas:
+                tool_schemas, tool_schema_prune_report = (
+                    runner._prune_tool_schemas_for_request_fit(
+                        session.messages,
+                        tool_schemas,
+                    )
+                )
+                if isinstance(tool_schema_prune_report, dict):
+                    diagnostics = dict(getattr(runner, "_last_compaction_diagnostics", {}))
+                    diagnostics.update({
+                        "compaction_tool_schema_pruned": bool(
+                            tool_schema_prune_report.get("applied", False),
+                        ),
+                        "compaction_tool_schema_prune_report": tool_schema_prune_report,
+                    })
+                    if bool(tool_schema_prune_report.get("applied", False)):
+                        applied_stages = list(
+                            diagnostics.get("compaction_applied_stages", []),
+                        )
+                        if "tool_schema_prune" not in applied_stages:
+                            applied_stages.append("tool_schema_prune")
+                        diagnostics["compaction_applied_stages"] = applied_stages
+                        diagnostics["compaction_stage"] = "tool_schema_prune"
+                        diagnostics["compaction_est_tokens_after"] = int(
+                            tool_schema_prune_report.get(
+                                "request_est_tokens_after",
+                                diagnostics.get("compaction_est_tokens_after", 0),
+                            ),
+                        )
+                        context_budget = int(
+                            getattr(
+                                runner,
+                                "_max_model_context_tokens",
+                                runner.MAX_MODEL_CONTEXT_TOKENS,
+                            ),
+                        )
+                        diagnostics["compaction_pressure_ratio_after"] = round(
+                            int(diagnostics["compaction_est_tokens_after"])
+                            / max(1, context_budget),
+                            4,
+                        )
+                        diagnostics["compaction_terminal_state"] = (
+                            "degraded_fit"
+                            if int(diagnostics["compaction_est_tokens_after"]) <= context_budget
+                            else "unfit"
+                        )
+                    runner._last_compaction_diagnostics = diagnostics
+            messages = session.messages
+            runner._emit_compaction_policy_decision_from_diagnostics(
+                task_id=task.id,
+                subtask_id=subtask.id,
+            )
             operation = "stream" if streaming else "complete"
             session.response = None
             policy = ModelRetryPolicy.from_execution_config(runner._config.execution)

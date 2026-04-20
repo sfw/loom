@@ -224,4 +224,33 @@ describe("history helpers", () => {
     expect(summarizeMessage(toolMessage)).toBe("Tool call: exec_command");
     expect(notificationSummary(notification)).toBe("Approval Requested");
   });
+
+  it("hides internal tool-call placeholder text from assistant summaries", () => {
+    const assistantMessage: ConversationMessage = {
+      id: 2,
+      session_id: "session-1",
+      turn_number: 2,
+      role: "assistant",
+      content: "Tool call context omitted.\nActual reply",
+      tool_calls: [],
+      created_at: "2026-03-24T10:00:01",
+      tool_name: null,
+      tool_call_id: null,
+      token_count: 2,
+    };
+    const assistantEvent: ConversationStreamEvent = {
+      id: 2,
+      session_id: "session-1",
+      seq: 5,
+      event_type: "assistant_text",
+      payload: {
+        text: "Tool call context omitted.\nActual reply",
+      },
+      payload_parse_error: false,
+      created_at: "2026-03-24T10:00:01",
+    };
+
+    expect(summarizeMessage(assistantMessage)).toBe("Actual reply");
+    expect(conversationEventDetail(assistantEvent)).toBe("Actual reply");
+  });
 });

@@ -101,6 +101,7 @@ class TestSubtaskRunnerContextBudget:
         runner._extractor_tool_trace_max_chars = 1800
         runner._extractor_prompt_max_chars = 2600
         runner._enable_model_overflow_fallback = True
+        runner._compaction_compactor_call_max_per_turn = 6
         runner._overflow_fallback_tool_message_min_chars = 500
         runner._overflow_fallback_tool_output_excerpt_chars = 220
         return runner
@@ -374,6 +375,199 @@ class TestSubtaskRunnerContextBudget:
         assert runner._last_compaction_diagnostics["compaction_skipped_reason"] == "no_pressure"
 
     @pytest.mark.asyncio
+    async def test_tool_schemas_count_toward_request_budget_pressure(self):
+        runner = self._make_runner_for_tiered_compaction(context_budget=1500)
+        messages = [
+            {"role": "user", "content": "Goal: inspect workspace state."},
+            {"role": "assistant", "content": "Historical notes A " + ("x " * 180)},
+            {"role": "user", "content": "Historical notes B " + ("y " * 170)},
+            {"role": "assistant", "content": "Historical notes C " + ("z " * 160)},
+            {"role": "user", "content": "Historical notes D " + ("q " * 150)},
+            {"role": "assistant", "content": "Latest assistant note: preserve behavior."},
+            {"role": "user", "content": "Latest instruction: keep the output concise."},
+        ]
+        oversized_tools = [{
+            "name": "very_large_tool",
+            "description": "D" * 18_000,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "P" * 4000},
+                },
+            },
+        }]
+
+        control_runner = self._make_runner_for_tiered_compaction(context_budget=1500)
+        control = await control_runner._compact_messages_for_model(
+            messages,
+            remaining_seconds=240,
+        )
+        compacted = await runner._compact_messages_for_model(
+            messages,
+            tools=oversized_tools,
+            remaining_seconds=240,
+        )
+
+        assert control == messages
+        assert control_runner._compactor.calls == []
+        assert runner._compactor.calls
+        assert compacted != messages
+        assert runner._last_compaction_diagnostics["compaction_est_tokens_before"] > (
+            control_runner._last_compaction_diagnostics["compaction_est_tokens_before"]
+        )
+        assert runner._last_compaction_diagnostics["compaction_pressure_tier"] in {
+            "pressure",
+            "critical",
+        }
+
+    @pytest.mark.asyncio
+    async def test_microcompact_reduces_tool_output_without_semantic_compactor_call(self):
+        runner = self._make_runner_for_tiered_compaction(context_budget=700)
+        messages = [
+            {"role": "user", "content": "Goal: inspect archived results."},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_old",
+                    "type": "function",
+                    "function": {"name": "web_fetch", "arguments": "{\"url\":\"https://example.com/a\"}"},
+                }],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_old",
+                "content": json.dumps({
+                    "success": True,
+                    "output": "A" * 12000,
+                    "error": None,
+                    "files_changed": [],
+                    "data": {"url": "https://example.com/a", "content_kind": "html"},
+                }),
+            },
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_latest",
+                    "type": "function",
+                    "function": {"name": "web_fetch", "arguments": "{\"url\":\"https://example.com/b\"}"},
+                }],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_latest",
+                "content": json.dumps({
+                    "success": True,
+                    "output": "latest short output",
+                    "error": None,
+                    "files_changed": [],
+                    "data": {"url": "https://example.com/b", "content_kind": "html"},
+                }),
+            },
+            {"role": "assistant", "content": "LATEST CRITICAL: preserve active findings."},
+            {"role": "user", "content": "LATEST USER: do not drop unresolved issues."},
+        ]
+
+        compacted = await runner._compact_messages_for_model(messages, remaining_seconds=240)
+
+        assert runner._compactor.calls == []
+        tool_payload = json.loads(compacted[2]["content"])
+        assert tool_payload["output"] != json.loads(messages[2]["content"])["output"]
+        assert runner._last_compaction_diagnostics["compaction_microcompact_hits"] >= 1
+        assert runner._last_compaction_diagnostics["compaction_compactor_calls"] == 0
+
+    @pytest.mark.asyncio
+    async def test_circuit_breaker_stops_repeated_low_gain_compaction_calls(self):
+        runner = self._make_runner_for_tiered_compaction(context_budget=1100)
+        runner._compaction_circuit_breaker_failure_limit = 1
+        runner._compaction_no_gain_min_delta_chars = 10_000
+        messages = [
+            {"role": "user", "content": "Goal: compact stale context aggressively."},
+            {"role": "assistant", "content": "Older assistant context " + ("a " * 900)},
+            {"role": "user", "content": "Older user context " + ("b " * 850)},
+            {"role": "assistant", "content": "Another assistant note " + ("c " * 820)},
+            {"role": "user", "content": "Older user follow-up " + ("d " * 780)},
+            {"role": "assistant", "content": "Recent assistant note: preserve behavior."},
+            {"role": "user", "content": "Latest steering: preserve file paths."},
+        ]
+
+        await runner._compact_messages_for_model(messages, remaining_seconds=240)
+
+        assert len(runner._compactor.calls) == 1
+        assert runner._last_compaction_diagnostics["compaction_circuit_breaker_tripped"] is True
+        assert runner._last_compaction_diagnostics["compaction_compactor_failures"] >= 1
+        skip_reasons = runner._last_compaction_diagnostics["compaction_skip_reasons"]
+        assert skip_reasons.get("circuit_breaker", 0) >= 1
+
+    @pytest.mark.asyncio
+    async def test_tool_schema_pruning_reduces_request_overhead_deterministically(self):
+        runner = self._make_runner_for_tiered_compaction(context_budget=900)
+        messages = [
+            {"role": "user", "content": "Goal: inspect the workspace."},
+            {"role": "assistant", "content": "Recent note: likely need read access first."},
+        ]
+        tool_schemas = [
+            {
+                "name": "read_file",
+                "description": "Read a file from disk.",
+                "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+            },
+            {
+                "name": "heavy_tool_a",
+                "description": "A" * 16_000,
+                "parameters": {"type": "object", "properties": {"payload": {"type": "string"}}},
+            },
+            {
+                "name": "heavy_tool_b",
+                "description": "B" * 14_000,
+                "parameters": {"type": "object", "properties": {"payload": {"type": "string"}}},
+            },
+        ]
+
+        pruned, report = runner._prune_tool_schemas_for_request_fit(messages, tool_schemas)
+
+        assert report["applied"] is True
+        assert report["tool_count_after"] < report["tool_count_before"]
+        assert report["request_est_tokens_after"] < report["request_est_tokens_before"]
+        assert any(schema.get("name") == "read_file" for schema in pruned)
+
+    @pytest.mark.asyncio
+    async def test_tool_schema_pruning_preserves_mutating_tool_in_minimal_set(self):
+        runner = self._make_runner_for_tiered_compaction(context_budget=900)
+        messages = [
+            {"role": "user", "content": "Goal: write the final report file."},
+            {"role": "assistant", "content": "Recent note: this turn needs a file mutation."},
+        ]
+        tool_schemas = [
+            {
+                "name": "read_file",
+                "description": "Read a file from disk.",
+                "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+            },
+            {
+                "name": "write_file",
+                "description": "Write a file to disk.",
+                "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+            },
+            {
+                "name": "heavy_tool_a",
+                "description": "A" * 16_000,
+                "parameters": {"type": "object", "properties": {"payload": {"type": "string"}}},
+            },
+            {
+                "name": "heavy_tool_b",
+                "description": "B" * 14_000,
+                "parameters": {"type": "object", "properties": {"payload": {"type": "string"}}},
+            },
+        ]
+
+        pruned, report = runner._prune_tool_schemas_for_request_fit(messages, tool_schemas)
+
+        assert report["applied"] is True
+        assert any(schema.get("name") == "write_file" for schema in pruned)
+
+    @pytest.mark.asyncio
     async def test_compaction_policy_mode_off_disables_runner_compaction(self):
         runner = self._make_runner_for_tiered_compaction(context_budget=1200)
         runner._runner_compaction_policy_mode = "off"
@@ -397,6 +591,27 @@ class TestSubtaskRunnerContextBudget:
         assert runner._compactor.calls == []
         assert runner._last_compaction_diagnostics["compaction_policy_mode"] == "off"
         assert runner._last_compaction_diagnostics["compaction_skipped_reason"] == "policy_disabled"
+
+    @pytest.mark.asyncio
+    async def test_compactor_call_budget_caps_historical_semantic_compaction(self):
+        runner = self._make_runner_for_tiered_compaction(context_budget=1200)
+        runner._compaction_compactor_call_max_per_turn = 1
+        messages = [
+            {"role": "user", "content": "Goal: review old context."},
+            {"role": "user", "content": "Old user context " + ("x " * 1200)},
+            {"role": "assistant", "content": "Old assistant context " + ("y " * 900)},
+            {"role": "user", "content": "Older follow-up " + ("z " * 800)},
+            {"role": "assistant", "content": "Another old assistant note " + ("w " * 700)},
+            {"role": "user", "content": "Yet more old context " + ("q " * 650)},
+            {"role": "assistant", "content": "LATEST CRITICAL: keep output schema unchanged."},
+            {"role": "user", "content": "LATEST USER: preserve all unresolved IDs."},
+        ]
+
+        await runner._compact_messages_for_model(messages, remaining_seconds=240)
+
+        assert len(runner._compactor.calls) == 1
+        skip_reasons = runner._last_compaction_diagnostics["compaction_skip_reasons"]
+        assert skip_reasons.get("call_budget", 0) >= 1
 
     @pytest.mark.asyncio
     async def test_compaction_order_tool_trace_before_critical_context(self):
@@ -453,13 +668,20 @@ class TestSubtaskRunnerContextBudget:
 
         compacted = await runner._compact_messages_for_model(messages, remaining_seconds=240)
         labels = [label for label, _max, _size in runner._compactor.calls]
-        arg_idx = next(i for i, label in enumerate(labels) if "assistant tool-call args" in label)
+        tool_indices = [
+            idx for idx, label in enumerate(labels)
+            if (
+                "assistant tool-call args" in label
+                or "tool message output" in label
+                or label.startswith("tool data ")
+            )
+        ]
         context_indices = [
             idx for idx, label in enumerate(labels)
             if label.endswith("context")
         ]
-        if context_indices:
-            assert arg_idx < min(context_indices)
+        if tool_indices and context_indices:
+            assert min(tool_indices) < min(context_indices)
         assert any(
             msg.get("content") == "LATEST USER STEER: preserve bullet ordering exactly."
             for msg in compacted
@@ -643,9 +865,70 @@ class TestSubtaskRunnerContextBudget:
 
         await runner._compact_messages_for_model(messages, remaining_seconds=5)
         labels = [label for label, _max, _size in runner._compactor.calls]
-        assert any("assistant tool-call args" in label for label in labels)
         assert all("tool message output" not in label for label in labels)
+        assert all(not label.endswith("context") for label in labels)
         assert runner._last_compaction_diagnostics["compaction_skipped_reason"] == "timeout_guard"
+
+    @pytest.mark.asyncio
+    async def test_tiered_compaction_uses_proactive_overflow_fallback_when_still_over_budget(self):
+        runner = self._make_runner_for_tiered_compaction(context_budget=500)
+        tool_payload = json.dumps({
+            "success": True,
+            "output": "A" * 12000,
+            "error": None,
+            "files_changed": [],
+            "data": {
+                "content_kind": "pdf",
+                "artifact_ref": "af_123",
+                "size_bytes": 2_000_000,
+                "url": "https://example.com/report.pdf",
+            },
+        })
+        latest_payload = json.dumps({
+            "success": True,
+            "output": "latest short output",
+            "error": None,
+            "files_changed": [],
+            "data": {"content_kind": "pdf", "artifact_ref": "af_latest"},
+        })
+        messages = [
+            {"role": "user", "content": "Goal: analyze report."},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_old",
+                    "type": "function",
+                    "function": {"name": "web_fetch", "arguments": "{\"url\":\"https://example.com/a.pdf\"}"},
+                }],
+            },
+            {"role": "tool", "tool_call_id": "call_old", "content": tool_payload},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_latest",
+                    "type": "function",
+                    "function": {"name": "web_fetch", "arguments": "{\"url\":\"https://example.com/b.pdf\"}"},
+                }],
+            },
+            {"role": "tool", "tool_call_id": "call_latest", "content": latest_payload},
+            {"role": "assistant", "content": "LATEST CRITICAL: keep findings stable."},
+            {"role": "user", "content": "LATEST USER: preserve the final short tool result."},
+        ]
+
+        compacted = await runner._compact_messages_for_model(messages, remaining_seconds=5)
+
+        old_payload = json.loads(compacted[2]["content"])
+        assert "overflow fallback applied" in old_payload["output"]
+        assert compacted[4]["content"] == latest_payload
+        assert (
+            runner._last_compaction_diagnostics["compaction_overflow_fallback_applied"]
+            is True
+        )
+        assert "overflow_fallback" in runner._last_compaction_diagnostics[
+            "compaction_applied_stages"
+        ]
 
     @pytest.mark.asyncio
     async def test_no_hard_truncation_marker_inserted_by_runner_compaction_path(self):

@@ -40,6 +40,7 @@ import {
   normalizeConversationPrompt,
   summarizeMessage,
 } from "../history";
+import { stripConversationToolCallPlaceholders } from "../conversationText";
 import { isTransientRequestError } from "../utils";
 
 // ---------------------------------------------------------------------------
@@ -1144,7 +1145,7 @@ export function useConversation(deps: {
 
       if (event.event_type === "assistant_text") {
         nextConversationStreaming = true;
-        const text = String(event.payload.text || "");
+        const text = stripConversationToolCallPlaceholders(String(event.payload.text || ""));
         if (text) {
           nextStreamingText += text;
         }
@@ -1299,6 +1300,7 @@ export function useConversation(deps: {
           pending_approval: null,
           awaiting_user_input: false,
           pending_prompt: null,
+          context_status: nextStatus?.context_status || null,
         };
         setConversationProcessing(selectedConversationId, true, {
           lastActiveAt: event.created_at,
@@ -1317,6 +1319,7 @@ export function useConversation(deps: {
           pending_approval: nextStatus?.pending_approval || null,
           awaiting_user_input: nextStatus?.awaiting_user_input || false,
           pending_prompt: nextStatus?.pending_prompt || null,
+          context_status: nextStatus?.context_status || null,
         };
       }
 
@@ -1333,6 +1336,7 @@ export function useConversation(deps: {
           pending_approval: pendingApproval,
           awaiting_user_input: false,
           pending_prompt: null,
+          context_status: nextStatus?.context_status || null,
         };
       }
 
@@ -1346,6 +1350,7 @@ export function useConversation(deps: {
           pending_approval: null,
           awaiting_user_input: false,
           pending_prompt: null,
+          context_status: nextStatus?.context_status || null,
         };
       }
 
@@ -1363,6 +1368,7 @@ export function useConversation(deps: {
             pending_approval: null,
             awaiting_user_input: true,
             pending_prompt: pendingPrompt,
+            context_status: nextStatus?.context_status || null,
           };
           setConversationProcessing(selectedConversationId, false, {
             lastActiveAt: event.created_at,
@@ -1381,6 +1387,7 @@ export function useConversation(deps: {
           pending_approval: null,
           awaiting_user_input: false,
           pending_prompt: null,
+          context_status: nextStatus?.context_status || null,
         };
       }
     }
@@ -1909,6 +1916,7 @@ export function useConversation(deps: {
           pending_approval: null,
           awaiting_user_input: false,
           pending_prompt: null,
+          context_status: current?.context_status || null,
         }));
         setConversationProcessing(selectedConversationId, true, {
           lastActiveAt: createdAt,
@@ -1972,6 +1980,7 @@ export function useConversation(deps: {
           pending_approval: current?.pending_approval || null,
           awaiting_user_input: current?.awaiting_user_input || false,
           pending_prompt: current?.pending_prompt || null,
+          context_status: current?.context_status || null,
         }));
         setConversationProcessing(selectedConversationId, false, {
           workspaceId: selectedWorkspaceId,
@@ -2027,6 +2036,7 @@ export function useConversation(deps: {
         pending_approval: current?.pending_approval || null,
         awaiting_user_input: current?.awaiting_user_input || false,
         pending_prompt: current?.pending_prompt || null,
+        context_status: current?.context_status || null,
       }));
       
     } catch (err) {
@@ -2079,6 +2089,7 @@ export function useConversation(deps: {
         pending_approval: null,
         awaiting_user_input: false,
         pending_prompt: null,
+        context_status: current?.context_status || null,
       }));
       setConversationTurnPending(true);
       removeApprovalItem(
@@ -2116,6 +2127,7 @@ export function useConversation(deps: {
         pending_approval: null,
         awaiting_user_input: false,
         pending_prompt: null,
+        context_status: current?.context_status || null,
       }));
       
     } catch (err) {

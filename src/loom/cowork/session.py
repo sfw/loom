@@ -23,12 +23,14 @@ import re
 import time
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from loom.cowork.approval import ApprovalDecision, ToolApprover
 from loom.cowork.memory_indexer import CoworkMemoryIndexer
 from loom.cowork.session_state import SessionState, extract_state_from_tool_events
+from loom.engine.compaction_control import select_budgeted_messages
 from loom.engine.semantic_compactor import SemanticCompactor
 from loom.engine.verification.development import development_helper_tool_guidance
 from loom.models.base import ModelProvider, TokenUsage, ToolCall
@@ -116,6 +118,9 @@ class _ContextWindowStats:
     context_messages: int = 0
     omitted_messages: int = 0
     recall_index_used: bool = False
+    max_context_tokens: int = 0
+    compacted: bool = False
+    memory_index_degraded: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +170,9 @@ _PARALLEL_BATCH_TOOL_NAMES = frozenset({
     "web_search",
 })
 MAX_PARALLEL_TOOL_BATCH_SIZE = 4
+_CONTEXT_APPROACHING_RATIO = 0.72
+_CONTEXT_NEAR_LIMIT_RATIO = 0.9
+_CONTEXT_LIKELY_COMPACT_RATIO = 0.82
 
 # Phrases that suggest the user is referencing earlier context.
 _DANGLING_REF_INDICATORS = [
@@ -666,10 +674,16 @@ class CoworkSession:
         self._stop_reason = ""
         self._pause_requested = asyncio.Event()
         self._pending_inject_instructions: list[str] = []
+        self._last_context_window_stats = _ContextWindowStats(
+            max_context_tokens=self._max_context_tokens,
+        )
+        self._last_context_status_snapshot: dict[str, Any] = {}
 
         self._messages: list[dict] = []
         if system_prompt:
             self._messages.append({"role": "system", "content": self._build_system_content()})
+
+        self._record_context_window_stats(self._last_context_window_stats)
 
         self._bind_hybrid_tools()
         self._maybe_start_memory_indexer()
@@ -755,6 +769,87 @@ class CoworkSession:
     def clear_pending_inject_instruction(self) -> None:
         """Drop any pending inject instruction."""
         self._pending_inject_instructions = []
+
+    def context_status_snapshot(self) -> dict[str, Any]:
+        """Return a UI-facing snapshot of context pressure and compaction state."""
+        return dict(self._last_context_status_snapshot)
+
+    def _context_pressure_state(self, stats: _ContextWindowStats) -> str:
+        if bool(stats.memory_index_degraded):
+            return "degraded"
+        max_context_tokens = max(
+            1,
+            int(stats.max_context_tokens or self._max_context_tokens or 0),
+        )
+        used_ratio = max(0.0, float(stats.context_tokens or 0) / float(max_context_tokens))
+        if bool(stats.compacted):
+            return "compacted"
+        if used_ratio >= _CONTEXT_NEAR_LIMIT_RATIO:
+            return "near_limit"
+        if used_ratio >= _CONTEXT_APPROACHING_RATIO:
+            return "approaching"
+        return "normal"
+
+    def _build_context_status_snapshot(
+        self,
+        stats: _ContextWindowStats,
+    ) -> dict[str, Any]:
+        safe_max_tokens = max(
+            1,
+            int(stats.max_context_tokens or self._max_context_tokens or 0),
+        )
+        estimated_tokens = max(0, int(stats.context_tokens or 0))
+        percent_used = round((float(estimated_tokens) / float(safe_max_tokens)) * 100.0, 1)
+        compacted_message_count = max(
+            int(stats.omitted_messages or 0),
+            int(getattr(self._session_state, "compact_summary_message_count", 0) or 0),
+        )
+        compacted_tool_message_count = max(
+            0,
+            int(getattr(self._session_state, "compact_summary_tool_message_count", 0) or 0),
+        )
+        compacted = bool(
+            stats.compacted
+            or compacted_message_count > 0
+            or stats.recall_index_used
+        )
+        last_compaction_at = ""
+        if compacted:
+            last_compaction_at = str(
+                self._last_context_status_snapshot.get("last_compaction_at", "") or "",
+            ).strip()
+            if not last_compaction_at:
+                last_compaction_at = datetime.now().isoformat()
+        likely_compaction_next_turn = bool(
+            compacted
+            or float(percent_used) >= (_CONTEXT_LIKELY_COMPACT_RATIO * 100.0)
+        )
+        return {
+            "estimated_tokens": estimated_tokens,
+            "max_tokens": safe_max_tokens,
+            "percent_used": percent_used,
+            "pressure_state": self._context_pressure_state(stats),
+            "compacted": compacted,
+            "compacted_message_count": compacted_message_count,
+            "compacted_tool_message_count": compacted_tool_message_count,
+            "recall_index_used": bool(stats.recall_index_used),
+            "memory_index_degraded": bool(stats.memory_index_degraded),
+            "likely_compaction_next_turn": likely_compaction_next_turn,
+            "last_compaction_at": last_compaction_at,
+            "updated_at": datetime.now().isoformat(),
+        }
+
+    def _record_context_window_stats(self, stats: _ContextWindowStats) -> None:
+        self._last_context_window_stats = stats
+        snapshot = self._build_context_status_snapshot(stats)
+        self._last_context_status_snapshot = snapshot
+        ui_state = (
+            dict(self._session_state.ui_state)
+            if isinstance(self._session_state.ui_state, dict)
+            else {}
+        )
+        ui_state["context_status"] = snapshot
+        self._session_state.ui_state = ui_state
 
     def _raise_if_stop_requested(self, *, stage: str = "") -> None:
         """Raise CoworkStopRequestedError when a cooperative stop is pending."""
@@ -1587,6 +1682,75 @@ class CoworkSession:
             legacy.append("- Archived tool activity: " + ", ".join(archived_tool_names))
         return legacy
 
+    def _build_compact_memory_lines(self, *, omitted_messages: list[dict]) -> list[str]:
+        if not omitted_messages:
+            return []
+
+        user_topics: list[str] = []
+        assistant_topics: list[str] = []
+        tool_names: list[str] = []
+
+        for msg in reversed(omitted_messages):
+            role = str(msg.get("role", "")).strip().lower()
+            if role == "user":
+                content = msg.get("content")
+                if isinstance(content, str) and content.strip():
+                    snippet, _ = _compact_preview(content, _RECALL_INDEX_SNIPPET_CHARS)
+                    if snippet and snippet not in user_topics:
+                        user_topics.append(snippet)
+                    if len(user_topics) >= 3:
+                        continue
+            elif role == "assistant":
+                tool_calls = msg.get("tool_calls")
+                if isinstance(tool_calls, list) and tool_calls:
+                    for call in tool_calls:
+                        if not isinstance(call, dict):
+                            continue
+                        fn = call.get("function")
+                        if isinstance(fn, dict):
+                            name = str(fn.get("name", "")).strip()
+                        else:
+                            name = str(call.get("name", "")).strip()
+                        if name and name not in tool_names:
+                            tool_names.append(name)
+                        if len(tool_names) >= _RECALL_INDEX_MAX_TOOL_NAMES:
+                            break
+                content = msg.get("content")
+                if isinstance(content, str) and content.strip():
+                    snippet, _ = _compact_preview(content, _RECALL_INDEX_SNIPPET_CHARS)
+                    if snippet and snippet not in assistant_topics:
+                        assistant_topics.append(snippet)
+
+        lines: list[str] = []
+        if user_topics:
+            lines.append("- Older user topics: " + " | ".join(user_topics[:3]))
+        if assistant_topics:
+            lines.append("- Older assistant context: " + " | ".join(assistant_topics[:2]))
+        if tool_names:
+            lines.append(
+                "- Older tool activity: "
+                + ", ".join(tool_names[:_RECALL_INDEX_MAX_TOOL_NAMES]),
+            )
+        return lines
+
+    def _refresh_compact_memory_from_omitted(self, *, omitted_messages: list[dict]) -> None:
+        if not omitted_messages:
+            return
+        lines = self._build_compact_memory_lines(omitted_messages=omitted_messages)
+        if not lines:
+            return
+        tool_messages = sum(
+            1
+            for msg in omitted_messages
+            if str(msg.get("role", "")).strip().lower() == "tool"
+        )
+        self._session_state.update_compact_memory(
+            summary="\n".join(lines),
+            boundary_message_count=len(omitted_messages),
+            message_count=len(omitted_messages),
+            tool_message_count=tool_messages,
+        )
+
     def _build_recall_index_message(
         self,
         *,
@@ -1594,7 +1758,8 @@ class CoworkSession:
         selected_messages: list[dict],
     ) -> dict | None:
         """Build a compact archive index that steers recall-tool usage."""
-        if not omitted_messages:
+        has_persisted_compact_memory = bool(self._session_state.has_compact_memory)
+        if not omitted_messages and not has_persisted_compact_memory:
             return None
 
         omitted_tool_messages = sum(
@@ -1602,13 +1767,28 @@ class CoworkSession:
             for msg in omitted_messages
             if str(msg.get("role", "")).strip() == "tool"
         )
+        if not omitted_messages and has_persisted_compact_memory:
+            omitted_tool_messages = int(
+                getattr(self._session_state, "compact_summary_tool_message_count", 0) or 0,
+            )
+        omitted_older_messages = (
+            len(omitted_messages)
+            if omitted_messages
+            else int(getattr(self._session_state, "compact_summary_message_count", 0) or 0)
+        )
 
         lines = [
             "[System: Compact archive index for omitted conversation history.]",
-            f"- Omitted older messages: {len(omitted_messages)}",
+            f"- Omitted older messages: {omitted_older_messages}",
             f"- Omitted tool-result messages: {omitted_tool_messages}",
             f"- Recent messages kept live: {len(selected_messages)}",
         ]
+        if has_persisted_compact_memory:
+            boundary = int(
+                getattr(self._session_state, "compact_boundary_message_count", 0) or 0,
+            )
+            if boundary > 0:
+                lines.append(f"- Compact memory boundary: first {boundary} messages summarized.")
         if self._session_state.memory_index_last_indexed_turn > 0:
             lines.append(
                 f"- Indexed through turn: {self._session_state.memory_index_last_indexed_turn}",
@@ -1648,9 +1828,21 @@ class CoworkSession:
                         break
                     lines.append(rendered)
         else:
-            for legacy_line in self._build_legacy_recall_lines(
-                omitted_messages=omitted_messages,
-            ):
+            compact_lines = []
+            if omitted_messages:
+                compact_lines = self._build_compact_memory_lines(
+                    omitted_messages=omitted_messages,
+                )
+            elif has_persisted_compact_memory:
+                compact_lines = [
+                    line
+                    for line in str(self._session_state.compact_summary or "").splitlines()
+                    if line.strip()
+                ]
+            for legacy_line in [
+                *compact_lines,
+                *self._build_legacy_recall_lines(omitted_messages=omitted_messages),
+            ]:
                 if not self._line_within_budget(
                     lines,
                     legacy_line,
@@ -1705,57 +1897,77 @@ class CoworkSession:
             min(int(self._max_context), _CONTEXT_RECENT_MESSAGE_CAP),
         )
 
-        # Walk backward, adding messages until budget is exhausted
-        selected: list[dict] = []
-        used = 0
-        for msg in reversed(rest):
-            if len(selected) >= recent_message_cap:
-                break
-            msg_tokens = _estimate_message_tokens(msg)
-            if msg_tokens > budget:
-                # One oversized message (typically a large tool result) should
-                # not collapse the entire context window.
-                continue
-            if used + msg_tokens > budget:
-                break
-            selected.append(msg)
-            used += msg_tokens
+        selection = select_budgeted_messages(
+            rest,
+            token_budget=budget,
+            recent_message_cap=recent_message_cap,
+            preserve_recent=4,
+            token_estimator=_estimate_message_tokens,
+        )
+        selected_items = [(idx, rest[idx]) for idx in selection.selected_indices]
+        used = sum(_estimate_message_tokens(msg) for _, msg in selected_items)
 
-        # Restore chronological order
-        selected.reverse()
+        def _omitted_messages_for(
+            items: list[tuple[int, dict]],
+        ) -> list[dict]:
+            selected_index_set = {idx for idx, _msg in items}
+            return [
+                msg
+                for idx, msg in enumerate(rest)
+                if idx not in selected_index_set
+            ]
 
-        # Ensure we don't start on an orphaned tool result
-        while selected and selected[0].get("role") == "tool":
-            selected.pop(0)
-
-        omitted_messages = rest[: max(0, len(rest) - len(selected))]
         recall_index_used = False
+        omitted_messages = _omitted_messages_for(selected_items)
+        self._refresh_compact_memory_from_omitted(omitted_messages=omitted_messages)
         recall_index = self._build_recall_index_message(
             omitted_messages=omitted_messages,
-            selected_messages=selected,
+            selected_messages=[msg for _, msg in selected_items],
         )
-        if recall_index is not None:
+        while recall_index is not None:
             recall_tokens = _estimate_message_tokens(recall_index)
-            while selected and (used + recall_tokens) > budget:
-                removed = selected.pop(0)
-                used = max(0, used - _estimate_message_tokens(removed))
-                while selected and selected[0].get("role") == "tool":
-                    removed_tool = selected.pop(0)
-                    used = max(0, used - _estimate_message_tokens(removed_tool))
+            if used + recall_tokens <= budget:
+                break
+            if not selected_items:
+                recall_index = None
+                break
+            removed_idx, removed = selected_items.pop(0)
+            used = max(0, used - _estimate_message_tokens(removed))
+            while selected_items and selected_items[0][1].get("role") == "tool":
+                _removed_tool_idx, removed_tool = selected_items.pop(0)
+                used = max(0, used - _estimate_message_tokens(removed_tool))
+            omitted_messages = _omitted_messages_for(selected_items)
+            self._refresh_compact_memory_from_omitted(omitted_messages=omitted_messages)
+            recall_index = self._build_recall_index_message(
+                omitted_messages=omitted_messages,
+                selected_messages=[msg for _, msg in selected_items],
+            )
 
-            if recall_tokens <= max(1, budget - used):
-                selected = [recall_index, *selected]
-                recall_index_used = True
+        selected = [msg for _, msg in selected_items]
+        if (
+            recall_index is not None
+            and _estimate_message_tokens(recall_index) <= max(1, budget - used)
+        ):
+            selected = [recall_index, *selected]
+            recall_index_used = True
 
         final_window = self._sanitize_tool_call_sequence(system + selected)
-        omitted_count = max(0, len(rest) - (len(selected) - (1 if recall_index_used else 0)))
+        omitted_count = len(_omitted_messages_for(selected_items))
         context_tokens = sum(_estimate_message_tokens(msg) for msg in final_window)
         stats = _ContextWindowStats(
             context_tokens=context_tokens,
             context_messages=len(final_window),
             omitted_messages=omitted_count,
             recall_index_used=recall_index_used,
+            max_context_tokens=effective_context_cap,
+            compacted=bool(
+                omitted_count > 0
+                or recall_index_used
+                or self._session_state.has_compact_memory
+            ),
+            memory_index_degraded=bool(self._session_state.memory_index_degraded),
         )
+        self._record_context_window_stats(stats)
         return final_window, stats
 
     @staticmethod
@@ -2906,6 +3118,11 @@ class CoworkSession:
                 session_state=self._session_state.to_dict(),
                 through_turn=self._message_counter,
             )
+            if isinstance(self._session_state.ui_state, dict):
+                await self._store.patch_session_state_metadata(
+                    self._session_id,
+                    ui_state=dict(self._session_state.ui_state),
+                )
         except Exception as e:
             logger.warning("Persist metadata failed: %s", e)
 

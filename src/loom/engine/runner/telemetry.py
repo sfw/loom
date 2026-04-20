@@ -377,6 +377,10 @@ def compaction_decision_from_diagnostics(
             else "tool_output_compacted"
         )
         return "compact_tool", reason
+    if stage == "tool_schema_prune" or bool(
+        diagnostics.get("compaction_tool_schema_pruned", False),
+    ):
+        return "compact_tool", "tool_schema_pruned"
     if stage in {"stage_2_general", "stage_3_historical", "stage_3_minimal", "stage_4_merge"}:
         reason = "history_merged" if stage == "stage_4_merge" else "history_compacted"
         return "compact_history", reason
@@ -425,6 +429,32 @@ def emit_compaction_policy_decision_from_diagnostics(
             "policy_mode": mode or runner.RUNNER_COMPACTION_POLICY_MODE,
             "decision": decision,
             "reason": reason,
+            "terminal_state": str(
+                diagnostics.get("compaction_terminal_state", "fit"),
+            ).strip().lower()
+            or "fit",
+            "deficit_tokens_before": max(
+                0,
+                safe_int(diagnostics.get("compaction_deficit_tokens_before", 0)),
+            ),
+            "protected_tail_count": max(
+                0,
+                safe_int(diagnostics.get("compaction_protected_tail_count", 0)),
+            ),
+            "compactor_calls": max(
+                0,
+                safe_int(diagnostics.get("compaction_compactor_calls", 0)),
+            ),
+            "microcompact_hits": max(
+                0,
+                safe_int(diagnostics.get("compaction_microcompact_hits", 0)),
+            ),
+            "circuit_breaker_tripped": bool(
+                diagnostics.get("compaction_circuit_breaker_tripped", False),
+            ),
+            "tool_schema_pruned": bool(
+                diagnostics.get("compaction_tool_schema_pruned", False),
+            ),
         },
         counter_key="compaction_policy_decisions",
     )
@@ -455,6 +485,10 @@ def emit_overflow_fallback_telemetry(
         "policy_mode": mode,
         "decision": "fallback_rewrite",
         "reason": "overflow_context_limit",
+        "terminal_state": str(
+            diagnostics.get("compaction_terminal_state", "degraded_fit"),
+        ).strip().lower()
+        or "degraded_fit",
         "rewritten_messages": max(
             0,
             safe_int(report.get("overflow_fallback_rewritten_messages", 0)),

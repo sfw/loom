@@ -717,6 +717,23 @@ export interface ConversationApproval {
   created_at: string;
 }
 
+export interface ConversationContextStatus {
+  estimated_tokens: number;
+  max_tokens: number;
+  percent_used: number;
+  pressure_state: string;
+  compaction_enabled?: boolean;
+  compaction_policy_mode?: string;
+  compacted: boolean;
+  compacted_message_count: number;
+  compacted_tool_message_count: number;
+  recall_index_used: boolean;
+  memory_index_degraded: boolean;
+  likely_compaction_next_turn: boolean;
+  last_compaction_at: string;
+  updated_at: string;
+}
+
 export interface ConversationStatus {
   conversation_id: string;
   processing: boolean;
@@ -726,6 +743,7 @@ export interface ConversationStatus {
   pending_approval: ConversationApproval | null;
   awaiting_user_input: boolean;
   pending_prompt: ConversationPrompt | null;
+  context_status?: ConversationContextStatus | null;
 }
 
 export interface SettingsPatchRequest {
