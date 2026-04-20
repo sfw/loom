@@ -169,7 +169,7 @@ describe("ThreadsTab", () => {
     render(<ThreadsTab />);
 
     expect(
-      screen.getByLabelText("Approaching compaction. Context window 18.4k / 24.0k tokens (77% full)."),
+      screen.getByLabelText("Approaching compaction. Loom working budget 18.4k / 24.0k tokens (77% full)."),
     ).toBeInTheDocument();
   });
 
@@ -205,7 +205,7 @@ describe("ThreadsTab", () => {
     render(<ThreadsTab />);
 
     expect(
-      screen.queryByLabelText("Approaching compaction. Context window 18.4k / 24.0k tokens (77% full)."),
+      screen.queryByLabelText("Approaching compaction. Loom working budget 18.4k / 24.0k tokens (77% full)."),
     ).not.toBeInTheDocument();
   });
 
@@ -753,6 +753,25 @@ describe("ThreadsTab", () => {
     expect(screen.getByText("Live")).toBeInTheDocument();
     expect(screen.getByText("Working through the numbers now")).toBeInTheDocument();
     expect(screen.queryByText("Thinking...")).not.toBeInTheDocument();
+  });
+
+  it("filters internal tool-call placeholder text from the live assistant draft", () => {
+    mockApp.conversationStatus = {
+      conversation_id: "conversation-1",
+      processing: true,
+    };
+    mockApp.conversationStreaming = true;
+    mockApp.conversationIsProcessing = true;
+    mockApp.conversationPhaseLabel = "Running";
+    mockApp.visibleConversationEvents = [
+      makeEvent(1, "user_message", { text: "hello" }),
+    ];
+    mockApp.streamingText = "Tool call context omitted.\nWorking through the numbers now";
+
+    render(<ThreadsTab />);
+
+    expect(screen.getByText("Working through the numbers now")).toBeInTheDocument();
+    expect(screen.queryByText("Tool call context omitted.")).not.toBeInTheDocument();
   });
 
   it("renders the live panel in a bounded scroll area with preserved paragraph breaks", () => {

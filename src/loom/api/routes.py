@@ -3767,7 +3767,7 @@ def _build_api_cowork_session(engine: Engine, session: dict[str, Any]) -> Cowork
         approver=ToolApprover(prompt_callback=approval_callback),
         store=engine.conversation_store,
         session_id=str(session.get("id", "") or ""),
-        max_context_tokens=int(getattr(execution, "cowork_max_context_tokens", 32_000)),
+        max_context_tokens=_cowork_context_token_budget(engine),
         tool_exposure_mode=str(getattr(execution, "cowork_tool_exposure_mode", "hybrid")),
         enable_filetype_ingest_router=bool(
             getattr(execution, "enable_filetype_ingest_router", True),
@@ -8326,6 +8326,16 @@ def _conversation_compaction_policy_mode(engine: Engine) -> str:
     limits = getattr(getattr(engine.config, "limits", None), "runner", None)
     mode = str(getattr(limits, "runner_compaction_policy_mode", "off") or "off").strip().lower()
     return mode if mode in {"legacy", "tiered", "off"} else "off"
+
+
+def _cowork_context_token_budget(engine: Engine) -> int:
+    runner_limits = getattr(getattr(engine.config, "limits", None), "runner", None)
+    if runner_limits is None:
+        return 24_000
+    return max(
+        4096,
+        int(getattr(runner_limits, "max_model_context_tokens", 24_000)),
+    )
 
 
 @router.get("/conversations/{conversation_id}/status")

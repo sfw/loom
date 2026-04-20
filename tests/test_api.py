@@ -3098,11 +3098,13 @@ class TestWorkspaceFirstEndpoints:
             "chat-model",
             SimpleNamespace(name="chat-model", roles=["executor"], tier=1),
         )
+        captured_kwargs: dict[str, object] = {}
 
         class FakeCoworkSession:
             def __init__(self, *args, store=None, session_id="", **kwargs):
                 self._store = store
                 self._session_id = session_id
+                captured_kwargs.update(kwargs)
 
             async def resume(self, session_id: str) -> None:
                 self._session_id = session_id
@@ -3158,6 +3160,9 @@ class TestWorkspaceFirstEndpoints:
 
         assert turns[-2]["content"] == "Hello from desktop"
         assert turns[-1]["content"] == "Background reply"
+        assert captured_kwargs["max_context_tokens"] == (
+            engine.config.limits.runner.max_model_context_tokens
+        )
         events = await conversation_store.get_chat_events(session_id)
         event_types = [row["event_type"] for row in events]
         assert "user_message" in event_types

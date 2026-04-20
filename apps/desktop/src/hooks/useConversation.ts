@@ -40,6 +40,7 @@ import {
   normalizeConversationPrompt,
   summarizeMessage,
 } from "../history";
+import { stripConversationToolCallPlaceholders } from "../conversationText";
 import { isTransientRequestError } from "../utils";
 
 // ---------------------------------------------------------------------------
@@ -1144,7 +1145,7 @@ export function useConversation(deps: {
 
       if (event.event_type === "assistant_text") {
         nextConversationStreaming = true;
-        const text = String(event.payload.text || "");
+        const text = stripConversationToolCallPlaceholders(String(event.payload.text || ""));
         if (text) {
           nextStreamingText += text;
         }

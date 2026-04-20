@@ -1,21 +1,5 @@
 import type { ConversationMessage, ConversationStreamEvent } from "./api";
-
-const TOOL_CALL_CONTEXT_PLACEHOLDERS = new Set([
-  "tool call context omitted.",
-  "tool call required to continue.",
-]);
-
-function stripConversationToolCallPlaceholders(text: string): string {
-  const normalized = String(text || "").replace(/\r\n?/g, "\n");
-  if (normalized.length === 0) {
-    return "";
-  }
-  const stripped = normalized
-    .split("\n")
-    .filter((line) => !TOOL_CALL_CONTEXT_PLACEHOLDERS.has(line.trim().toLowerCase()))
-    .join("\n");
-  return stripped;
-}
+import { stripConversationToolCallPlaceholders } from "./conversationText";
 
 export type ConversationTimelineItem =
   | {

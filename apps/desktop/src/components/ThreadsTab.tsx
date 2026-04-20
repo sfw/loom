@@ -37,6 +37,7 @@ import {
   workspaceAttachmentName,
   type WorkspaceAttachmentOption,
 } from "@/workspacePathAttachments";
+import { stripConversationToolCallPlaceholders } from "@/conversationText";
 import {
   appendConversationTimelineItems,
   buildHistoricalConversationTimelineItems,
@@ -151,7 +152,7 @@ function contextPressurePresentation(
     case "compacted":
       return {
         label: "Compacted",
-        tone: "Context compacted recently",
+        tone: "Loom working budget compacted recently",
         chipClassName: "border-sky-500/20 bg-sky-500/8 text-sky-300",
         badgeClassName: "bg-sky-500/15 text-sky-300",
         ringClassName: "stroke-sky-400",
@@ -160,7 +161,7 @@ function contextPressurePresentation(
     case "near_limit":
       return {
         label: "Near limit",
-        tone: "Very full context window",
+        tone: "Loom working budget nearly full",
         chipClassName: "border-amber-500/20 bg-amber-500/8 text-amber-200",
         badgeClassName: "bg-amber-500/15 text-amber-300",
         ringClassName: "stroke-amber-300",
@@ -169,7 +170,7 @@ function contextPressurePresentation(
     case "approaching":
       return {
         label: "Approaching compaction",
-        tone: "Context window is filling",
+        tone: "Loom working budget is filling",
         chipClassName: "border-amber-500/20 bg-amber-500/8 text-amber-200",
         badgeClassName: "bg-amber-500/15 text-amber-300",
         ringClassName: "stroke-amber-300",
@@ -187,7 +188,7 @@ function contextPressurePresentation(
     default:
       return {
         label: "Normal",
-        tone: "Context window healthy",
+        tone: "Loom working budget healthy",
         chipClassName: "border-zinc-800 bg-zinc-950/70 text-zinc-300",
         badgeClassName: "bg-zinc-800 text-zinc-300",
         ringClassName: "stroke-zinc-300",
@@ -210,7 +211,7 @@ function ContextPressureMeter({
   const compactedSummary = contextStatus.compacted_message_count > 0
     ? `${contextStatus.compacted_message_count.toLocaleString()} older msg${contextStatus.compacted_message_count === 1 ? "" : "s"} compacted`
     : "No compacted history yet";
-  const ariaLabel = `${presentation.label}. Context window ${formatContextTokenCount(contextStatus.estimated_tokens)} / ${formatContextTokenCount(contextStatus.max_tokens)} tokens (${Math.round(percentUsed)}% full).`;
+  const ariaLabel = `${presentation.label}. Loom working budget ${formatContextTokenCount(contextStatus.estimated_tokens)} / ${formatContextTokenCount(contextStatus.max_tokens)} tokens (${Math.round(percentUsed)}% full).`;
 
   return (
     <div className="group relative">
@@ -258,6 +259,9 @@ function ContextPressureMeter({
           <span className="text-[11px] text-zinc-400">{presentation.tone}</span>
         </div>
         <div className="mt-2 text-sm text-zinc-200">
+          <div className="text-[11px] uppercase tracking-[0.12em] text-zinc-500">
+            Loom working budget
+          </div>
           {formatContextTokenCount(contextStatus.estimated_tokens)} / {formatContextTokenCount(contextStatus.max_tokens)} tokens
         </div>
         <div className="mt-1 text-[11px] text-zinc-500">
@@ -903,7 +907,11 @@ export default function ThreadsTab() {
   }, []);
 
   const messageCount = visibleConversationMessages.length;
-  const streamingLen = streamingText.length + streamingThinking.length;
+  const visibleStreamingText = useMemo(
+    () => stripConversationToolCallPlaceholders(streamingText),
+    [streamingText],
+  );
+  const streamingLen = visibleStreamingText.length + streamingThinking.length;
   const liveTranscriptHasContent = visibleConversationEvents.length > 0 || visibleConversationMessages.length > 0;
   const deferredConversationEvents = useDeferredValue(visibleConversationEvents);
   const deferredConversationMessages = useDeferredValue(visibleConversationMessages);
@@ -1015,11 +1023,11 @@ export default function ThreadsTab() {
   );
   const showLiveAssistantDraft = Boolean(
     conversationIsProcessing
-    && streamingText.trim()
+    && visibleStreamingText.trim()
     && !(
       latestRenderedTimelineItem?.kind === "text"
       && latestRenderedTimelineItem.role === "assistant"
-      && latestRenderedTimelineItem.text === streamingText
+      && latestRenderedTimelineItem.text === visibleStreamingText
     ),
   );
   const { totalHeight: virtualTimelineHeight, virtualItems, reportSize: reportTimelineRowSize } = useVirtualizedList({
@@ -1815,7 +1823,7 @@ export default function ThreadsTab() {
         {showLiveFeedback && (
           <LiveFeedbackPanel
             text={streamingThinking}
-            draftText={showLiveAssistantDraft ? streamingText : ""}
+            draftText={showLiveAssistantDraft ? visibleStreamingText : ""}
             markdownComponents={markdownComponents}
           />
         )}
@@ -1848,7 +1856,7 @@ export default function ThreadsTab() {
                 "prose-th:text-zinc-300 prose-td:text-zinc-400",
                 "text-zinc-300",
               )}>
-                <Markdown remarkPlugins={[remarkGfm]} components={markdownComponents}>{streamingText}</Markdown>
+                <Markdown remarkPlugins={[remarkGfm]} components={markdownComponents}>{visibleStreamingText}</Markdown>
                 <span className="ml-0.5 inline-block h-4 w-1 rounded-full bg-[#a3b396]/70 align-[-0.15em] animate-pulse" />
               </div>
             </div>

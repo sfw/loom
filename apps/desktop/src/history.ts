@@ -6,6 +6,7 @@ import type {
   NotificationEvent,
   RunTimelineEvent,
 } from "./api";
+import { stripConversationToolCallPlaceholders } from "./conversationText";
 
 export function firstMeaningfulString(value: unknown): string {
   if (typeof value === "string" && value.trim()) {
@@ -541,7 +542,13 @@ export function runTimelinePills(event: RunTimelineEvent): string[] {
 
 export function summarizeMessage(message: ConversationMessage): string {
   if (typeof message.content === "string" && message.content.trim()) {
-    return message.content.trim();
+    const role = String(message.role || "").trim().toLowerCase();
+    const content = role === "assistant"
+      ? stripConversationToolCallPlaceholders(message.content).trim()
+      : message.content.trim();
+    if (content) {
+      return content;
+    }
   }
   if (typeof message.tool_name === "string" && message.tool_name.trim()) {
     return `Tool call: ${message.tool_name}`;
@@ -682,7 +689,7 @@ function summarizeConversationEvent(event: ConversationStreamEvent): string {
     return `You: ${String(payload.text || "").trim() || "Sent a message"}`;
   }
   if (event.event_type === "assistant_text") {
-    return String(payload.text || "").trim() || "Assistant replied";
+    return stripConversationToolCallPlaceholders(String(payload.text || "")).trim() || "Assistant replied";
   }
   if (event.event_type === "tool_call_started") {
     return `Started ${String(payload.tool_name || "tool")}`;
@@ -814,8 +821,12 @@ export function conversationEventTitle(event: ConversationStreamEvent): string {
 
 export function conversationEventDetail(event: ConversationStreamEvent): string {
   const payload = event.payload;
-  if (event.event_type === "user_message" || event.event_type === "assistant_text") {
+  if (event.event_type === "user_message") {
     return String(payload.text || "").trim() || summarizeConversationEvent(event);
+  }
+  if (event.event_type === "assistant_text") {
+    return stripConversationToolCallPlaceholders(String(payload.text || "")).trim()
+      || summarizeConversationEvent(event);
   }
   if (event.event_type === "tool_call_started" || event.event_type === "tool_call_completed") {
     const preview = conversationEventPreviewFromPayload(payload);
