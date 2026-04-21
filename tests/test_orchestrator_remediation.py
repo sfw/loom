@@ -126,6 +126,37 @@ def test_build_remediation_retry_context_prefers_reason_specific_process_instruc
     ])
 
 
+def test_augment_retry_context_for_evidence_recovery_surfaces_unfetched_urls(
+    tmp_path: Path,
+) -> None:
+    events: list = []
+    orch, _ = _make_orchestrator(tmp_path=tmp_path, events=events)
+    text = orch._augment_retry_context_for_evidence_recovery(
+        base_context="PREVIOUS ATTEMPTS",
+        reason_code="claim_insufficient_evidence",
+        prior_evidence_records=[
+            {
+                "tool": "web_search",
+                "query": "example channel subscribers",
+                "source_url": "https://example.com/channel",
+            },
+            {
+                "tool": "web_search",
+                "query": "example secondary source",
+                "source_url": "https://example.com/secondary",
+            },
+            {
+                "tool": "web_fetch",
+                "source_url": "https://example.com/secondary",
+            },
+        ],
+    )
+    assert "EVIDENCE RECOVERY GUIDANCE" in text
+    assert "https://example.com/channel" in text
+    assert "https://example.com/secondary" not in text
+    assert "Do not treat web_search snippets as final support" in text
+
+
 @pytest.mark.asyncio
 async def test_process_remediation_queue_marks_ttl_expired_items_terminal(
     tmp_path: Path,

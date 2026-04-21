@@ -172,6 +172,25 @@ class TestRetryManager:
         assert strategy == RetryStrategy.UNCONFIRMED_DATA
         assert markets == []
 
+    def test_classify_failure_block_with_confirm_or_prune_metadata_routes_to_unconfirmed(self):
+        strategy, targets = RetryManager.classify_failure(
+            verification_feedback="fact checker missing",
+            execution_error="",
+            verification={
+                "reason_code": "required_verifier_missing",
+                "severity_class": "semantic",
+                "metadata": {
+                    "remediation_mode": "confirm_or_prune",
+                    "missing_targets": ["fact_checker grounding for material claims"],
+                },
+            },
+            profile="research",
+            policy_mode="enforce",
+            profile_confidence=0.9,
+        )
+        assert strategy == RetryStrategy.UNCONFIRMED_DATA
+        assert targets == ["fact_checker grounding for material claims"]
+
     @pytest.mark.parametrize("reason_code", [
         "tool_capability_unavailable",
         "provider_binary_not_found",

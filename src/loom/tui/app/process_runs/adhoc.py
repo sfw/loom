@@ -684,7 +684,9 @@ def adhoc_default_validity_contract(intent: str, risk_level: str) -> dict[str, A
     normalized_intent = str(intent or "").strip().lower()
     normalized_risk = normalize_adhoc_risk_level(risk_level)
     high_risk = normalized_risk in {"high", "critical"}
-    require_fact_checker = bool(high_risk)
+    require_fact_checker = bool(
+        high_risk or normalized_intent in {"research", "writing"},
+    )
     min_supported_ratio = 0.8 if normalized_intent in {"research", "writing"} else 0.65
     max_unverified_ratio = 0.2 if normalized_intent in {"research", "writing"} else 0.35
     if high_risk:
@@ -1089,6 +1091,15 @@ def fallback_adhoc_spec(
         "and artifact production. Prefer primary sources, maintain traceability, "
         "and keep outputs concise and decision-oriented."
     )
+    if resolved_intent in {"research", "writing"}:
+        tool_guidance = (
+            f"{tool_guidance}\n\n"
+            "Do not treat web_search snippets as final evidence. When search "
+            "finds a relevant result, follow up with web_fetch or web_fetch_html "
+            "before citing facts. If an exact metric cannot be confirmed, record "
+            "the gap explicitly instead of estimating. Run fact_checker on "
+            "material factual or numeric conclusions before final synthesis."
+        )
     if resolved_intent == "build":
         tool_guidance = (
             f"{tool_guidance}\n\n{development_helper_tool_guidance()}"
@@ -1202,6 +1213,14 @@ def normalize_adhoc_spec(
     description = str(raw.get("description", "")).strip() or fallback["description"]
     persona = str(raw.get("persona", "")).strip() or fallback["persona"]
     tool_guidance = str(raw.get("tool_guidance", "")).strip() or fallback["tool_guidance"]
+    if resolved_intent in {"research", "writing"}:
+        tool_guidance = (
+            f"{tool_guidance}\n\n"
+            "Research evidence rule: do not rely on web_search snippets alone for "
+            "factual claims. Fetch the underlying page before citing it, mark "
+            "unconfirmed metrics as gaps instead of estimates, and use fact_checker "
+            "before final synthesis of material claims."
+        ).strip()
     valid_phase_modes = {"strict", "guided", "suggestive"}
     raw_phase_mode = str(raw.get("phase_mode", "")).strip().lower()
     fallback_phase_mode = str(fallback.get("phase_mode", "guided")).strip().lower()
@@ -1352,6 +1371,7 @@ def build_adhoc_cache_entry(
     from loom.processes.schema import (
         PhaseTemplate,
         ProcessDefinition,
+        PromptContracts,
         ToolRequirements,
         VerificationPolicyContract,
     )
@@ -1407,6 +1427,13 @@ def build_adhoc_cache_entry(
             dict(spec.get("validity_contract", {}))
             if isinstance(spec.get("validity_contract", {}), dict)
             else {}
+        ),
+        prompt_contracts=PromptContracts(
+            evidence_contract=(
+                {"enabled": True, "applies_to_phases": ["*"]}
+                if resolved_intent in {"research", "writing"}
+                else {}
+            ),
         ),
         verification_policy=VerificationPolicyContract(
             mode=(
