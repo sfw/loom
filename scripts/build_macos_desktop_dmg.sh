@@ -18,6 +18,19 @@ OUTPUT_PATH=""
 VOLUME_NAME="Loom Desktop"
 OPEN_DMG=0
 
+resolve_existing_path() {
+  local path="$1"
+  printf '%s/%s\n' "$(cd "$(dirname "$path")" && pwd)" "$(basename "$path")"
+}
+
+resolve_output_path() {
+  local path="$1"
+  local dir
+  dir="$(dirname "$path")"
+  mkdir -p "$dir"
+  printf '%s/%s\n' "$(cd "$dir" && pwd)" "$(basename "$path")"
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --app-bundle)
@@ -53,15 +66,14 @@ if [[ -z "$APP_BUNDLE" || -z "$OUTPUT_PATH" ]]; then
   exit 1
 fi
 
-APP_BUNDLE="$(cd "$(dirname "$APP_BUNDLE")" && pwd)/$(basename "$APP_BUNDLE")"
-OUTPUT_PATH="$(cd "$(dirname "$OUTPUT_PATH")" && pwd)/$(basename "$OUTPUT_PATH")"
+APP_BUNDLE="$(resolve_existing_path "$APP_BUNDLE")"
+OUTPUT_PATH="$(resolve_output_path "$OUTPUT_PATH")"
 
 if [[ ! -d "$APP_BUNDLE" ]]; then
   echo "App bundle not found: $APP_BUNDLE" >&2
   exit 1
 fi
 
-mkdir -p "$(dirname "$OUTPUT_PATH")"
 rm -f "$OUTPUT_PATH"
 
 STAGING_DIR="$(mktemp -d "${TMPDIR:-/tmp}/loom-desktop-dmg.XXXXXX")"
