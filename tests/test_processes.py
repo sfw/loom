@@ -2438,6 +2438,27 @@ verification:
 
         assert defn.verifier_tool_success_policy() == "method_resilient"
 
+    @pytest.mark.parametrize(
+        "name,phase_id",
+        [
+            ("research-report", "quality-assurance"),
+            ("competitive-intel", "monitoring-plan"),
+            ("market-research", "synthesize-recommendations"),
+        ],
+    )
+    def test_evidence_first_builtins_require_fact_checker_for_final_synthesis(
+        self,
+        name: str,
+        phase_id: str,
+    ):
+        loader = ProcessLoader()
+        defn = loader.load(name)
+
+        resolved = defn.resolve_validity_contract_for_phase(phase_id, is_synthesis=True)
+
+        assert resolved["claim_extraction"]["enabled"] is True
+        assert resolved["require_fact_checker_for_synthesis"] is True
+
     def test_loader_rejects_unregistered_verification_helper(self, tmp_path):
         yaml_content = """\
 name: invalid-helper

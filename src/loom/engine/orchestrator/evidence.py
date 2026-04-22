@@ -514,6 +514,12 @@ def _record_subtask_validity_metrics(
         "critical_contradicted": int(counts.get("critical_contradicted", 0) or 0),
     }
     ratios = self._claim_ratios(counts)
+    contract = self._validity_contract_for_subtask(subtask)
+    claim_extraction = contract.get("claim_extraction", {})
+    claim_extraction_expected = (
+        isinstance(claim_extraction, dict)
+        and bool(claim_extraction.get("enabled", False))
+    )
     reason_codes = metadata.get("claim_reason_codes")
     if not isinstance(reason_codes, list):
         reason_codes = []
@@ -528,6 +534,7 @@ def _record_subtask_validity_metrics(
         "is_synthesis": bool(subtask.is_synthesis),
         "verification_outcome": str(verification.outcome or ""),
         "reason_code": str(verification.reason_code or "").strip().lower(),
+        "claim_extraction_expected": claim_extraction_expected,
         "counts": counts,
         "ratios": {
             "supported_ratio": float(ratios.get("supported_ratio", 0.0)),
@@ -571,6 +578,8 @@ def _build_run_validity_scorecard(self, task: Task) -> dict[str, object]:
         "critical_contradicted": 0,
     }
     reason_codes: set[str] = set()
+    claim_extraction_expected = False
+    synthesis_claims_expected = False
     for entry in per_subtask.values():
         if not isinstance(entry, dict):
             continue
@@ -589,11 +598,22 @@ def _build_run_validity_scorecard(self, task: Task) -> dict[str, object]:
         entry_reason = str(entry.get("reason_code", "") or "").strip().lower()
         if entry_reason:
             reason_codes.add(entry_reason)
+        if bool(entry.get("claim_extraction_expected")):
+            claim_extraction_expected = True
+            if bool(entry.get("is_synthesis")):
+                synthesis_claims_expected = True
 
     ratios = self._claim_ratios(aggregate)
     extracted = max(0, int(aggregate.get("extracted", 0) or 0))
     contradicted = max(0, int(aggregate.get("contradicted", 0) or 0))
     contradicted_ratio = (float(contradicted) / float(extracted)) if extracted > 0 else 0.0
+    if extracted <= 0 and (synthesis_claims_expected or "infra_verifier_error" in reason_codes):
+        reason_codes.add("no_claims_extracted")
+        ratios = {
+            "supported_ratio": 0.0,
+            "unverified_ratio": 1.0 if claim_extraction_expected else 0.0,
+            "critical_support_ratio": 0.0 if claim_extraction_expected else 1.0,
+        }
     trust_score = max(
         0.0,
         min(

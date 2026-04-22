@@ -660,6 +660,11 @@ async def run_confirm_or_prune_remediation(
                 reason_code=placeholder_reason_code,
             )
         )
+        remediation_context = orchestrator._augment_retry_context_for_evidence_recovery(
+            base_context=remediation_context,
+            reason_code=placeholder_reason_code,
+            prior_evidence_records=prior_evidence_records,
+        )
         output_policy = orchestrator._output_write_policy_for_subtask(subtask=subtask)
         expected_deliverables = list(output_policy.get("expected_deliverables", []))
         forbidden_deliverables = list(output_policy.get("forbidden_deliverables", []))
@@ -1970,6 +1975,76 @@ def _build_remediation_retry_context(
             lines.append("PROCESS REMEDIATION INSTRUCTIONS:")
             lines.append(instructions)
     return "\n".join(lines)
+
+
+def _augment_retry_context_for_evidence_recovery(
+    self,
+    *,
+    base_context: str,
+    reason_code: str = "",
+    prior_evidence_records: list[dict[str, object]] | None = None,
+) -> str:
+    normalized_reason = str(reason_code or "").strip().lower()
+    recovery_reason_codes = {
+        "claim_insufficient_evidence",
+        "coverage_below_threshold",
+        "required_verifier_missing",
+        "required_verifier_empty",
+        "claim_inconclusive",
+        "infra_verifier_error",
+    }
+    if normalized_reason not in recovery_reason_codes:
+        return base_context
+
+    discovered_urls: list[str] = []
+    fetched_urls: set[str] = set()
+    discovery_queries: list[str] = []
+    for record in prior_evidence_records or []:
+        if not isinstance(record, dict):
+            continue
+        tool_name = str(record.get("tool", "") or "").strip().lower()
+        source_url = str(record.get("source_url", "") or "").strip()
+        query = str(record.get("query", "") or "").strip()
+        if tool_name == "web_search":
+            if query and query not in discovery_queries:
+                discovery_queries.append(query)
+            if source_url and source_url not in discovered_urls:
+                discovered_urls.append(source_url)
+        elif tool_name in {"web_fetch", "web_fetch_html"} and source_url:
+            fetched_urls.add(source_url)
+
+    unfetched_urls = [
+        url for url in discovered_urls
+        if url and url not in fetched_urls
+    ]
+    lines = [
+        "EVIDENCE RECOVERY GUIDANCE:",
+        "- Reuse already discovered evidence and outputs; do not restart broad research.",
+        "- Do not treat web_search snippets as final support for factual claims.",
+        (
+            "- Fetch the underlying source page for any material factual, numeric, "
+            "or entity claim before citing it."
+        ),
+        "- Run fact_checker after targeted evidence recovery to confirm or prune material claims.",
+        (
+            "- If a claim still cannot be confirmed, remove it or rewrite it as an "
+            "explicit uncertainty/data gap."
+        ),
+    ]
+    if unfetched_urls:
+        lines.append("- Candidate URLs already discovered but not yet fetched:")
+        for url in unfetched_urls[:5]:
+            lines.append(f"  - {url}")
+    if discovery_queries:
+        lines.append(
+            "- Prior discovery queries to refine only if needed: "
+            + "; ".join(discovery_queries[:3]),
+        )
+    return (
+        f"{base_context}\n\n{chr(10).join(lines)}".strip()
+        if base_context.strip()
+        else "\n".join(lines)
+    )
 
 def _record_confirm_or_prune_attempt(
     self,

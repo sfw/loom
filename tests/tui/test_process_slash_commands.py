@@ -1255,6 +1255,10 @@ class TestProcessSlashCommands:
         assert payload["key"] == key
         assert payload["goal"] == goal
         assert payload["spec"]["name"] == "book-research-adhoc"
+        assert (
+            resolved.process_defn.prompt_contracts.evidence_contract.get("enabled")
+            is True
+        )
 
     @pytest.mark.asyncio
     async def test_get_or_create_adhoc_process_uses_disk_cache(self, tmp_path, monkeypatch):
@@ -2160,7 +2164,7 @@ class TestProcessSlashCommands:
         assert isinstance(contract, dict)
         assert contract.get("enabled") is True
         assert contract.get("claim_extraction", {}).get("enabled") is True
-        assert contract.get("require_fact_checker_for_synthesis") is False
+        assert contract.get("require_fact_checker_for_synthesis") is True
         assert contract.get("final_gate", {}).get("enforce_verified_context_only") is True
         assert contract.get("final_gate", {}).get("synthesis_min_verification_tier") == 2
 
@@ -2201,7 +2205,7 @@ class TestProcessSlashCommands:
         assert contract.get("min_supported_ratio") == 0.9
         assert contract.get("max_unverified_ratio") == 0.1
         assert contract.get("final_gate", {}).get("synthesis_min_verification_tier") == 3
-        assert contract.get("require_fact_checker_for_synthesis") is False
+        assert contract.get("require_fact_checker_for_synthesis") is True
 
     def test_normalize_adhoc_spec_injects_default_verification_policy(self):
         from loom.tui.app import LoomApp

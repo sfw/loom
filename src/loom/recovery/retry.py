@@ -311,6 +311,8 @@ class RetryManager:
             profile_confidence=profile_confidence,
         )
         if policy_decision.action == "block":
+            if remediation_mode == "confirm_or_prune":
+                return RetryStrategy.UNCONFIRMED_DATA, missing_targets
             if reason_code == "hard_invariant_failed":
                 if (
                     has_placeholder_findings

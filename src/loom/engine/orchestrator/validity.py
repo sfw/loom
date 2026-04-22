@@ -876,6 +876,46 @@ def _verification_with_metadata(
         metadata=metadata,
     )
 
+
+def _recoverable_evidence_gap_verification(
+    self,
+    *,
+    verification: VerificationResult,
+    metadata: dict[str, object] | None = None,
+    feedback: str,
+    reason_code: str,
+    missing_targets: list[str] | None = None,
+    confidence_cap: float = 0.35,
+) -> VerificationResult:
+    merged_metadata = (
+        dict(verification.metadata)
+        if isinstance(verification.metadata, dict)
+        else {}
+    )
+    if isinstance(metadata, dict):
+        merged_metadata.update(metadata)
+    merged_targets = normalize_missing_targets(
+        merged_metadata.get("missing_targets"),
+    )
+    for target in normalize_missing_targets(missing_targets or []):
+        if target not in merged_targets:
+            merged_targets.append(target)
+    if merged_targets:
+        merged_metadata["missing_targets"] = merged_targets
+    merged_metadata["remediation_required"] = True
+    merged_metadata["remediation_mode"] = "confirm_or_prune"
+    merged_metadata["failure_class"] = "recoverable_evidence_gap"
+    return self._verification_with_metadata(
+        verification,
+        metadata=merged_metadata,
+        passed=False,
+        outcome="fail",
+        reason_code=reason_code,
+        feedback=feedback,
+        severity_class="semantic",
+        confidence=min(confidence_cap, max(0.2, float(verification.confidence or 0.5))),
+    )
+
 def _apply_intermediate_claim_pruning(
     self,
     *,
@@ -1376,6 +1416,17 @@ def _enforce_synthesis_claim_gate(
     verification_profile = normalize_profile(
         metadata.get("verification_profile", "hybrid"),
     )
+    claim_extraction = contract.get("claim_extraction", {})
+    claim_extraction_enabled = isinstance(claim_extraction, dict) and self._to_bool(
+        claim_extraction.get("enabled", False),
+        False,
+    )
+    claim_extraction_expected = (
+        self._to_bool(metadata.get("claim_extraction_expected", False), False)
+        or self._to_bool(contract.get("require_fact_checker_for_synthesis", False), False)
+        or (claim_extraction_enabled and verification_profile == "research")
+        or verification_profile == "research"
+    )
     assertions = self._assertions_from_verification(verification)
     assertion_counts = self._assertion_counts(assertions)
     metadata["assertion_counts"] = assertion_counts
@@ -1404,12 +1455,60 @@ def _enforce_synthesis_claim_gate(
                 severity_class="inconclusive",
                 confidence=min(0.75, max(0.35, float(verification.confidence or 0.5))),
             )
+        if not verification.passed:
+            if (
+                verification_profile in {"coding", "data_ops", "hybrid"}
+                and int(assertion_counts.get("behavior_supported", 0) or 0) > 0
+            ):
+                metadata["synthesis_gate_profile_resilience_skipped"] = True
+            return self._verification_with_metadata(
+                verification,
+                metadata=metadata,
+            )
+        if not claim_extraction_expected:
+            metadata["claim_extraction_expected"] = False
+            return self._verification_with_metadata(
+                verification,
+                metadata=metadata,
+            )
         if (
             verification_profile in {"coding", "data_ops", "hybrid"}
             and int(assertion_counts.get("behavior_supported", 0) or 0) > 0
         ):
             metadata["synthesis_gate_profile_resilience_skipped"] = True
-        return verification
+        note = (
+            "Synthesis claim gate could not verify any extracted claims. "
+            "Recover missing evidence, fetch underlying sources for material facts, "
+            "then confirm or prune unsupported claims before final synthesis."
+        )
+        existing_feedback = str(verification.feedback or "").strip()
+        existing_reason = str(verification.reason_code or "").strip().lower()
+        recovery_targets = [
+            "fetched source evidence for material claims",
+            "fact-check verdicts for material numeric/entity claims",
+        ]
+        if existing_reason in {
+            "infra_verifier_error",
+            "parse_inconclusive",
+            "verifier_parse_inconclusive",
+            "verifier_unavailable",
+            "semantic_inconclusive",
+        }:
+            recovery_targets.append("claim verification rerun after evidence recovery")
+        metadata["claim_extraction_expected"] = True
+        metadata["claim_extraction_missing"] = True
+        metadata["supported_ratio"] = 0.0
+        metadata["unverified_ratio"] = 1.0
+        metadata["critical_support_ratio"] = 0.0
+        return self._recoverable_evidence_gap_verification(
+            verification=verification,
+            metadata=metadata,
+            feedback="\n".join(
+                part for part in [existing_feedback, note] if part
+            ),
+            reason_code="claim_insufficient_evidence",
+            missing_targets=recovery_targets,
+        )
 
     counts = self._claim_counts(claims)
     ratios = self._claim_ratios(counts)
@@ -1569,6 +1668,24 @@ def _enforce_synthesis_claim_gate(
             ),
             severity_class="inconclusive",
             confidence=min(float(verification.confidence or 0.5), 0.45),
+        )
+    if reason_code in {"coverage_below_threshold", "claim_insufficient_evidence"}:
+        recovery_targets = [
+            "fetched source evidence for unresolved material claims",
+            "fact-check verdicts for unresolved material claims",
+        ]
+        if orphan_critical_numeric_claims:
+            recovery_targets.append("evidence lineage for critical numeric claims")
+        return self._recoverable_evidence_gap_verification(
+            verification=verification,
+            metadata=metadata,
+            feedback="\n".join([
+                *(part for part in [verification.feedback or ""] if part),
+                *fail_reasons,
+            ]),
+            reason_code=reason_code,
+            missing_targets=recovery_targets,
+            confidence_cap=0.45,
         )
     return self._verification_with_metadata(
         verification,
@@ -2052,16 +2169,25 @@ def _enforce_required_fact_checker(
             "Synthesis requires fact grounding, but no successful "
             "`fact_checker` invocation was observed."
         )
-        return VerificationResult(
-            tier=max(verification.tier, int(subtask.verification_tier or 1)),
-            passed=False,
-            confidence=min(verification.confidence, 0.3),
-            checks=list(verification.checks or []),
-            feedback=details,
-            outcome="fail",
-            reason_code="required_verifier_missing",
-            severity_class="semantic",
+        return self._recoverable_evidence_gap_verification(
+            verification=VerificationResult(
+                tier=max(verification.tier, int(subtask.verification_tier or 1)),
+                passed=False,
+                confidence=min(verification.confidence, 0.3),
+                checks=list(verification.checks or []),
+                feedback=details,
+                outcome="fail",
+                reason_code="required_verifier_missing",
+                severity_class="semantic",
+                metadata=metadata,
+            ),
             metadata=metadata,
+            feedback=details,
+            reason_code="required_verifier_missing",
+            missing_targets=[
+                "fact_checker grounding for material claims",
+                "fetched source evidence for material claims",
+            ],
         )
 
     contract = self._validity_contract_for_subtask(subtask)
@@ -2085,16 +2211,25 @@ def _enforce_required_fact_checker(
             "Synthesis requires claim-level fact grounding, but `fact_checker` "
             "returned no claim verdicts."
         )
-        return VerificationResult(
-            tier=max(verification.tier, int(subtask.verification_tier or 1)),
-            passed=False,
-            confidence=min(verification.confidence, 0.3),
-            checks=list(verification.checks or []),
-            feedback=details,
-            outcome="fail",
-            reason_code="required_verifier_empty",
-            severity_class="semantic",
+        return self._recoverable_evidence_gap_verification(
+            verification=VerificationResult(
+                tier=max(verification.tier, int(subtask.verification_tier or 1)),
+                passed=False,
+                confidence=min(verification.confidence, 0.3),
+                checks=list(verification.checks or []),
+                feedback=details,
+                outcome="fail",
+                reason_code="required_verifier_empty",
+                severity_class="semantic",
+                metadata=metadata,
+            ),
             metadata=metadata,
+            feedback=details,
+            reason_code="required_verifier_empty",
+            missing_targets=[
+                "fact_checker verdicts for material claims",
+                "fetched source evidence for material claims",
+            ],
         )
 
     return verification

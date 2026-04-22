@@ -279,6 +279,15 @@ async def dispatch_subtask(
         is_iteration_retry and iteration_strategy == "targeted_remediation"
     )
     retry_context = orchestrator._retry.build_retry_context(attempts)
+    retry_context = orchestrator._augment_retry_context_for_evidence_recovery(
+        base_context=retry_context,
+        reason_code=(
+            str(attempts[-1].reason_code or "").strip().lower()
+            if attempts
+            else ""
+        ),
+        prior_evidence_records=prior_evidence_records,
+    )
     retry_context = orchestrator._augment_retry_context_for_outputs(
         subtask=subtask,
         attempts=attempts,

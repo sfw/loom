@@ -834,6 +834,26 @@ class Orchestrator:
             contract=contract,
         )
 
+    def _recoverable_evidence_gap_verification(
+        self,
+        *,
+        verification: VerificationResult,
+        metadata: dict[str, object] | None = None,
+        feedback: str,
+        reason_code: str,
+        missing_targets: list[str] | None = None,
+        confidence_cap: float = 0.35,
+    ) -> VerificationResult:
+        return orchestrator_validity._recoverable_evidence_gap_verification(
+            self,
+            verification=verification,
+            metadata=metadata,
+            feedback=feedback,
+            reason_code=reason_code,
+            missing_targets=missing_targets,
+            confidence_cap=confidence_cap,
+        )
+
     @staticmethod
     def _artifact_provenance_evidence(
         *,
@@ -1633,6 +1653,20 @@ class Orchestrator:
             self,
             strategy=strategy,
             reason_code=reason_code,
+        )
+
+    def _augment_retry_context_for_evidence_recovery(
+        self,
+        *,
+        base_context: str,
+        reason_code: str = "",
+        prior_evidence_records: list[dict[str, object]] | None = None,
+    ) -> str:
+        return orchestrator_remediation._augment_retry_context_for_evidence_recovery(
+            self,
+            base_context=base_context,
+            reason_code=reason_code,
+            prior_evidence_records=prior_evidence_records,
         )
 
     async def _run_confirm_or_prune_remediation(

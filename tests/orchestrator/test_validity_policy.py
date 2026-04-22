@@ -585,6 +585,54 @@ class TestOrchestratorValidityPolicy:
         assert gated.reason_code == "claim_inconclusive"
 
     @pytest.mark.asyncio
+    async def test_synthesis_claim_gate_marks_missing_claim_extraction_recoverable_for_research(
+        self,
+        tmp_path,
+    ):
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text='{"subtasks": []}'),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=_make_state_manager(tmp_path),
+            event_bus=_make_event_bus(),
+            config=_make_config(),
+        )
+        subtask = Subtask(
+            id="synth",
+            description="Synthesize research results",
+            is_synthesis=True,
+            verification_tier=2,
+        )
+        verification = VerificationResult(
+            tier=2,
+            passed=True,
+            outcome="pass",
+            reason_code="infra_verifier_error",
+            severity_class="infra",
+            confidence=0.9,
+            metadata={
+                "verification_profile": "research",
+                "assertion_envelope": [],
+            },
+        )
+
+        gated = orch._enforce_synthesis_claim_gate(
+            subtask=subtask,
+            verification=verification,
+            contract={},
+        )
+
+        assert gated.passed is False
+        assert gated.outcome == "fail"
+        assert gated.reason_code == "claim_insufficient_evidence"
+        assert gated.metadata.get("remediation_required") is True
+        assert gated.metadata.get("remediation_mode") == "confirm_or_prune"
+        assert gated.metadata.get("failure_class") == "recoverable_evidence_gap"
+        assert gated.metadata.get("claim_extraction_missing") is True
+        assert gated.metadata.get("missing_targets")
+
+    @pytest.mark.asyncio
     async def test_synthesis_claim_gate_shadow_mode_disables_behavior_soft_pass(
         self,
         tmp_path,
@@ -1604,3 +1652,54 @@ class TestOrchestratorValidityPolicy:
         assert report_path.exists()
         payload = json.loads(report_path.read_text(encoding="utf-8"))
         assert payload.get("summary", {}).get("counts", {}).get("supported") == 2
+
+    def test_run_validity_scorecard_does_not_report_full_trust_on_zero_claims(self, tmp_path):
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text='{"subtasks": []}'),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=_make_state_manager(tmp_path),
+            event_bus=_make_event_bus(),
+            config=_make_config(),
+        )
+        task = _make_task(goal="Zero-claim scorecard")
+        task.plan = Plan(
+            subtasks=[
+                Subtask(
+                    id="synth",
+                    description="Synthesize findings",
+                    is_synthesis=True,
+                ),
+            ],
+        )
+        task.metadata["validity_scorecard"] = {
+            "subtask_metrics": {
+                "synth": {
+                    "subtask_id": "synth",
+                    "is_synthesis": True,
+                    "claim_extraction_expected": True,
+                    "reason_code": "infra_verifier_error",
+                    "counts": {
+                        "extracted": 0,
+                        "supported": 0,
+                        "contradicted": 0,
+                        "insufficient_evidence": 0,
+                        "stale": 0,
+                        "pruned": 0,
+                        "unresolved": 0,
+                        "critical_total": 0,
+                        "critical_supported": 0,
+                        "critical_contradicted": 0,
+                    },
+                    "reason_codes": ["infra_verifier_error"],
+                },
+            },
+        }
+
+        summary = orch._build_run_validity_scorecard(task)
+
+        assert summary["supported_ratio"] == 0.0
+        assert summary["unverified_ratio"] == 1.0
+        assert summary["trust_score"] == 0.0
+        assert "no_claims_extracted" in summary["reason_codes"]
