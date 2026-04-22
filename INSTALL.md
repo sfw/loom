@@ -83,6 +83,169 @@ The Tauri desktop shell is currently macOS-only. Loom itself still supports
 CLI/TUI/API workflows on macOS, Linux, and Windows, but the desktop app's
 runtime ownership and packaging are only hardened for macOS right now.
 
+## Build the macOS Desktop App
+
+Use this section if you want to build the native desktop app from source on a
+Mac, including on a fresh machine that does not already have `uv`, `cargo`,
+`rustc`, `node`, or `pnpm`.
+
+These steps assume you are building locally for development or internal testing.
+The local packaging flow builds an unsigned `.app` and a local `.dmg`. Release
+signing and notarization are covered in
+[`docs/DESKTOP-MACOS-PACKAGING.md`](/Users/sfw/Development/loom/docs/DESKTOP-MACOS-PACKAGING.md).
+
+### 1. Install Apple build tools
+
+Install Xcode Command Line Tools first:
+
+```bash
+xcode-select --install
+```
+
+Verify they are available:
+
+```bash
+xcodebuild -version
+```
+
+### 2. Install Homebrew
+
+If `brew` is not already installed, install Homebrew using the official
+instructions from [brew.sh](https://brew.sh/):
+
+```bash
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+```
+
+After install, follow the shell setup steps printed by the installer so `brew`
+is on your `PATH`.
+
+### 3. Install the desktop build toolchain
+
+Install the tools Loom expects for the macOS desktop build:
+
+```bash
+brew install node uv
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+corepack enable
+corepack prepare pnpm@10.8.0 --activate
+```
+
+Notes:
+
+- `cargo` and `rustc` are installed by `rustup`.
+- This repo pins `pnpm` with `packageManager: pnpm@10.8.0` in the root
+  [`package.json`](/Users/sfw/Development/loom/package.json).
+- CI currently uses `uv 0.10.12`, `pnpm 10.8.0`, Node 20, and the stable Rust
+  toolchain for desktop builds. Newer compatible versions may also work, but
+  those are the versions this repo is actively exercised against.
+
+Verify the toolchain:
+
+```bash
+uv --version
+node --version
+pnpm --version
+cargo --version
+rustc --version
+```
+
+### 4. Clone Loom and install dependencies
+
+```bash
+git clone https://github.com/sfw/loom.git
+cd loom
+
+uv sync --extra dev
+pnpm install --frozen-lockfile
+```
+
+What these commands do:
+
+- `uv sync --extra dev` creates the Python environment used by Loom and by the
+  packaging helper scripts.
+- `pnpm install --frozen-lockfile` installs the desktop frontend and Tauri
+  JavaScript dependencies from the checked-in lockfile.
+
+### 5. Run desktop tests before packaging
+
+Frontend tests:
+
+```bash
+pnpm --dir apps/desktop test
+```
+
+Rust tests:
+
+```bash
+cd apps/desktop/src-tauri
+cargo test
+cd ../../..
+```
+
+### 6. Build the app bundle and DMG
+
+From the repo root:
+
+```bash
+pnpm --dir apps/desktop package:macos
+```
+
+This does all of the local macOS packaging work:
+
+1. regenerates the desktop icons
+2. builds the React frontend
+3. assembles a bundled private Python runtime and locked Loom environment
+4. builds `Loom Desktop.app`
+5. creates `Loom Desktop.dmg`
+6. opens the finished DMG in Finder
+
+Build outputs:
+
+- App bundle:
+  [apps/desktop/src-tauri/target/release/bundle/macos/Loom Desktop.app](</Users/sfw/Development/loom/apps/desktop/src-tauri/target/release/bundle/macos/Loom Desktop.app>)
+- DMG:
+  [apps/desktop/src-tauri/target/release/bundle/dmg/Loom Desktop.dmg](</Users/sfw/Development/loom/apps/desktop/src-tauri/target/release/bundle/dmg/Loom Desktop.dmg>)
+
+If you only want the `.app` bundle and do not need the `.dmg`, run:
+
+```bash
+pnpm --dir apps/desktop exec tauri build --bundles app --ci --no-sign
+```
+
+### 7. Smoke-test the packaged bundle
+
+After building, you can verify that the packaged desktop runtime starts
+correctly without launching the full UI:
+
+```bash
+env UV_CACHE_DIR=.uv-cache \
+  uv run python scripts/smoke_macos_desktop_bundle.py \
+  --app-bundle "apps/desktop/src-tauri/target/release/bundle/macos/Loom Desktop.app"
+```
+
+### 8. Run the desktop app in development mode
+
+If you want the live-reload development shell instead of a packaged build:
+
+```bash
+pnpm desktop:tauri:dev
+```
+
+### Troubleshooting
+
+- If `cargo`, `rustc`, or `rustup` are not found after installation, open a new
+  terminal or run `source "$HOME/.cargo/env"`.
+- If `pnpm` is not found after installing Node, run `corepack enable` again and
+  then `corepack prepare pnpm@10.8.0 --activate`.
+- If `xcodebuild` is missing, re-run `xcode-select --install` and let the Apple
+  install complete before building.
+- The local packaging flow uses `--no-sign`. That is expected for development
+  builds. Signed and notarized distribution builds are a separate release step.
+- The packaged desktop build bundles its own Python runtime, so the finished app
+  does not depend on Python or `uv` being installed on the target Mac.
+
 ### From Source (using uv -- recommended)
 
 ```bash
