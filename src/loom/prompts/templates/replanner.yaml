@@ -34,6 +34,7 @@ constraints: |
   - Do NOT re-do completed subtasks.
   - Address discovered issues in the revised plan.
   - If errors suggest the approach is fundamentally wrong, propose a new approach.
+  - If the failure indicates unclear or missing tool capability, add a narrow inspection/discovery subtask before retrying downstream work.
   - Preserve phase_id on existing subtasks; for new custom IDs that map to process phases, include phase_id.
   - Use is_synthesis=true ONLY for terminal final integration/reporting subtasks.
   - Never mark a subtask as synthesis if any other subtask depends on it.
