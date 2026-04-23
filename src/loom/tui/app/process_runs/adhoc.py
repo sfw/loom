@@ -1088,8 +1088,10 @@ def fallback_adhoc_spec(
     )
     tool_guidance = (
         "Use available tools aggressively for evidence gathering, verification, "
-        "and artifact production. Prefer primary sources, maintain traceability, "
-        "and keep outputs concise and decision-oriented."
+        "and artifact production. Inspect available tools before acting, avoid "
+        "inventing tool names or arguments, and if the needed capability is not "
+        "obvious use list_tools narrowly to discover it. Prefer primary sources, "
+        "maintain traceability, and keep outputs concise and decision-oriented."
     )
     if resolved_intent in {"research", "writing"}:
         tool_guidance = (
@@ -1744,6 +1746,9 @@ async def synthesize_adhoc_process(self, goal: str, *, key: str) -> AdhocProcess
         "explicitly asks for that structure.\n"
         "- If the goal mentions local files or directories, include a phase that "
         "inspects them.\n"
+        "- tool_guidance should tell the executor to inspect available tools first, "
+        "avoid inventing tool names/args, and use list_tools narrowly when tool "
+        "discovery is needed.\n"
         "- required_tools must be selected ONLY from available tools.\n"
         "- recommended_tools should list useful missing tools not currently available.\n"
         "- Keep the process reusable and focused on outcomes, not implementation trivia.\n"

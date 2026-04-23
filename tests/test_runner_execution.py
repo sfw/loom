@@ -215,6 +215,57 @@ async def test_run_locks_to_text_completion_after_writing_expected_deliverable(
 
 
 @pytest.mark.asyncio
+async def test_run_skips_tool_schema_pruning_when_compaction_policy_is_off(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        runner_module,
+        "build_run_auth_context",
+        lambda **kwargs: {},
+    )
+    model_complete = AsyncMock(
+        return_value=ModelResponse(
+            text="Completed.",
+            tool_calls=None,
+            usage=TokenUsage(total_tokens=12),
+        ),
+    )
+    runner = _make_runner(
+        memory_query=AsyncMock(return_value=[]),
+        model_complete=model_complete,
+        config=Config(execution=ExecutionConfig(enable_streaming=False)),
+    )
+    runner._runner_compaction_policy_mode = "off"
+    tool_schemas = [
+        {
+            "name": "read_file",
+            "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+        },
+        {
+            "name": "web_search",
+            "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+        },
+    ]
+    runner._tools.all_schemas = MagicMock(return_value=tool_schemas)
+    runner._prune_tool_schemas_for_request_fit = MagicMock(
+        side_effect=AssertionError("tool schema pruning should stay off"),
+    )
+
+    task, subtask = _make_task(tmp_path)
+
+    result, verification = await runner.run(task, subtask)
+
+    assert result.status == SubtaskResultStatus.SUCCESS
+    assert verification.passed is True
+    runner._prune_tool_schemas_for_request_fit.assert_not_called()
+    assert model_complete.await_count == 1
+    assert model_complete.await_args.kwargs["tools"] == tool_schemas
+    assert runner._last_compaction_diagnostics["compaction_policy_mode"] == "off"
+    assert runner._last_compaction_diagnostics["compaction_skipped_reason"] == "policy_disabled"
+
+
+@pytest.mark.asyncio
 async def test_run_allows_same_response_non_mutating_tools_after_canonical_write(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

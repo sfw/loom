@@ -761,7 +761,7 @@ class PromptAssembler:
 
     def _format_tools(self, tools: list[dict]) -> str:
         """Format tool schemas for prompt injection."""
-        lines = ["AVAILABLE TOOLS:"]
+        lines = ["AVAILABLE TOOLS (REVIEW BEFORE ACTING):"]
         for tool in tools:
             name = tool.get("name", "unknown")
             desc = tool.get("description", "")
@@ -771,6 +771,59 @@ class PromptAssembler:
                 lines.append(
                     f"  Parameters: {json.dumps(params, indent=2)}",
                 )
+        protocol = self._tool_usage_protocol(tools)
+        if protocol:
+            lines.append("")
+            lines.append(protocol)
+        return "\n".join(lines)
+
+    def _tool_usage_protocol(self, tools: list[dict]) -> str:
+        """Return explicit tool selection and discovery guidance."""
+        tool_names = {
+            str(tool.get("name", "") or "").strip()
+            for tool in tools
+            if isinstance(tool, dict) and str(tool.get("name", "") or "").strip()
+        }
+        if not tool_names:
+            return ""
+
+        lines = [
+            "TOOL USAGE PROTOCOL:",
+            (
+                "- Review the available tool list before acting. If the needed "
+                "tool is listed with a usable schema, call it directly."
+            ),
+            (
+                "- Do NOT invent tool names or arguments. If the right tool or "
+                "argument shape is unclear, inspect before calling."
+            ),
+        ]
+        if "list_tools" in tool_names:
+            lines.append(
+                '- When the needed capability is not obvious, call '
+                '`list_tools` with `{"detail":"compact"}` first to discover '
+                "candidate tool names."
+            )
+            lines.append(
+                '- If you still need argument details, call `list_tools` with '
+                '`{"detail":"schema","query":"<tool name>"}` and keep that '
+                "lookup narrowly scoped to the specific tool(s) you plan to use."
+            )
+            lines.append(
+                '- Do NOT call `list_tools` with `detail="schema"` broadly across the full catalog.'
+            )
+            if "run_tool" in tool_names:
+                lines.append(
+                    "- Use `run_tool` only for long-tail tools discovered "
+                    "through `list_tools` that are not already exposed as "
+                    "direct typed tool calls."
+                )
+        elif "run_tool" in tool_names:
+            lines.append(
+                "- Use `run_tool` only when you already know the exact "
+                "delegated tool name and JSON arguments from prompt context "
+                "or prior tool output."
+            )
         return "\n".join(lines)
 
     @staticmethod

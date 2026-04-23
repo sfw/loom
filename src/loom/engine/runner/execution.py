@@ -225,7 +225,7 @@ async def run_subtask(
                 tools=tool_schemas,
                 remaining_seconds=remaining_seconds,
             )
-            if tool_schemas:
+            if tool_schemas and runner._runner_compaction_mode() != "off":
                 tool_schemas, tool_schema_prune_report = (
                     runner._prune_tool_schemas_for_request_fit(
                         session.messages,

@@ -143,6 +143,14 @@ class TestPlannerPrompt:
         prompt = assembler.build_planner_prompt(sample_task)
         assert "Never mark a subtask as synthesis if any other subtask depends on it." in prompt
 
+    def test_planner_warns_against_assuming_unknown_tool_capabilities(
+        self,
+        assembler: PromptAssembler,
+        sample_task: Task,
+    ):
+        prompt = assembler.build_planner_prompt(sample_task)
+        assert "Do NOT assume non-obvious tool capabilities will be available" in prompt
+
 class TestExecutorPrompt:
     """Test executor prompt assembly."""
 
@@ -284,6 +292,33 @@ class TestExecutorPrompt:
 
         assert "write_file" in prompt
         assert "read_file" in prompt
+
+    def test_executor_includes_tool_discovery_protocol_when_list_tools_available(
+        self,
+        assembler: PromptAssembler,
+        sample_task: Task,
+        state_manager: TaskStateManager,
+    ):
+        state_manager.create(sample_task)
+        subtask = sample_task.get_subtask("add-tsconfig")
+
+        tools = [
+            {"name": "list_tools", "description": "Discover available tools"},
+            {"name": "run_tool", "description": "Run a discovered long-tail tool"},
+            {"name": "write_file", "description": "Write content to a file"},
+        ]
+
+        prompt = assembler.build_executor_prompt(
+            task=sample_task,
+            subtask=subtask,
+            state_manager=state_manager,
+            available_tools=tools,
+        )
+
+        assert "TOOL USAGE PROTOCOL" in prompt
+        assert '`{"detail":"compact"}` first to discover candidate tool names' in prompt
+        assert '`{"detail":"schema","query":"<tool name>"}`' in prompt
+        assert "Use `run_tool` only for long-tail tools discovered through `list_tools`" in prompt
 
     def test_executor_includes_read_write_scope_when_read_roots_present(
         self,
@@ -443,6 +478,21 @@ class TestReplannerPrompt:
             replan_reason="test",
         )
         assert "Never mark a subtask as synthesis if any other subtask depends on it." in prompt
+
+    def test_replanner_adds_tool_discovery_guidance_for_capability_failures(
+        self,
+        assembler: PromptAssembler,
+        sample_task: Task,
+    ):
+        prompt = assembler.build_replanner_prompt(
+            goal=sample_task.goal,
+            current_state_yaml="task: {}",
+            discoveries=[],
+            errors=["Tool capability unclear"],
+            original_plan=sample_task.plan,
+            replan_reason="tool failure",
+        )
+        assert "If the failure indicates unclear or missing tool capability" in prompt
 
 
 class TestExtractorPrompt:
