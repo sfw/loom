@@ -18,6 +18,7 @@ from loom.events.types import (
     TOOL_CALL_DEDUPLICATED,
     TOOL_CALL_STARTED,
 )
+from loom.models.base import ModelEmptyResponseError, ModelResponse
 from loom.models.request_diagnostics import (
     collect_request_diagnostics,
     collect_response_diagnostics,
@@ -48,6 +49,91 @@ compactor_event_context: contextvars.ContextVar[tuple[str, str] | None] = (
 
 # Backwards-compatible name used by runner internals.
 _COMPACTOR_EVENT_CONTEXT = compactor_event_context
+
+
+def _response_has_no_assistant_output(response: ModelResponse) -> bool:
+    text = str(getattr(response, "text", "") or "").strip()
+    tool_calls = getattr(response, "tool_calls", None)
+    finish_reason = str(getattr(response, "finish_reason", "") or "").strip()
+    return not text and not tool_calls and not finish_reason
+
+
+def _response_raw_dict(response: ModelResponse) -> dict[str, Any]:
+    raw = getattr(response, "raw", None)
+    return dict(raw) if isinstance(raw, dict) else {}
+
+
+def _model_enforces_context_window(model: Any) -> bool:
+    """Return whether a provider should be hard-stopped by context preflight."""
+    explicit = getattr(model, "enforces_context_window", None)
+    if isinstance(explicit, bool):
+        return explicit
+    module_name = str(getattr(type(model), "__module__", "") or "")
+    return module_name.startswith("loom.models.")
+
+
+def _empty_response_metadata(
+    *,
+    response: ModelResponse,
+    request_diag,
+    invocation_attempt: int,
+    max_attempts: int,
+    operation: str,
+    iteration: int,
+    model_name: str,
+    compaction_diagnostics: dict[str, Any],
+) -> dict[str, Any]:
+    request_payload = request_diag.to_event_payload() if request_diag else {}
+    response_payload = collect_response_diagnostics(response).to_event_payload()
+    raw = _response_raw_dict(response)
+    stream_close_reason = str(raw.get("stream_close_reason", "") or "").strip()
+    if not stream_close_reason:
+        stream_close_reason = "not_streaming" if operation != "stream" else "unknown"
+    provider_status = str(
+        raw.get("provider_status", raw.get("http_status", "")) or "",
+    ).strip() or "unknown"
+    return {
+        "reason_code": ModelEmptyResponseError.reason_code,
+        "failure_class": "model_empty_response",
+        "provider_status": provider_status,
+        "stream_close_reason": stream_close_reason,
+        "stream_final_chunk_seen": bool(raw.get("stream_final_chunk_seen", False)),
+        "stream_chunk_count": int(raw.get("stream_chunk_count", 0) or 0),
+        "stream_content_chunk_count": int(
+            raw.get("stream_content_chunk_count", 0) or 0,
+        ),
+        "retry_count": max(0, invocation_attempt - 1),
+        "invocation_attempt": invocation_attempt,
+        "invocation_max_attempts": max_attempts,
+        "iteration": iteration,
+        "operation": operation,
+        "model": model_name,
+        "request_bytes": int(request_payload.get("request_bytes", 0) or 0),
+        "request_est_tokens": int(request_payload.get("request_est_tokens", 0) or 0),
+        "request_size_tier": str(request_payload.get("request_size_tier", "") or ""),
+        "message_count": int(request_payload.get("message_count", 0) or 0),
+        "tool_count": int(request_payload.get("tool_count", 0) or 0),
+        "response_chars": int(response_payload.get("response_chars", 0) or 0),
+        "response_tool_calls": int(
+            response_payload.get("response_tool_calls", 0) or 0,
+        ),
+        "response_finish_reason": str(
+            response_payload.get("response_finish_reason", "") or "",
+        ),
+        "compaction_policy_mode": str(
+            compaction_diagnostics.get("compaction_policy_mode", "") or "",
+        ),
+        "compaction_terminal_state": str(
+            compaction_diagnostics.get("compaction_terminal_state", "") or "",
+        ),
+        "compaction_pressure_ratio": float(
+            compaction_diagnostics.get("compaction_pressure_ratio", 0.0) or 0.0,
+        ),
+        "compaction_skipped_reason": str(
+            compaction_diagnostics.get("compaction_skipped_reason", "") or "",
+        ),
+    }
+
 
 async def run_subtask(
     runner,
@@ -188,6 +274,8 @@ async def run_subtask(
             has_expected_deliverables=bool(canonical_deliverables),
             base_budget=runner._max_tool_iterations,
         )
+        last_model_failure_metadata: dict[str, Any] = {}
+        last_model_failure_reason_code = ""
 
         for iteration in range(iteration_budget):
             if not await runner._wait_for_task_control_window(task):
@@ -282,9 +370,84 @@ async def run_subtask(
             policy = ModelRetryPolicy.from_execution_config(runner._config.execution)
             invocation_attempt = 0
             request_diag = None
+            last_model_failure_metadata = {}
+            last_model_failure_reason_code = ""
             overflow_fallback_pending = False
             overflow_fallback_attempted = False
             overflow_fallback_report: dict[str, Any] | None = None
+            compaction_diagnostics = dict(
+                getattr(runner, "_last_compaction_diagnostics", {}),
+            )
+            if (
+                _model_enforces_context_window(model)
+                and
+                str(compaction_diagnostics.get("compaction_policy_mode", "") or "")
+                .strip()
+                .lower()
+                == "off"
+                and str(
+                    compaction_diagnostics.get("compaction_terminal_state", "") or "",
+                )
+                .strip()
+                .lower()
+                == "unfit"
+            ):
+                request_diag = collect_request_diagnostics(
+                    messages=session.messages,
+                    tools=tool_schemas,
+                    origin=f"runner.execute_subtask.{operation}.preflight",
+                )
+                request_payload = request_diag.to_event_payload()
+                last_model_failure_reason_code = "infra_runner_context_unfit"
+                last_model_failure_metadata = {
+                    "reason_code": last_model_failure_reason_code,
+                    "failure_class": "context_unfit",
+                    "provider_status": "not_sent",
+                    "stream_close_reason": "not_started",
+                    "retry_count": 0,
+                    "invocation_attempt": 0,
+                    "invocation_max_attempts": policy.max_attempts,
+                    "iteration": iteration + 1,
+                    "operation": operation,
+                    "model": model.name,
+                    "request_bytes": int(request_payload.get("request_bytes", 0) or 0),
+                    "request_est_tokens": int(
+                        request_payload.get("request_est_tokens", 0) or 0,
+                    ),
+                    "request_size_tier": str(
+                        request_payload.get("request_size_tier", "") or "",
+                    ),
+                    "message_count": int(request_payload.get("message_count", 0) or 0),
+                    "tool_count": int(request_payload.get("tool_count", 0) or 0),
+                    "compaction_policy_mode": "off",
+                    "compaction_terminal_state": "unfit",
+                    "compaction_pressure_ratio": float(
+                        compaction_diagnostics.get("compaction_pressure_ratio", 0.0)
+                        or 0.0,
+                    ),
+                    "compaction_skipped_reason": str(
+                        compaction_diagnostics.get(
+                            "compaction_skipped_reason",
+                            "",
+                        )
+                        or "",
+                    ),
+                }
+                runner._emit_model_event(
+                    task_id=task.id,
+                    subtask_id=subtask.id,
+                    model_name=model.name,
+                    phase="done",
+                    details={
+                        "origin": request_diag.origin,
+                        **last_model_failure_metadata,
+                    },
+                )
+                session.interruption_reason = (
+                    "Model request preflight failed: context fit is unfit while "
+                    "runner compaction policy is off."
+                )
+                break
 
             async def _invoke_model():
                 nonlocal invocation_attempt, request_diag
@@ -314,14 +477,39 @@ async def run_subtask(
                     },
                 )
                 if streaming:
-                    return await runner._stream_completion(
+                    response = await runner._stream_completion(
                         model,
                         session.messages,
                         tool_schemas,
                         task_id=task.id,
                         subtask_id=subtask.id,
                     )
-                return await model.complete(session.messages, tools=tool_schemas)
+                else:
+                    response = await model.complete(
+                        session.messages,
+                        tools=tool_schemas,
+                    )
+                if _response_has_no_assistant_output(response):
+                    metadata = _empty_response_metadata(
+                        response=response,
+                        request_diag=request_diag,
+                        invocation_attempt=invocation_attempt,
+                        max_attempts=policy.max_attempts,
+                        operation=operation,
+                        iteration=iteration + 1,
+                        model_name=model.name,
+                        compaction_diagnostics=dict(
+                            getattr(runner, "_last_compaction_diagnostics", {}),
+                        ),
+                    )
+                    raise ModelEmptyResponseError(
+                        (
+                            "Model invocation returned no assistant text, no tool "
+                            "calls, and no finish reason."
+                        ),
+                        metadata=metadata,
+                    )
+                return response
 
             def _should_retry_invocation(error: BaseException) -> bool:
                 nonlocal overflow_fallback_pending
@@ -340,8 +528,20 @@ async def run_subtask(
                 error: BaseException,
                 remaining: int,
             ) -> None:
+                nonlocal last_model_failure_metadata
+                nonlocal last_model_failure_reason_code
                 nonlocal overflow_fallback_pending
                 nonlocal overflow_fallback_attempted, overflow_fallback_report
+                error_metadata = (
+                    dict(getattr(error, "metadata", {}) or {})
+                    if isinstance(error, ModelEmptyResponseError)
+                    else {}
+                )
+                if error_metadata:
+                    last_model_failure_metadata = error_metadata
+                    last_model_failure_reason_code = str(
+                        error_metadata.get("reason_code", "") or "",
+                    ).strip()
                 if overflow_fallback_pending:
                     overflow_fallback_pending = False
                     overflow_fallback_attempted = True
@@ -371,6 +571,7 @@ async def run_subtask(
                         "error": str(error),
                         "overflow_error_detected": runner._is_model_request_overflow_error(error),
                         "overflow_fallback_attempted": overflow_fallback_attempted,
+                        **error_metadata,
                         **(overflow_fallback_report or {}),
                     },
                 )
@@ -382,6 +583,11 @@ async def run_subtask(
                 remaining: int,
                 delay_seconds: float,
             ) -> None:
+                error_metadata = (
+                    dict(getattr(error, "metadata", {}) or {})
+                    if isinstance(error, ModelEmptyResponseError)
+                    else {}
+                )
                 runner._emit_model_event(
                     task_id=task.id,
                     subtask_id=subtask.id,
@@ -400,6 +606,7 @@ async def run_subtask(
                             runner._is_model_request_overflow_error(error)
                         ),
                         "overflow_fallback_attempted": overflow_fallback_attempted,
+                        **error_metadata,
                         **build_model_retry_event_payload(
                             error,
                             delay_seconds=delay_seconds,
@@ -417,6 +624,16 @@ async def run_subtask(
                     on_retry_scheduled=_on_invocation_retry_scheduled,
                 )
             except Exception as e:
+                error_metadata = (
+                    dict(getattr(e, "metadata", {}) or {})
+                    if isinstance(e, ModelEmptyResponseError)
+                    else {}
+                )
+                if error_metadata:
+                    last_model_failure_metadata = error_metadata
+                    last_model_failure_reason_code = str(
+                        error_metadata.get("reason_code", "") or "",
+                    ).strip()
                 session.interruption_reason = (
                     "Model invocation failed after "
                     f"{invocation_attempt} attempt(s): {type(e).__name__}: {e}"
@@ -1154,6 +1371,14 @@ async def run_subtask(
         )
 
         if session.interruption_reason:
+            reason_code = (
+                last_model_failure_reason_code
+                or "model_invocation_failed"
+            )
+            metadata = dict(last_model_failure_metadata)
+            if reason_code == ModelEmptyResponseError.reason_code:
+                metadata.setdefault("root_cause", "model_empty_response")
+                metadata.setdefault("downstream_failure", "deliverable_missing")
             verification = VerificationResult(
                 tier=1,
                 passed=False,
@@ -1164,6 +1389,14 @@ async def run_subtask(
                     detail=session.interruption_reason,
                 )],
                 feedback=session.interruption_reason,
+                outcome="fail",
+                reason_code=reason_code,
+                severity_class=(
+                    "infra"
+                    if reason_code == ModelEmptyResponseError.reason_code
+                    else ""
+                ),
+                metadata=metadata,
             )
             runner._spawn_memory_extraction(task.id, subtask.id, result)
             return result, verification

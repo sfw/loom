@@ -426,6 +426,7 @@ class OpenAICompatibleProvider(ModelProvider):
                     # Buffer tool call deltas until complete
                     tool_call_buffers: dict[int, dict] = {}
                     latest_usage: TokenUsage | None = None
+                    latest_finish_reason = ""
 
                     async for line in response.aiter_lines():
                         line = line.strip()
@@ -459,6 +460,7 @@ class OpenAICompatibleProvider(ModelProvider):
                                 text="", done=True,
                                 tool_calls=parsed_tools,
                                 usage=latest_usage,
+                                finish_reason=latest_finish_reason,
                             )
                             return
 
@@ -473,6 +475,11 @@ class OpenAICompatibleProvider(ModelProvider):
                             first = choices[0]
                             if isinstance(first, dict):
                                 choice = first
+                        finish_reason = str(
+                            choice.get("finish_reason", "") or "",
+                        ).strip()
+                        if finish_reason:
+                            latest_finish_reason = finish_reason
                         delta = choice.get("delta", {}) if isinstance(choice, dict) else {}
                         text = delta.get("content") or ""
                         reasoning = delta.get("reasoning_content") or delta.get("reasoning") or ""

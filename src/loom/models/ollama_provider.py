@@ -243,6 +243,7 @@ class OllamaProvider(ModelProvider):
                     message = data.get("message", {})
                     text = message.get("content") or ""
                     done = data.get("done", False)
+                    finish_reason = str(data.get("done_reason", "") or "").strip()
 
                     # Collect tool calls (only available in final message)
                     if message.get("tool_calls"):
@@ -287,6 +288,7 @@ class OllamaProvider(ModelProvider):
                         done=done,
                         tool_calls=parsed_tools,
                         usage=usage,
+                        finish_reason=finish_reason,
                     )
 
                     if done:
