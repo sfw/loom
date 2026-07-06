@@ -12,7 +12,7 @@ from loom.auth.runtime import AuthResolutionError
 from loom.config import Config, ExecutionConfig
 from loom.engine.runner import SubtaskResultStatus, SubtaskRunner
 from loom.engine.verification import VerificationResult
-from loom.models.base import ModelResponse, TokenUsage, ToolCall
+from loom.models.base import ModelResponse, StreamChunk, TokenUsage, ToolCall
 from loom.state.task_state import Subtask, Task
 from loom.tools.registry import ToolResult
 
@@ -44,6 +44,18 @@ def _make_runner(
             usage=TokenUsage(total_tokens=12),
         ),
     )
+
+    async def _stream_from_complete(messages, tools=None):
+        response = await executor_model.complete(messages, tools=tools)
+        yield StreamChunk(
+            text=response.text,
+            done=True,
+            tool_calls=response.tool_calls,
+            usage=response.usage,
+            finish_reason=response.finish_reason,
+        )
+
+    executor_model.stream = _stream_from_complete
     router.select = MagicMock(return_value=executor_model)
 
     tool_registry = MagicMock()
@@ -133,6 +145,144 @@ async def test_run_cleans_session_state_on_unhandled_exception(
 
     assert runner._subtask_deadline_monotonic is None
     assert runner._active_subtask_telemetry_counters is None
+
+
+@pytest.mark.asyncio
+async def test_run_classifies_empty_model_response_as_infra_without_verification(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        runner_module,
+        "build_run_auth_context",
+        lambda **kwargs: {},
+    )
+    model_complete = AsyncMock(
+        return_value=ModelResponse(
+            text="",
+            tool_calls=None,
+            finish_reason="",
+            usage=TokenUsage(total_tokens=0),
+        ),
+    )
+    runner = _make_runner(
+        memory_query=AsyncMock(return_value=[]),
+        model_complete=model_complete,
+        config=Config(
+            execution=ExecutionConfig(
+                enable_streaming=False,
+                model_call_max_attempts=2,
+                model_call_retry_base_delay_seconds=0,
+                model_call_retry_max_delay_seconds=0,
+                model_call_retry_jitter_seconds=0,
+            ),
+        ),
+    )
+    task, subtask = _make_task(tmp_path)
+
+    result, verification = await runner.run(task, subtask)
+
+    assert model_complete.await_count == 2
+    runner._verification.verify.assert_not_called()
+    assert result.status == SubtaskResultStatus.FAILED
+    assert verification.passed is False
+    assert verification.reason_code == "infra_runner_empty_response"
+    assert verification.severity_class == "infra"
+    assert verification.metadata["failure_class"] == "model_empty_response"
+    assert verification.metadata["provider_status"] == "unknown"
+    assert verification.metadata["stream_close_reason"] == "not_streaming"
+    assert verification.metadata["retry_count"] == 1
+    assert verification.metadata["response_chars"] == 0
+    assert verification.metadata["response_tool_calls"] == 0
+    assert verification.metadata["response_finish_reason"] == ""
+
+
+@pytest.mark.asyncio
+async def test_run_classifies_empty_stream_close_as_infra_without_verification(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        runner_module,
+        "build_run_auth_context",
+        lambda **kwargs: {},
+    )
+    runner = _make_runner(
+        memory_query=AsyncMock(return_value=[]),
+        config=Config(
+            execution=ExecutionConfig(
+                enable_streaming=True,
+                model_call_max_attempts=2,
+                model_call_retry_base_delay_seconds=0,
+                model_call_retry_max_delay_seconds=0,
+                model_call_retry_jitter_seconds=0,
+            ),
+        ),
+    )
+    stream_calls = 0
+
+    async def empty_stream(messages, tools=None):
+        nonlocal stream_calls
+        stream_calls += 1
+        if False:
+            yield StreamChunk()
+
+    executor_model = runner._router.select.return_value
+    executor_model.stream = empty_stream
+    task, subtask = _make_task(tmp_path)
+
+    result, verification = await runner.run(task, subtask)
+
+    assert stream_calls == 2
+    runner._verification.verify.assert_not_called()
+    assert result.status == SubtaskResultStatus.FAILED
+    assert verification.reason_code == "infra_runner_empty_response"
+    assert verification.severity_class == "infra"
+    assert verification.metadata["stream_close_reason"] == (
+        "generator_exhausted_without_final_chunk"
+    )
+    assert verification.metadata["stream_final_chunk_seen"] is False
+    assert verification.metadata["stream_chunk_count"] == 0
+    assert verification.metadata["retry_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_run_fails_unfit_context_preflight_when_compaction_is_off(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        runner_module,
+        "build_run_auth_context",
+        lambda **kwargs: {},
+    )
+    model_complete = AsyncMock(
+        return_value=ModelResponse(
+            text="Completed.",
+            tool_calls=None,
+            usage=TokenUsage(total_tokens=12),
+        ),
+    )
+    runner = _make_runner(
+        memory_query=AsyncMock(return_value=[]),
+        model_complete=model_complete,
+        config=Config(execution=ExecutionConfig(enable_streaming=False)),
+    )
+    runner._router.select.return_value.enforces_context_window = True
+    runner._max_model_context_tokens = 1
+    task, subtask = _make_task(tmp_path)
+
+    result, verification = await runner.run(task, subtask)
+
+    model_complete.assert_not_awaited()
+    runner._verification.verify.assert_not_called()
+    assert result.status == SubtaskResultStatus.FAILED
+    assert verification.reason_code == "infra_runner_context_unfit"
+    assert verification.severity_class == "infra"
+    assert verification.metadata["failure_class"] == "context_unfit"
+    assert verification.metadata["provider_status"] == "not_sent"
+    assert verification.metadata["compaction_policy_mode"] == "off"
+    assert verification.metadata["compaction_terminal_state"] == "unfit"
 
 
 def test_runner_resolves_post_call_guard_mode_from_config() -> None:

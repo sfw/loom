@@ -1119,9 +1119,15 @@ class SubtaskRunner:
         text_parts: list[str] = []
         final_tool_calls = None
         final_usage = None
+        final_finish_reason = ""
+        chunk_count = 0
+        content_chunk_count = 0
+        final_chunk_seen = False
 
         async for chunk in model.stream(messages, tools=tools):
+            chunk_count += 1
             if chunk.text:
+                content_chunk_count += 1
                 text_parts.append(chunk.text)
                 # Emit token event
                 if self._event_bus:
@@ -1138,15 +1144,31 @@ class SubtaskRunner:
                 final_tool_calls = chunk.tool_calls
             if chunk.usage is not None:
                 final_usage = chunk.usage
+            finish_reason = str(getattr(chunk, "finish_reason", "") or "").strip()
+            if finish_reason:
+                final_finish_reason = finish_reason
+            if bool(getattr(chunk, "done", False)):
+                final_chunk_seen = True
 
         from loom.models.base import TokenUsage
 
+        stream_close_reason = (
+            "final_chunk"
+            if final_chunk_seen
+            else "generator_exhausted_without_final_chunk"
+        )
         return ModelResponse(
             text="".join(text_parts),
             tool_calls=final_tool_calls,
-            raw="",
+            raw={
+                "stream_chunk_count": chunk_count,
+                "stream_content_chunk_count": content_chunk_count,
+                "stream_final_chunk_seen": final_chunk_seen,
+                "stream_close_reason": stream_close_reason,
+            },
             usage=final_usage or TokenUsage(),
             model=model.name,
+            finish_reason=final_finish_reason,
         )
 
     def _emit_tool_event(
@@ -1984,19 +2006,21 @@ class SubtaskRunner:
     ) -> list[dict]:
         mode = self._runner_compaction_mode()
         if mode == "off":
+            context_budget = int(
+                getattr(
+                    self,
+                    "_max_model_context_tokens",
+                    self.MAX_MODEL_CONTEXT_TOKENS,
+                ),
+            )
             estimate = runner_compaction.compute_request_budget(
                 messages=messages,
                 tools=tools,
-                context_budget_tokens=int(
-                    getattr(
-                        self,
-                        "_max_model_context_tokens",
-                        self.MAX_MODEL_CONTEXT_TOKENS,
-                    ),
-                ),
+                context_budget_tokens=context_budget,
                 target_ratio=1.0,
                 origin="runner.compaction.disabled",
             ).request_est_tokens
+            pressure_ratio = estimate / max(1, context_budget)
             self._set_compaction_diagnostics({
                 "compaction_policy_mode": mode,
                 "compaction_stage": "none",
@@ -2004,6 +2028,16 @@ class SubtaskRunner:
                 "compaction_skipped_reason": "policy_disabled",
                 "compaction_est_tokens_before": estimate,
                 "compaction_est_tokens_after": estimate,
+                "compaction_pressure_ratio": round(pressure_ratio, 4),
+                "compaction_pressure_ratio_after": round(pressure_ratio, 4),
+                "compaction_deficit_tokens_before": max(0, estimate - context_budget),
+                "compaction_terminal_state": runner_compaction.compaction_terminal_state(
+                    estimate_after=estimate,
+                    context_budget=context_budget,
+                    microcompact_hits=0,
+                    compactor_calls=0,
+                    overflow_fallback_applied=False,
+                ),
                 "compaction_compactor_calls": 0,
             })
             return messages

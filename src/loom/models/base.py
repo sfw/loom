@@ -55,6 +55,7 @@ class StreamChunk:
     done: bool = False
     tool_calls: list[ToolCall] | None = None
     usage: TokenUsage | None = None
+    finish_reason: str = ""
 
 
 class ModelProvider(ABC):
@@ -148,3 +149,13 @@ class ModelConnectionError(Exception):
     def __init__(self, message: str, original: Exception | None = None):
         super().__init__(message)
         self.original = original
+
+
+class ModelEmptyResponseError(Exception):
+    """Raised when a provider returns no assistant output or terminal reason."""
+
+    reason_code = "infra_runner_empty_response"
+
+    def __init__(self, message: str, *, metadata: dict | None = None):
+        super().__init__(message)
+        self.metadata = dict(metadata or {})
