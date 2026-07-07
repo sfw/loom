@@ -186,9 +186,9 @@ async def test_run_classifies_empty_model_response_as_infra_without_verification
     runner._verification.verify.assert_not_called()
     assert result.status == SubtaskResultStatus.FAILED
     assert verification.passed is False
-    assert verification.reason_code == "infra_runner_empty_response"
+    assert verification.reason_code == "runner_empty_response"
     assert verification.severity_class == "infra"
-    assert verification.metadata["failure_class"] == "model_empty_response"
+    assert verification.metadata["failure_class"] == "runner_empty_response"
     assert verification.metadata["provider_status"] == "unknown"
     assert verification.metadata["stream_close_reason"] == "not_streaming"
     assert verification.metadata["retry_count"] == 1
@@ -236,8 +236,9 @@ async def test_run_classifies_empty_stream_close_as_infra_without_verification(
     assert stream_calls == 2
     runner._verification.verify.assert_not_called()
     assert result.status == SubtaskResultStatus.FAILED
-    assert verification.reason_code == "infra_runner_empty_response"
+    assert verification.reason_code == "model_stream_empty"
     assert verification.severity_class == "infra"
+    assert verification.metadata["failure_class"] == "model_stream_empty"
     assert verification.metadata["stream_close_reason"] == (
         "generator_exhausted_without_final_chunk"
     )

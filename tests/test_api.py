@@ -5249,6 +5249,136 @@ class TestWorkspaceFirstEndpoints:
         assert "HTTP 999" in failure["summary"]
         assert "hard invariant verification failure" in failure["remediation"]["why_not_remedied"]
 
+    @pytest.mark.asyncio
+    async def test_run_failure_analysis_prefers_terminal_subtask_failure_event(
+        self,
+        client,
+        tmp_path,
+        database,
+        state_manager,
+        workspace_registry,
+    ):
+        workspace_path = tmp_path / "run-terminal-failure-analysis-ws"
+        workspace_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(
+            str(workspace_path),
+            display_name="Run Terminal Failure Analysis WS",
+        )
+        assert workspace is not None
+
+        task = Task(
+            id="task-run-terminal-failure-analysis-1",
+            goal="Build interview dossier",
+            status=TaskStatus.FAILED,
+            workspace=str(workspace_path),
+            metadata={"process": "interview-dossier"},
+            plan=Plan(subtasks=[
+                Subtask(
+                    id="identity-and-source-map",
+                    description="Identity and source map",
+                    status=SubtaskStatus.COMPLETED,
+                ),
+                Subtask(
+                    id="prior-interview-analysis",
+                    description="Prior interview analysis",
+                    status=SubtaskStatus.FAILED,
+                ),
+            ]),
+        )
+        state_manager.save(task)
+
+        await database.insert_task(
+            task_id=task.id,
+            goal=task.goal,
+            workspace_path=str(workspace_path),
+            status="failed",
+            metadata={"process": "interview-dossier"},
+        )
+        await database.insert_task_run(
+            run_id="exec-run-terminal-failure-analysis-1",
+            task_id=task.id,
+            status="failed",
+            process_name="interview-dossier",
+        )
+        await database.insert_event(
+            task_id=task.id,
+            correlation_id="corr-terminal-failure-analysis-1",
+            run_id="exec-run-terminal-failure-analysis-1",
+            event_type="subtask_failed",
+            data={
+                "subtask_id": "identity-and-source-map",
+                "feedback": "Expected deliverable 'identity-and-source-map.md' not found",
+                "reason_code": "hard_invariant_failed",
+            },
+            sequence=1,
+        )
+        await database.insert_event(
+            task_id=task.id,
+            correlation_id="corr-terminal-failure-analysis-1",
+            run_id="exec-run-terminal-failure-analysis-1",
+            event_type="subtask_completed",
+            data={
+                "subtask_id": "identity-and-source-map",
+                "reason_code": "",
+            },
+            sequence=2,
+        )
+        await database.insert_event(
+            task_id=task.id,
+            correlation_id="corr-terminal-failure-analysis-1",
+            run_id="exec-run-terminal-failure-analysis-1",
+            event_type="model_invocation",
+            data={
+                "subtask_id": "prior-interview-analysis",
+                "phase": "done",
+                "reason_code": "model_stream_empty",
+                "failure_class": "model_stream_empty",
+                "response_chars": 0,
+                "response_tool_calls": 0,
+                "response_finish_reason": "",
+                "compaction_terminal_state": "unfit",
+            },
+            sequence=3,
+        )
+        await database.insert_event(
+            task_id=task.id,
+            correlation_id="corr-terminal-failure-analysis-1",
+            run_id="exec-run-terminal-failure-analysis-1",
+            event_type="subtask_failed",
+            data={
+                "subtask_id": "prior-interview-analysis",
+                "feedback": (
+                    "Model invocation failed after 2 attempt(s): "
+                    "ModelEmptyResponseError: no assistant output."
+                ),
+                "reason_code": "model_stream_empty",
+            },
+            sequence=4,
+        )
+        await database.insert_event(
+            task_id=task.id,
+            correlation_id="corr-terminal-failure-analysis-1",
+            run_id="exec-run-terminal-failure-analysis-1",
+            event_type="task_failed",
+            data={
+                "failed_subtasks": [
+                    "prior-interview-analysis",
+                    "identity-and-source-map",
+                ],
+                "reason": "subtask_failure",
+            },
+            sequence=5,
+        )
+
+        response = await client.get(f"/runs/{task.id}")
+        assert response.status_code == 200
+        failure = response.json()["failure_analysis"]
+        assert failure["failing_subtask_id"] == "prior-interview-analysis"
+        assert failure["failing_subtask_label"] == "Prior interview analysis"
+        assert failure["primary_reason_code"] == "model_stream_empty"
+        assert "Prior interview analysis failed" in failure["headline"]
+        assert "identity-and-source-map" not in failure["headline"]
+
     def test_reason_family_maps_method_failures_to_unconfirmed_data(self):
         from loom.api.routes import _reason_family
 

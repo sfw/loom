@@ -981,6 +981,9 @@ _FAILURE_REASON_FAMILIES: dict[str, str] = {
     "forbidden_output_path": "policy",
     "hard_invariant_failed": "contract_failure",
     "infra_verifier_error": "verification_infra",
+    "infra_runner_empty_response": "runtime_infra",
+    "model_stream_empty": "runtime_infra",
+    "runner_empty_response": "runtime_infra",
     "manifest_input_policy_violation": "policy",
     "parse_inconclusive": "unconfirmed_data",
     "policy_remediation_required": "policy",
@@ -1022,6 +1025,26 @@ def _latest_event(
         if subtask_id and str(data.get("subtask_id", "") or "").strip() != subtask_id:
             continue
         return event
+    return None
+
+
+def _latest_unresolved_subtask_failed_event(
+    events: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    completed_after: set[str] = set()
+    for event in reversed(events):
+        event_type = str(event.get("event_type", "") or "")
+        data = event.get("data")
+        if not isinstance(data, dict):
+            data = {}
+        subtask_id = str(data.get("subtask_id", "") or "").strip()
+        if not subtask_id:
+            continue
+        if event_type == "subtask_completed":
+            completed_after.add(subtask_id)
+            continue
+        if event_type == "subtask_failed" and subtask_id not in completed_after:
+            return event
     return None
 
 
@@ -1156,16 +1179,19 @@ def _build_run_failure_analysis(
         for item in blocked_subtasks
         if isinstance(item, dict) and str(item.get("subtask_id", "") or "").strip()
     ]
-    latest_subtask_failed = _latest_event(events, event_types={"subtask_failed"})
+    latest_subtask_failed = (
+        _latest_unresolved_subtask_failed_event(events)
+        or _latest_event(events, event_types={"subtask_failed"})
+    )
     latest_subtask_failed_data = (
         dict(latest_subtask_failed.get("data", {}))
-        if isinstance(latest_subtask_failed and latest_subtask_failed.get("data"), dict)
+        if isinstance((latest_subtask_failed or {}).get("data"), dict)
         else {}
     )
     failing_subtask_id = (
-        (failed_subtasks[-1] if failed_subtasks else "")
+        str(latest_subtask_failed_data.get("subtask_id", "") or "").strip()
+        or (failed_subtasks[-1] if failed_subtasks else "")
         or (blocked_subtask_ids[0] if blocked_subtask_ids else "")
-        or str(latest_subtask_failed_data.get("subtask_id", "") or "").strip()
     )
     failing_subtask_label = label_lookup.get(failing_subtask_id, failing_subtask_id)
 

@@ -88,6 +88,14 @@ class TestDataStructures:
         )
         assert r.severity_class == "inconclusive"
 
+        empty_response = VerificationResult(
+            tier=1,
+            passed=False,
+            outcome="fail",
+            reason_code="runner_empty_response",
+        )
+        assert empty_response.severity_class == "infra"
+
     def test_verification_result_respects_explicit_severity_class(self):
         r = VerificationResult(
             tier=2,

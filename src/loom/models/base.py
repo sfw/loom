@@ -154,7 +154,7 @@ class ModelConnectionError(Exception):
 class ModelEmptyResponseError(Exception):
     """Raised when a provider returns no assistant output or terminal reason."""
 
-    reason_code = "infra_runner_empty_response"
+    reason_code = "runner_empty_response"
 
     def __init__(self, message: str, *, metadata: dict | None = None):
         super().__init__(message)

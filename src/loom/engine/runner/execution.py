@@ -89,12 +89,17 @@ def _empty_response_metadata(
     stream_close_reason = str(raw.get("stream_close_reason", "") or "").strip()
     if not stream_close_reason:
         stream_close_reason = "not_streaming" if operation != "stream" else "unknown"
+    reason_code = (
+        "model_stream_empty"
+        if operation == "stream"
+        else ModelEmptyResponseError.reason_code
+    )
     provider_status = str(
         raw.get("provider_status", raw.get("http_status", "")) or "",
     ).strip() or "unknown"
     return {
-        "reason_code": ModelEmptyResponseError.reason_code,
-        "failure_class": "model_empty_response",
+        "reason_code": reason_code,
+        "failure_class": reason_code,
         "provider_status": provider_status,
         "stream_close_reason": stream_close_reason,
         "stream_final_chunk_seen": bool(raw.get("stream_final_chunk_seen", False)),
@@ -1369,7 +1374,10 @@ async def run_subtask(
                 or "model_invocation_failed"
             )
             metadata = dict(last_model_failure_metadata)
-            if reason_code == ModelEmptyResponseError.reason_code:
+            if reason_code in {
+                ModelEmptyResponseError.reason_code,
+                "model_stream_empty",
+            }:
                 metadata.setdefault("root_cause", "model_empty_response")
                 metadata.setdefault("downstream_failure", "deliverable_missing")
             verification = VerificationResult(
@@ -1386,7 +1394,10 @@ async def run_subtask(
                 reason_code=reason_code,
                 severity_class=(
                     "infra"
-                    if reason_code == ModelEmptyResponseError.reason_code
+                    if reason_code in {
+                        ModelEmptyResponseError.reason_code,
+                        "model_stream_empty",
+                    }
                     else ""
                 ),
                 metadata=metadata,
