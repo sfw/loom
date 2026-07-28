@@ -173,6 +173,11 @@ Default `iteration_command_exit_allowlisted_prefixes`:
 | `remediation_queue_max_attempts` | `int` | `3` | Max queued remediation attempts after confirm/prune. |
 | `remediation_queue_backoff_seconds` | `float` | `2.0` | Base backoff for queued remediation retries. |
 | `remediation_queue_max_backoff_seconds` | `float` | `30.0` | Max backoff cap for queued remediation retries. |
+| `resilience_no_progress_attempts` | `int` | `2` | Consecutive correction observations without a structured progress-vector improvement before the controller stops blind retries. |
+
+Correction lifecycle persistence is always enabled for orchestrated task failures.
+`enable_sqlite_remediation_queue` only controls the legacy remediation-queue
+projection; it does not disable durable correction cycles, attempts, or actions.
 
 Default `contradiction_scan_allowed_suffixes`:
 
@@ -204,7 +209,7 @@ Default `contradiction_scan_allowed_suffixes`:
 | `minimal_text_output_chars` | `int` | `260` | Tiny fallback compacted text target. |
 | `tool_call_argument_context_chars` | `int` | `700` | Argument context extraction target. |
 | `compact_tool_call_argument_chars` | `int` | `1600` | Aggressive tool-argument compaction target. |
-| `runner_compaction_policy_mode` | `string` | `"off"` | Runner compaction policy (`legacy`, `tiered`, `off`). |
+| `runner_compaction_policy_mode` | `string` | `"hybrid"` | Runner compaction policy. `hybrid` performs deterministic structural reduction plus cached, anchor-validated semantic checkpoints; `deterministic` is the emergency zero-model-call policy; `semantic`, `tiered`, and `legacy` are compatibility modes; `off` disables proactive compaction. |
 | `enable_filetype_ingest_router` | `bool` | `true` | Routes fetched binary/doc payloads into artifact-backed summaries. |
 | `enable_artifact_telemetry_events` | `bool` | `true` | Emits artifact ingest/read/retention and compaction/overflow transparency events to run logs (set `false` to disable). |
 | `artifact_telemetry_max_metadata_chars` | `int` | `1200` | Max serialized chars allowed for `handler_metadata` telemetry payload fields. |
@@ -529,7 +534,7 @@ Operational OAuth notes:
 - `limits.runner.minimal_text_output_chars` is clamped to `40..10000`.
 - `limits.runner.tool_call_argument_context_chars` is clamped to `80..20000`.
 - `limits.runner.compact_tool_call_argument_chars` is clamped to `40..10000`.
-- Invalid `limits.runner.runner_compaction_policy_mode` falls back to `"off"`.
+- Invalid `limits.runner.runner_compaction_policy_mode` falls back to `"hybrid"`.
 - `limits.runner.artifact_telemetry_max_metadata_chars` is clamped to `120..20000`.
 - `limits.runner.ingest_artifact_retention_max_age_days` is clamped to `0..3650`.
 - `limits.runner.ingest_artifact_retention_max_files_per_scope` is clamped to `1..200000`.

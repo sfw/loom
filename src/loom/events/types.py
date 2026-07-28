@@ -108,6 +108,13 @@ PLACEHOLDER_FILLED = "placeholder_filled"
 PLACEHOLDER_PRUNED = "placeholder_pruned"
 PLACEHOLDER_REMEDIATION_UNRESOLVED = "placeholder_remediation_unresolved"
 
+# Unified correction lifecycle
+CORRECTION_DETECTED = "correction_detected"
+CORRECTION_PLANNED = "correction_planned"
+CORRECTION_PROGRESS = "correction_progress"
+CORRECTION_RESOLVED = "correction_resolved"
+CORRECTION_TERMINAL = "correction_terminal"
+
 # Iteration loop events
 ITERATION_STARTED = "iteration_started"
 ITERATION_GATE_FAILED = "iteration_gate_failed"
@@ -255,6 +262,11 @@ EVENT_LIFECYCLE: dict[str, EventLifecycle] = {
     PLACEHOLDER_FILLED: "active",
     PLACEHOLDER_PRUNED: "active",
     PLACEHOLDER_REMEDIATION_UNRESOLVED: "active",
+    CORRECTION_DETECTED: "active",
+    CORRECTION_PLANNED: "active",
+    CORRECTION_PROGRESS: "active",
+    CORRECTION_RESOLVED: "active",
+    CORRECTION_TERMINAL: "active",
     # Iteration events
     ITERATION_STARTED: "active",
     ITERATION_GATE_FAILED: "active",

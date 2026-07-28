@@ -1524,6 +1524,58 @@ class TestOrchestratorExecution:
         assert attempts[0].error is not None
 
     @pytest.mark.asyncio
+    async def test_handle_failure_grants_one_progressing_checkpoint_continuation(
+        self,
+        tmp_path,
+    ):
+        state_manager = _make_state_manager(tmp_path)
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text='{"subtasks": []}'),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=state_manager,
+            event_bus=_make_event_bus(),
+            config=Config(execution=ExecutionConfig(max_subtask_retries=3)),
+        )
+        task = _make_task()
+        subtask = Subtask(
+            id="risk-register",
+            description="Finish the risk register",
+            is_critical_path=True,
+            retry_count=3,
+            max_retries=3,
+        )
+        task.plan.subtasks = [subtask]
+        state_manager.create(task)
+        result = SubtaskResult(
+            status="failed",
+            summary="Partial risk register exists.",
+        )
+        verification = VerificationResult(
+            tier=2,
+            passed=False,
+            outcome="fail",
+            reason_code="tool_budget_exhausted",
+            severity_class="infra",
+            feedback="Only RISK-006 remains.",
+            metadata={"missing_targets": ["RISK-006"]},
+        )
+        orch._abort_on_critical_path_failure = AsyncMock()
+
+        await orch._handle_failure(
+            task,
+            subtask,
+            result,
+            verification,
+            attempts_by_subtask={},
+        )
+
+        assert subtask.retry_count == 4
+        assert subtask.status == SubtaskStatus.PENDING
+        orch._abort_on_critical_path_failure.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_handle_failure_allows_optional_dev_verifier_warning_success(self, tmp_path):
         state_manager = _make_state_manager(tmp_path)
         process = ProcessDefinition(

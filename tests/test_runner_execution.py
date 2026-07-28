@@ -248,6 +248,61 @@ async def test_run_classifies_empty_stream_close_as_infra_without_verification(
 
 
 @pytest.mark.asyncio
+async def test_run_repairs_orphan_tool_message_before_model_submission(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        runner_module,
+        "build_run_auth_context",
+        lambda **kwargs: {},
+    )
+    model_complete = AsyncMock(
+        return_value=ModelResponse(
+            text="Recovered and completed.",
+            usage=TokenUsage(total_tokens=12),
+        ),
+    )
+    runner = _make_runner(
+        memory_query=AsyncMock(return_value=[]),
+        model_complete=model_complete,
+        config=Config(
+            execution=ExecutionConfig(
+                enable_streaming=False,
+                model_call_max_attempts=5,
+                model_call_retry_base_delay_seconds=0,
+                model_call_retry_max_delay_seconds=0,
+                model_call_retry_jitter_seconds=0,
+            ),
+        ),
+    )
+    runner._compact_messages_for_model = AsyncMock(return_value=[
+        {"role": "user", "content": "Do the work."},
+        {"role": "tool", "tool_call_id": "call-missing", "content": "orphaned"},
+    ])
+    task, subtask = _make_task(tmp_path)
+
+    result, verification = await runner.run(task, subtask)
+
+    assert result.status == SubtaskResultStatus.SUCCESS
+    assert verification.passed is True
+    model_complete.assert_awaited_once()
+    runner._verification.verify.assert_awaited_once()
+    sent_messages = model_complete.await_args.args[0]
+    assert sent_messages[1]["role"] == "user"
+    assert "RECOVERED HISTORICAL TOOL CONTEXT" in sent_messages[1]["content"]
+    assert "call-missing" in sent_messages[1]["content"]
+    assert "orphaned" in sent_messages[1]["content"]
+    diagnostics = runner._last_compaction_diagnostics
+    assert diagnostics["message_contract_repair_applied"] is True
+    assert diagnostics["message_contract_repair_status"] == "recovered"
+    assert diagnostics["message_contract_repair_violations"] == [
+        "tool_call_id_not_found",
+    ]
+    assert diagnostics["message_contract_repair_tool_messages_recovered"] == 1
+
+
+@pytest.mark.asyncio
 async def test_run_fails_unfit_context_preflight_when_compaction_is_off(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -269,6 +324,7 @@ async def test_run_fails_unfit_context_preflight_when_compaction_is_off(
         model_complete=model_complete,
         config=Config(execution=ExecutionConfig(enable_streaming=False)),
     )
+    runner._runner_compaction_policy_mode = "off"
     runner._router.select.return_value.enforces_context_window = True
     runner._max_model_context_tokens = 1
     task, subtask = _make_task(tmp_path)
@@ -282,8 +338,69 @@ async def test_run_fails_unfit_context_preflight_when_compaction_is_off(
     assert verification.severity_class == "infra"
     assert verification.metadata["failure_class"] == "context_unfit"
     assert verification.metadata["provider_status"] == "not_sent"
-    assert verification.metadata["compaction_policy_mode"] == "off"
+    assert verification.metadata["compaction_policy_mode"] == "deterministic"
+    assert verification.metadata["compaction_policy_mode_configured"] == "off"
+    assert verification.metadata["compaction_emergency_rescue_attempted"] is True
     assert verification.metadata["compaction_terminal_state"] == "unfit"
+
+
+@pytest.mark.asyncio
+async def test_run_emergency_compacts_oversized_initial_prompt_when_policy_is_off(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        runner_module,
+        "build_run_auth_context",
+        lambda **kwargs: {},
+    )
+    model_complete = AsyncMock(
+        return_value=ModelResponse(
+            text="Completed.",
+            tool_calls=None,
+            usage=TokenUsage(total_tokens=12),
+        ),
+    )
+    runner = _make_runner(
+        memory_query=AsyncMock(return_value=[]),
+        model_complete=model_complete,
+        config=Config(execution=ExecutionConfig(enable_streaming=False)),
+    )
+    runner._runner_compaction_policy_mode = "off"
+    runner._router.select.return_value.enforces_context_window = True
+    runner._max_model_context_tokens = 600
+    runner._prompts.build_executor_prompt = MagicMock(
+        return_value="Oversized process context. " + ("detail " * 5000),
+    )
+
+    class _FakeCompactor:
+        async def compact(self, text: str, *, max_chars: int, label: str = "") -> str:
+            assert label == "initial execution prompt context"
+            return str(text)[:max_chars]
+
+    runner._compactor = _FakeCompactor()
+    task, subtask = _make_task(tmp_path)
+
+    result, verification = await runner.run(task, subtask)
+
+    assert result.status == SubtaskResultStatus.SUCCESS
+    assert verification.passed is True
+    assert model_complete.await_count == 1
+    sent_messages = model_complete.await_args.args[0]
+    assert "EMERGENCY CONTEXT COMPACTION APPLIED" in sent_messages[0]["content"]
+    assert runner._verification.verify.await_count == 1
+    assert runner._last_compaction_diagnostics["compaction_policy_mode"] == (
+        "deterministic"
+    )
+    assert (
+        runner._last_compaction_diagnostics["compaction_policy_mode_configured"]
+        == "off"
+    )
+    assert runner._last_compaction_diagnostics["compaction_emergency_rescue_attempted"]
+    assert runner._last_compaction_diagnostics["compaction_stage"] == (
+        "stage_5_initial_prompt"
+    )
+    assert runner._last_compaction_diagnostics["compaction_terminal_state"] != "unfit"
 
 
 def test_runner_resolves_post_call_guard_mode_from_config() -> None:
@@ -363,6 +480,76 @@ async def test_run_locks_to_text_completion_after_writing_expected_deliverable(
         "CANONICAL DELIVERABLE WRITE COMPLETE" in str(message.get("content", ""))
         for message in second_messages
     )
+
+
+@pytest.mark.asyncio
+async def test_run_does_not_refetch_access_denied_url_with_different_query_hint(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        runner_module,
+        "build_run_auth_context",
+        lambda **kwargs: {},
+    )
+    blocked_url = "https://members.example.test/private-page"
+    model_complete = AsyncMock(side_effect=[
+        ModelResponse(
+            text="",
+            tool_calls=[
+                ToolCall(
+                    id="call-1",
+                    name="web_fetch",
+                    arguments={"url": blocked_url, "query": "local units"},
+                ),
+            ],
+            usage=TokenUsage(total_tokens=10),
+        ),
+        ModelResponse(
+            text="",
+            tool_calls=[
+                ToolCall(
+                    id="call-2",
+                    name="web_fetch",
+                    arguments={"url": blocked_url, "query": "regions and chapters"},
+                ),
+            ],
+            usage=TokenUsage(total_tokens=10),
+        ),
+        ModelResponse(
+            text="Completed using alternate public evidence.",
+            tool_calls=None,
+            usage=TokenUsage(total_tokens=8),
+        ),
+    ])
+    runner = _make_runner(
+        memory_query=AsyncMock(return_value=[]),
+        model_complete=model_complete,
+        config=Config(execution=ExecutionConfig(enable_streaming=False)),
+    )
+    runner._tools.all_schemas = MagicMock(return_value=[
+        {
+            "name": "web_fetch",
+            "parameters": {"type": "object", "required": ["url"]},
+        },
+    ])
+    fetch_tool = MagicMock()
+    fetch_tool.is_mutating = False
+    fetch_tool.mutation_target_arg_keys = ()
+    runner._tools.get = MagicMock(return_value=fetch_tool)
+    runner._tools.execute = AsyncMock(
+        return_value=ToolResult.fail(f"HTTP 403: {blocked_url}"),
+    )
+
+    task, subtask = _make_task(tmp_path)
+    result, verification = await runner.run(task, subtask)
+
+    assert result.status == SubtaskResultStatus.SUCCESS
+    assert verification.passed is True
+    assert runner._tools.execute.await_count == 1
+    assert len(result.tool_calls) == 2
+    assert "SOURCE METHOD EXHAUSTED" in result.tool_calls[1].result.error
+    assert "Use web_search" in result.tool_calls[1].result.error
 
 
 @pytest.mark.asyncio
@@ -497,6 +684,104 @@ async def test_run_allows_same_response_non_mutating_tools_after_canonical_write
     assert runner._tools.execute.await_args_list[1].args[0] == "fact_checker"
     assert len(model_complete.await_args_list) == 2
     assert model_complete.await_args_list[1].kwargs["tools"] == []
+
+
+@pytest.mark.asyncio
+async def test_run_suppresses_optional_fact_checker_reports_outside_canonical_outputs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        runner_module,
+        "build_run_auth_context",
+        lambda **kwargs: {},
+    )
+    model_complete = AsyncMock(side_effect=[
+        ModelResponse(
+            text="",
+            tool_calls=[
+                ToolCall(
+                    id="call-1",
+                    name="write_file",
+                    arguments={"path": "report.md", "content": "draft"},
+                ),
+                ToolCall(
+                    id="call-2",
+                    name="fact_checker",
+                    arguments={
+                        "claims": ["A claim"],
+                        "sources": ["source.md"],
+                        "write_reports": True,
+                        "output_path": "fact-check-report.md",
+                        "output_csv_path": "fact-check-report.csv",
+                    },
+                ),
+            ],
+            usage=TokenUsage(total_tokens=20),
+        ),
+        ModelResponse(
+            text="Completed.",
+            tool_calls=None,
+            usage=TokenUsage(total_tokens=8),
+        ),
+    ])
+    runner = _make_runner(
+        memory_query=AsyncMock(return_value=[]),
+        model_complete=model_complete,
+        config=Config(execution=ExecutionConfig(enable_streaming=False)),
+    )
+    runner._tools.all_schemas = MagicMock(return_value=[
+        {
+            "name": "write_file",
+            "parameters": {"type": "object", "required": ["path", "content"]},
+        },
+        {
+            "name": "fact_checker",
+            "parameters": {"type": "object", "required": ["claims"]},
+        },
+    ])
+    write_tool = MagicMock()
+    write_tool.is_mutating = True
+    write_tool.mutation_target_arg_keys = ()
+    fact_checker_tool = MagicMock()
+    fact_checker_tool.is_mutating = True
+    fact_checker_tool.mutation_target_arg_keys = (
+        "output_path",
+        "output_csv_path",
+    )
+    runner._tools.get = MagicMock(side_effect=lambda name: {
+        "write_file": write_tool,
+        "fact_checker": fact_checker_tool,
+    }[name])
+    runner._tools.execute = AsyncMock(side_effect=[
+        ToolResult.ok("written", files_changed=["report.md"]),
+        ToolResult.ok(
+            "supported",
+            data={"verdicts": [{"claim": "A claim", "verdict": "supported"}]},
+        ),
+    ])
+
+    task, subtask = _make_task(tmp_path)
+    result, verification = await runner.run(
+        task,
+        subtask,
+        expected_deliverables=["report.md"],
+    )
+
+    assert result.status == SubtaskResultStatus.SUCCESS
+    assert verification.passed is True
+    execute_args = runner._tools.execute.await_args_list[1].args[1]
+    assert execute_args == {
+        "claims": ["A claim"],
+        "sources": ["source.md"],
+    }
+    call_record = result.tool_calls[1]
+    assert call_record.result.data["optional_output_side_effects_suppressed"] is True
+    assert call_record.result.data["suppressed_argument_keys"] == [
+        "output_path",
+        "output_csv_path",
+        "write_reports",
+    ]
 
 
 @pytest.mark.asyncio

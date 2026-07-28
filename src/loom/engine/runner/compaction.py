@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
-from collections import Counter
+import re
 from typing import Any
 
 from loom.engine.compaction_control import (
@@ -43,6 +44,23 @@ _TOOL_SCHEMA_FALLBACK_PRIORITY = (
     "web_fetch",
     "web_fetch_html",
     "fact_checker",
+)
+_SALIENCE_LINE_PATTERN = re.compile(
+    r"(?:https?://|(?:^|\s)[~/][^\s]+|\b(?:must|required|constraint|deliverable|"
+    r"acceptance|error|failed|failure|warning|source|citation|as-of|do not|never|"
+    r"deadline|output|path|file)\b|\b\d{4}-\d{2}-\d{2}\b)",
+    re.IGNORECASE,
+)
+_SEMANTIC_ANCHOR_PATTERNS = (
+    re.compile(r"https?://[^\s<>\]\[(){}]+", re.IGNORECASE),
+    re.compile(r"(?<!\w)(?:\.?\.?/)?(?:[\w.-]+/)+[\w.-]+"),
+    re.compile(r"\b\d{4}-\d{2}-\d{2}\b"),
+    re.compile(
+        r"(?<![\w-])(?:[$€£])?\d[\d,]*(?:\.\d+)?(?:%|ms|s|min|h|KB|MB|GB|TB)?(?![\w-])",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\b(?:call|task|subtask|run|event|evidence)[-_][A-Za-z0-9_.:-]+\b"),
+    re.compile(r"\b[A-Za-z0-9_.-]+\.(?:md|json|yaml|yml|toml|csv|tsv|pdf|docx|xlsx)\b"),
 )
 
 
@@ -202,53 +220,21 @@ def _structured_microcompact_text(raw: str, *, max_chars: int) -> str | None:
     return None
 
 
-def _text_blob_microcompact_text(raw: str, *, max_chars: int) -> str | None:
+def _tool_payload_microcompact_text(raw: str, *, max_chars: int) -> str | None:
     text = str(raw or "")
     if not text:
         return None
-    stripped_lines = [line.strip() for line in text.splitlines() if line.strip()]
     normalized = _normalize_inline_whitespace(text)
-    preview_budget = max(24, min(180, max_chars - 96))
-    summary: dict[str, Any] = {
+    payload = {
         "_loom_compact": "deterministic",
-        "type": "text",
+        "type": "tool_payload",
         "chars": len(text),
-        "lines": max(1, text.count("\n") + 1),
-        "preview": overflow_excerpt(normalized, max_chars=preview_budget),
+        "preview": overflow_excerpt(
+            normalized,
+            max_chars=max(16, min(180, max_chars - 80)),
+        ),
     }
-    if stripped_lines:
-        counts = Counter(stripped_lines)
-        repeated = [
-            {
-                "count": count,
-                "preview": overflow_excerpt(line, max_chars=56),
-            }
-            for line, count in counts.most_common(3)
-            if count > 1
-        ]
-        if repeated:
-            summary["repeated"] = repeated
-            summary["unique_lines"] = len(counts)
-    if normalized and len(set(normalized[: min(len(normalized), 256)])) <= 4:
-        summary["shape"] = "low_entropy_blob"
-
-    variants: list[dict[str, Any]] = [summary]
-    if "repeated" in summary:
-        compact = dict(summary)
-        compact.pop("repeated", None)
-        compact.pop("unique_lines", None)
-        variants.append(compact)
-    variants.append({
-        "_loom_compact": "deterministic",
-        "type": "text",
-        "chars": len(text),
-        "preview": overflow_excerpt(normalized, max_chars=max(16, max_chars - 56)),
-    })
-    variants.append({
-        "_loom_compact": "deterministic",
-        "type": "text",
-        "chars": len(text),
-    })
+    variants = [payload, {key: value for key, value in payload.items() if key != "preview"}]
     for variant in variants:
         rendered = json.dumps(
             variant,
@@ -259,6 +245,64 @@ def _text_blob_microcompact_text(raw: str, *, max_chars: int) -> str | None:
         if len(rendered) <= max_chars:
             return rendered
     return None
+
+
+def _salience_preserving_excerpt(raw: str, *, max_chars: int) -> str | None:
+    """Return an exact, deterministic head/salience/tail excerpt.
+
+    Unlike semantic summaries, every retained character comes from the source.
+    This keeps requirements, identifiers, URLs, errors, and the most recent tail
+    visible without adding a model call or paraphrasing the original context.
+    """
+    text = str(raw or "")
+    if max_chars <= 0 or len(text) <= max_chars:
+        return None
+    if max_chars <= 48:
+        return text[:max_chars]
+
+    lines = text.splitlines()
+    signal_lines: list[str] = []
+    seen: set[str] = set()
+    for line in lines[1:-1]:
+        stripped = line.strip()
+        if not stripped or stripped in seen:
+            continue
+        if _SALIENCE_LINE_PATTERN.search(stripped):
+            seen.add(stripped)
+            signal_lines.append(stripped)
+        if len(signal_lines) >= 6:
+            break
+
+    omitted_marker = "\n...[deterministic excerpt: middle context omitted]...\n"
+    signal_budget = min(max_chars // 4, 480) if signal_lines else 0
+    signal_text = ""
+    if signal_budget > 40:
+        packed: list[str] = []
+        used = 0
+        for line in signal_lines:
+            excerpt = overflow_excerpt(line, max_chars=min(180, signal_budget))
+            addition = len(excerpt) + (1 if packed else 0)
+            if used + addition > signal_budget:
+                continue
+            packed.append(excerpt)
+            used += addition
+        if packed:
+            signal_text = "\n[retained salient lines]\n" + "\n".join(packed) + "\n"
+
+    fixed = len(omitted_marker) + len(signal_text)
+    if fixed >= max_chars - 24:
+        signal_text = ""
+        fixed = len(omitted_marker)
+    remaining = max(1, max_chars - fixed)
+    head_chars = max(1, int(remaining * 0.62))
+    tail_chars = max(0, remaining - head_chars)
+    result = (
+        text[:head_chars].rstrip()
+        + omitted_marker
+        + signal_text
+        + (text[-tail_chars:].lstrip() if tail_chars else "")
+    )
+    return result[:max_chars]
 
 
 def deterministic_microcompact_text(
@@ -274,11 +318,80 @@ def deterministic_microcompact_text(
     structured = _structured_microcompact_text(text, max_chars=max_chars)
     if structured and len(structured) < len(text):
         return structured
-    if force or _is_microcompact_label(label):
-        micro = _text_blob_microcompact_text(text, max_chars=max_chars)
+    if _is_microcompact_label(label):
+        micro = _tool_payload_microcompact_text(text, max_chars=max_chars)
+        if micro and len(micro) < len(text):
+            return micro
+    if force:
+        micro = _salience_preserving_excerpt(text, max_chars=max_chars)
         if micro and len(micro) < len(text):
             return micro
     return None
+
+
+def extract_semantic_anchors(
+    text: str,
+    *,
+    limit: int | None = None,
+) -> list[str]:
+    """Extract exact high-risk tokens that a semantic checkpoint must retain."""
+    value = str(text or "")
+    anchors: list[str] = []
+    seen: set[str] = set()
+    for pattern in _SEMANTIC_ANCHOR_PATTERNS:
+        for match in pattern.finditer(value):
+            anchor = match.group(0).rstrip(".,;:!?")
+            if not anchor or anchor in seen:
+                continue
+            seen.add(anchor)
+            anchors.append(anchor)
+            if limit is not None and len(anchors) >= max(1, int(limit)):
+                return anchors
+    return anchors
+
+
+def validate_and_repair_semantic_checkpoint(
+    summary: str,
+    *,
+    anchors: list[str],
+    max_chars: int,
+) -> tuple[str | None, dict[str, Any]]:
+    """Require exact source anchors, appending missing ones when budget permits."""
+    compacted = str(summary or "").strip()
+    missing_before = [anchor for anchor in anchors if anchor not in compacted]
+    repaired = compacted
+    appended: list[str] = []
+    if missing_before:
+        prefix = "\n\nExact retained source anchors:\n"
+        available = max(0, int(max_chars) - len(repaired) - len(prefix))
+        lines: list[str] = []
+        used = 0
+        for anchor in missing_before:
+            line = f"- {anchor}"
+            cost = len(line) + (1 if lines else 0)
+            if used + cost > available:
+                continue
+            lines.append(line)
+            appended.append(anchor)
+            used += cost
+        if lines:
+            repaired = repaired + prefix + "\n".join(lines)
+
+    missing_after = [anchor for anchor in anchors if anchor not in repaired]
+    report = {
+        "checkpoint_anchor_count": len(anchors),
+        "checkpoint_anchor_missing_before_repair": len(missing_before),
+        "checkpoint_anchor_appended_count": len(appended),
+        "checkpoint_anchor_missing_after_repair": len(missing_after),
+        "checkpoint_anchor_coverage_ratio": round(
+            (len(anchors) - len(missing_after)) / max(1, len(anchors)),
+            4,
+        ),
+        "checkpoint_validation_passed": bool(repaired) and not missing_after,
+    }
+    if not repaired or len(repaired) > max_chars or missing_after:
+        return None, report
+    return repaired, report
 
 
 def rewrite_tool_payload_for_overflow(
@@ -789,7 +902,7 @@ def build_compaction_plan(
             stage3_historical.append(idx)
 
     stage4_merge: list[int] = []
-    if tier == CompactionPressureTier.CRITICAL and total > 4:
+    if tier != CompactionPressureTier.NORMAL and total > 4:
         preserve_recent = int(
             getattr(
                 runner,
@@ -798,10 +911,43 @@ def build_compaction_plan(
             ),
         )
         merge_limit = max(1, total - max(3, preserve_recent + 1))
-        for idx in range(1, merge_limit):
-            if idx in preserve_tool_exchange:
+        merge_set = {
+            idx
+            for idx in range(1, merge_limit)
+            if idx not in preserve_tool_exchange
+        }
+
+        # Provider tool-call messages are an atomic protocol unit.  Expanding a
+        # merge boundary through an old exchange is safe; retaining only its tool
+        # result (or only its assistant call) creates an invalid next request.
+        idx = 1
+        while idx < total:
+            msg = messages[idx]
+            if not (
+                isinstance(msg, dict)
+                and str(msg.get("role", "") or "").strip().lower() == "assistant"
+                and msg.get("tool_calls")
+            ):
+                idx += 1
                 continue
-            stage4_merge.append(idx)
+            exchange = {idx}
+            cursor = idx + 1
+            while cursor < total:
+                candidate = messages[cursor]
+                if not isinstance(candidate, dict):
+                    break
+                if str(candidate.get("role", "") or "").strip().lower() != "tool":
+                    break
+                exchange.add(cursor)
+                cursor += 1
+            if exchange & merge_set:
+                if exchange & preserve_tool_exchange:
+                    merge_set.difference_update(exchange)
+                else:
+                    merge_set.update(exchange)
+            idx = cursor
+
+        stage4_merge.extend(sorted(merge_set))
 
     return _CompactionPlan(
         critical_indices=tuple(sorted(critical_indices)),
@@ -821,7 +967,8 @@ async def compact_text(
     logger: logging.Logger | None = None,
 ) -> str:
     value = str(text or "")
-    if runner._runner_compaction_mode() == "off":
+    mode = runner._runner_compaction_mode()
+    if mode == "off":
         runner._record_compaction_skip("policy_disabled")
         return value
     if max_chars <= 0:
@@ -835,6 +982,24 @@ async def compact_text(
     if cached is not None:
         runner._record_compaction_skip("cache_hit")
         return cached
+
+    hybrid_semantic_label = str(label or "").strip().lower() in {
+        "semantic checkpoint context",
+        "subtask verification summary",
+    }
+    if mode == "deterministic" or (mode == "hybrid" and not hybrid_semantic_label):
+        compacted = deterministic_microcompact_text(
+            value,
+            max_chars=max_chars,
+            label=label,
+            force=True,
+        )
+        if compacted is None:
+            compacted = runner._hard_cap_text(value, max_chars)
+        runner._runner_compaction_cache[key] = compacted
+        runner._trim_compaction_cache(runner._runner_compaction_cache)
+        runner._record_compaction_microcompact(len(value) - len(compacted))
+        return compacted
 
     micro = deterministic_microcompact_text(
         value,
@@ -1184,28 +1349,42 @@ async def compact_messages_for_model_tiered(
 ) -> list[dict]:
     runner._reset_compaction_runtime_stats()
     mode = runner._runner_compaction_mode()
-    if len(messages) < 3:
-        set_compaction_diagnostics(runner, {
-            "compaction_policy_mode": mode,
-            "compaction_pressure_tier": CompactionPressureTier.NORMAL.value,
-            "compaction_pressure_ratio": 0.0,
-            "compaction_stage": "none",
-            "compaction_candidate_count": 0,
-            "compaction_skipped_reason": "short_history",
-            "compaction_deficit_tokens_before": 0,
-            "compaction_protected_tail_count": len(messages),
-            "compaction_terminal_state": "fit",
-            "compaction_compactor_calls": 0,
-            "compaction_compactor_failures": 0,
-            "compaction_circuit_breaker_tripped": False,
-            "compaction_microcompact_hits": 0,
-            "compaction_microcompact_chars_reduced": 0,
-        })
-        return messages
-
     context_budget = int(
         getattr(runner, "_max_model_context_tokens", runner.MAX_MODEL_CONTEXT_TOKENS),
     )
+    if len(messages) < 3:
+        request_budget = compute_request_budget(
+            messages=messages,
+            tools=tools,
+            context_budget_tokens=context_budget,
+            target_ratio=1.0,
+            origin="runner.compaction.tiered.short_history",
+        )
+        if request_budget.request_est_tokens <= max(1, context_budget):
+            pressure_ratio = request_budget.usage_ratio
+            deficit_before = request_budget.deficit_tokens
+            set_compaction_diagnostics(runner, {
+                "compaction_policy_mode": mode,
+                "compaction_pressure_tier": CompactionPressureTier.NORMAL.value,
+                "compaction_pressure_ratio": round(pressure_ratio, 4),
+                "compaction_stage": "none",
+                "compaction_candidate_count": 0,
+                "compaction_skipped_reason": "short_history",
+                "compaction_est_tokens_before": request_budget.request_est_tokens,
+                "compaction_est_tokens_after": request_budget.request_est_tokens,
+                "compaction_deficit_tokens_before": deficit_before,
+                "compaction_protected_tail_count": len(messages),
+                "compaction_terminal_state": "fit",
+                "compaction_compactor_calls": 0,
+                "compaction_compactor_failures": 0,
+                "compaction_circuit_breaker_tripped": False,
+                "compaction_microcompact_hits": 0,
+                "compaction_microcompact_chars_reduced": 0,
+            })
+            return messages
+        # A first-turn prompt can be the whole problem. Continue into the
+        # pressure path so the initial prompt can be compacted.
+
     soft_ratio = float(
         getattr(
             runner,
@@ -1240,6 +1419,10 @@ async def compact_messages_for_model_tiered(
     )
     minimal_text_chars = int(
         getattr(runner, "_minimal_text_output_chars", runner.MINIMAL_TEXT_OUTPUT_CHARS),
+    )
+    initial_prompt_target_chars = max(
+        int(minimal_text_chars * 4),
+        int(context_budget * 2.2),
     )
 
     request_budget_before = compute_request_budget(
@@ -1281,13 +1464,25 @@ async def compact_messages_for_model_tiered(
         for message in messages
     ]
     plan = build_compaction_plan(runner, compacted, tier=tier)
-    timeout_guard_active = runner._is_timeout_guard_active(remaining_seconds)
+    timeout_guard_active = (
+        mode not in {"deterministic"}
+        and runner._is_timeout_guard_active(remaining_seconds)
+    )
     total_candidates = (
         len(plan.stage1_tool_args)
         + len(plan.stage2_tool_output)
         + len(plan.stage3_historical)
         + len(plan.stage4_merge)
     )
+    initial_prompt_candidate = False
+    if estimate_before > max(1, context_budget) and compacted:
+        first_message = compacted[0]
+        if isinstance(first_message, dict) and isinstance(first_message.get("content"), str):
+            initial_prompt_candidate = (
+                len(str(first_message.get("content", ""))) > initial_prompt_target_chars
+            )
+            if initial_prompt_candidate:
+                total_candidates += 1
     protected_tail_count = len(plan.critical_indices)
     if total_candidates == 0:
         set_compaction_diagnostics(runner, {
@@ -1313,6 +1508,7 @@ async def compact_messages_for_model_tiered(
     estimate_after = estimate_before
     pressure_after = pressure_ratio
     applied_stages: list[str] = []
+    checkpoint_report: dict[str, Any] = {}
 
     async def _compact_stage_1() -> bool:
         changed = False
@@ -1379,17 +1575,49 @@ async def compact_messages_for_model_tiered(
         return changed
 
     async def _compact_stage_4() -> bool:
-        if tier != CompactionPressureTier.CRITICAL:
-            return False
-        if pressure_after <= hard_ratio:
+        nonlocal checkpoint_report
+        semantic_trigger_ratio = max(soft_ratio, min(0.98, hard_ratio))
+        if mode == "hybrid":
+            if pressure_after <= semantic_trigger_ratio:
+                return False
+        elif tier != CompactionPressureTier.CRITICAL or pressure_after <= hard_ratio:
             return False
         if not plan.stage4_merge:
             return False
-        merge_lines: list[str] = []
-        for idx in plan.stage4_merge:
+
+        max_source_chars = min(
+            int(getattr(runner._compactor, "_max_chunk_chars", 8_000)),
+            max(4_000, int(compact_text_chars * 6)),
+        )
+        merge_candidates = set(plan.stage4_merge)
+        atomic_groups: list[list[int]] = []
+        cursor = 0
+        ordered_candidates = sorted(merge_candidates)
+        while cursor < len(ordered_candidates):
+            idx = ordered_candidates[cursor]
+            msg = compacted[idx]
+            group = [idx]
+            if (
+                isinstance(msg, dict)
+                and str(msg.get("role", "") or "").strip().lower() == "assistant"
+                and msg.get("tool_calls")
+            ):
+                next_idx = idx + 1
+                while next_idx in merge_candidates:
+                    candidate = compacted[next_idx]
+                    if not isinstance(candidate, dict):
+                        break
+                    if str(candidate.get("role", "") or "").strip().lower() != "tool":
+                        break
+                    group.append(next_idx)
+                    next_idx += 1
+            atomic_groups.append(group)
+            cursor += len(group)
+
+        def _render_message(idx: int) -> str:
             msg = compacted[idx]
             if not isinstance(msg, dict):
-                continue
+                return ""
             role = str(msg.get("role", "")).strip().lower() or "unknown"
             if role == "assistant" and msg.get("tool_calls"):
                 tool_names = [
@@ -1397,34 +1625,127 @@ async def compact_messages_for_model_tiered(
                     for tc in list(msg.get("tool_calls", []))
                     if isinstance(tc, dict)
                 ]
-                merge_lines.append(
-                    f"[assistant/tool_call] {', '.join(tool_names) or 'tool call'}",
+                return (
+                    f"[assistant/tool_call] {', '.join(tool_names) or 'tool call'}"
                 )
-                continue
             content = msg.get("content", "")
             if not isinstance(content, str):
                 content = str(content)
-            merge_lines.append(f"[{role}] {content}")
+            return f"[{role}] {content}"
+
+        selected_indices: list[int] = []
+        merge_lines: list[str] = []
+        source_chars = 0
+        for group in atomic_groups:
+            rendered_group = [line for idx in group if (line := _render_message(idx))]
+            group_text = "\n".join(rendered_group)
+            added_chars = len(group_text) + (1 if merge_lines else 0)
+            if source_chars + added_chars > max_source_chars:
+                break
+            selected_indices.extend(group)
+            merge_lines.extend(rendered_group)
+            source_chars += added_chars
+
         merged_text = "\n".join(merge_lines).strip()
         if not merged_text:
+            checkpoint_report = {
+                "checkpoint_validation_passed": False,
+                "checkpoint_skipped_reason": "source_batch_exceeds_limit",
+                "checkpoint_source_limit_chars": max_source_chars,
+            }
             return False
+        checkpoint_target_chars = max(1_800, int(compact_text_chars * 2))
+        anchors = extract_semantic_anchors(merged_text)
+        anchor_reserve_chars = min(
+            max(0, checkpoint_target_chars - 600),
+            len("\n\nExact retained source anchors:\n")
+            + sum(len(anchor) + 3 for anchor in anchors),
+        )
+        semantic_target_chars = max(
+            600,
+            checkpoint_target_chars - anchor_reserve_chars,
+        )
+        source_hash = hashlib.sha256(
+            merged_text.encode("utf-8", errors="replace"),
+        ).hexdigest()
+        compactor_calls_before = int(
+            getattr(runner, "_compaction_runtime_stats", {}).get("compactor_calls", 0),
+        )
         merged_summary = await compact_text(
             runner,
             merged_text,
-            max_chars=max(480, int(compact_text_chars * 1.5)),
-            label="prior conversation context",
+            max_chars=semantic_target_chars,
+            label="semantic checkpoint context",
         )
-        merge_set = set(plan.stage4_merge)
+        validated_summary, validation_report = validate_and_repair_semantic_checkpoint(
+            merged_summary,
+            anchors=anchors,
+            max_chars=checkpoint_target_chars,
+        )
+        compactor_calls_after = int(
+            getattr(runner, "_compaction_runtime_stats", {}).get("compactor_calls", 0),
+        )
+        checkpoint_report = {
+            **validation_report,
+            "checkpoint_source_hash": source_hash,
+            "checkpoint_source_message_count": len(selected_indices),
+            "checkpoint_source_chars": len(merged_text),
+            "checkpoint_source_limit_chars": max_source_chars,
+            "checkpoint_target_chars": checkpoint_target_chars,
+            "checkpoint_semantic_target_chars": semantic_target_chars,
+            "checkpoint_anchor_reserve_chars": anchor_reserve_chars,
+            "checkpoint_model_calls": max(0, compactor_calls_after - compactor_calls_before),
+            "checkpoint_cache_hit": compactor_calls_after == compactor_calls_before,
+            "checkpoint_skipped_reason": (
+                "" if validated_summary is not None else "anchor_validation_failed"
+            ),
+        }
+        if validated_summary is None:
+            runner._record_compaction_skip("checkpoint_validation_failed")
+            return False
+
+        merge_set = set(selected_indices)
         rebuilt = [compacted[0]]
         rebuilt.append({
             "role": "user",
-            "content": f"Prior compacted context:\n{merged_summary}",
+            "content": (
+                "Prior semantic context checkpoint "
+                f"(source_sha256={source_hash[:16]}):\n{validated_summary}"
+            ),
         })
         for idx, msg in enumerate(compacted[1:], start=1):
             if idx in merge_set:
                 continue
             rebuilt.append(msg)
         compacted[:] = rebuilt
+        return True
+
+    async def _compact_stage_5_initial_prompt() -> bool:
+        if not initial_prompt_candidate:
+            return False
+        if pressure_after <= 1.0:
+            return False
+        msg = compacted[0]
+        if not isinstance(msg, dict):
+            return False
+        content = msg.get("content")
+        if not isinstance(content, str) or len(content) <= initial_prompt_target_chars:
+            return False
+        compacted_content = await compact_text(
+            runner,
+            content,
+            max_chars=initial_prompt_target_chars,
+            label="initial execution prompt context",
+        )
+        if compacted_content == content:
+            return False
+        msg["content"] = (
+            "EMERGENCY CONTEXT COMPACTION APPLIED TO INITIAL EXECUTION PROMPT.\n"
+            "The original prompt exceeded the model context window. Preserve all "
+            "explicit task requirements, output contracts, paths, and constraints "
+            "from this compacted prompt.\n\n"
+            f"{compacted_content}"
+        )
         return True
 
     async def _run_stage(stage_name: str, apply_fn) -> bool:
@@ -1444,7 +1765,20 @@ async def compact_messages_for_model_tiered(
         return changed
 
     await _run_stage("stage_1_tool_args", _compact_stage_1)
-    if pressure_after <= soft_ratio:
+    if mode == "hybrid":
+        if pressure_after > soft_ratio:
+            await _run_stage("stage_2_tool_outputs", _compact_stage_2)
+        if pressure_after > soft_ratio:
+            if timeout_guard_active:
+                runner._record_compaction_skip("timeout_guard")
+            else:
+                await _run_stage("stage_4_semantic_checkpoint", _compact_stage_4)
+        if pressure_after > 1.0:
+            await _run_stage(
+                "stage_5_initial_prompt",
+                _compact_stage_5_initial_prompt,
+            )
+    elif pressure_after <= soft_ratio:
         pass
     else:
         if timeout_guard_active:
@@ -1455,6 +1789,11 @@ async def compact_messages_for_model_tiered(
                 await _run_stage("stage_3_historical", _compact_stage_3)
             if pressure_after > soft_ratio and tier == CompactionPressureTier.CRITICAL:
                 await _run_stage("stage_4_merge", _compact_stage_4)
+            if pressure_after > 1.0:
+                await _run_stage(
+                    "stage_5_initial_prompt",
+                    _compact_stage_5_initial_prompt,
+                )
 
     stats = dict(getattr(runner, "_compaction_runtime_stats", {}))
     compactor_calls = int(stats.get("compactor_calls", 0))
@@ -1545,6 +1884,7 @@ async def compact_messages_for_model_tiered(
             ),
         ),
         "compaction_skip_reasons": stats.get("skip_reasons", {}),
+        "compaction_checkpoint": checkpoint_report,
     })
     return compacted
 

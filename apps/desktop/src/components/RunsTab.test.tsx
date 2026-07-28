@@ -98,7 +98,7 @@ describe("RunsTab", () => {
   });
 
   it("wraps long run goals in the selected run header instead of truncating them", () => {
-    const goal = "We are a film and TV production house that will be attending Banff World Media Festival in 2026 and need the entire prompt visible in the run header";
+    const goal = "We are preparing a detailed synthetic research brief and need the entire prompt visible in the run header";
     mockApp.selectedRunId = "run-abc";
     mockApp.runDetail = {
       id: "run-abc",

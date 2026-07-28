@@ -21,6 +21,7 @@ from loom.config import Config
 
 if TYPE_CHECKING:
     from loom.processes.schema import IterationPolicy, ProcessDefinition
+from loom.engine.correction import CorrectionController
 from loom.engine.iteration_gates import IterationEvaluation, IterationGateEvaluator
 from loom.engine.runner import SubtaskResult, SubtaskRunner, ToolCallRecord
 from loom.engine.scheduler import Scheduler
@@ -231,6 +232,13 @@ class Orchestrator:
             self._question = None
         self._retry = RetryManager(
             max_retries=config.execution.max_subtask_retries,
+        )
+        self._correction = CorrectionController(
+            memory_manager,
+            self._emit,
+            max_no_progress_attempts=int(
+                getattr(config.verification, "resilience_no_progress_attempts", 2) or 2
+            ),
         )
         self._state_lock = asyncio.Lock()
         self._changelog_cache: dict[str, ChangeLog] = {}

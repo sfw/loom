@@ -154,7 +154,7 @@ class TestDefaultConfig:
         assert config.limits.adhoc_repair_source_max_chars == 0
         assert config.limits.evidence_context_text_max_chars == 8192
         assert config.limits.runner.default_tool_result_output_chars == 2800
-        assert config.limits.runner.runner_compaction_policy_mode == "off"
+        assert config.limits.runner.runner_compaction_policy_mode == "hybrid"
         assert config.limits.runner.enable_filetype_ingest_router is True
         assert config.limits.runner.enable_artifact_telemetry_events is True
         assert config.limits.runner.artifact_telemetry_max_metadata_chars == 1200
@@ -846,6 +846,33 @@ runner_compaction_policy_mode = "off"
         config = load_config(toml_file)
         assert config.limits.runner.runner_compaction_policy_mode == "off"
 
+    def test_load_runner_compaction_policy_mode_deterministic(self, tmp_path: Path):
+        toml_file = tmp_path / "loom.toml"
+        toml_file.write_text("""\
+[limits.runner]
+runner_compaction_policy_mode = "deterministic"
+""")
+        config = load_config(toml_file)
+        assert config.limits.runner.runner_compaction_policy_mode == "deterministic"
+
+    def test_load_runner_compaction_policy_mode_hybrid(self, tmp_path: Path):
+        toml_file = tmp_path / "loom.toml"
+        toml_file.write_text("""\
+[limits.runner]
+runner_compaction_policy_mode = "hybrid"
+""")
+        config = load_config(toml_file)
+        assert config.limits.runner.runner_compaction_policy_mode == "hybrid"
+
+    def test_load_runner_compaction_policy_mode_semantic(self, tmp_path: Path):
+        toml_file = tmp_path / "loom.toml"
+        toml_file.write_text("""\
+[limits.runner]
+runner_compaction_policy_mode = "semantic"
+""")
+        config = load_config(toml_file)
+        assert config.limits.runner.runner_compaction_policy_mode == "semantic"
+
     def test_invalid_runner_compaction_policy_mode_falls_back(self, tmp_path: Path):
         toml_file = tmp_path / "loom.toml"
         toml_file.write_text("""\
@@ -853,7 +880,7 @@ runner_compaction_policy_mode = "off"
 runner_compaction_policy_mode = "invalid-mode"
 """)
         config = load_config(toml_file)
-        assert config.limits.runner.runner_compaction_policy_mode == "off"
+        assert config.limits.runner.runner_compaction_policy_mode == "hybrid"
 
     def test_can_disable_artifact_telemetry_events(self, tmp_path: Path):
         toml_file = tmp_path / "loom.toml"

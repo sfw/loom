@@ -46,13 +46,17 @@ class EconomicDataApiTool(Tool):
                 },
                 "provider": {
                     "type": "string",
+                    "enum": sorted(SUPPORTED_ECONOMIC_PROVIDERS),
                     "description": (
                         "Provider name: world_bank, oecd, eurostat, dbnomics, bls, fred."
                     ),
                 },
                 "providers": {
                     "type": "array",
-                    "items": {"type": "string"},
+                    "items": {
+                        "type": "string",
+                        "enum": sorted(SUPPORTED_ECONOMIC_PROVIDERS),
+                    },
                     "description": "Optional provider list for search/fallback.",
                 },
                 "query": {

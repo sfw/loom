@@ -210,6 +210,7 @@ class TestRetryManager:
         assert markets == []
 
     @pytest.mark.parametrize("reason_code", [
+        "artifact_confirmation_required",
         "tool_method_failed",
         "tool_transient_failure",
         "tool_upstream_unavailable",

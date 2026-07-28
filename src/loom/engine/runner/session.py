@@ -23,6 +23,7 @@ class RunnerSession:
     completed_normally: bool = False
     interruption_reason: str | None = None
     budget_exhaustion_note: str | None = None
+    exhausted_web_targets: dict[str, str] = field(default_factory=dict)
     ask_user_questions_asked: int = 0
     last_ask_user_requested_at: float = 0.0
 

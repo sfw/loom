@@ -420,7 +420,7 @@ class RunnerLimitsConfig:
     minimal_text_output_chars: int = 260
     tool_call_argument_context_chars: int = 700
     compact_tool_call_argument_chars: int = 1600
-    runner_compaction_policy_mode: str = "off"  # "legacy" | "tiered" | "off"
+    runner_compaction_policy_mode: str = "hybrid"
     enable_filetype_ingest_router: bool = True
     enable_artifact_telemetry_events: bool = True
     artifact_telemetry_max_metadata_chars: int = 1200
@@ -1605,7 +1605,14 @@ def load_config(path: Path | None = None) -> Config:
             RunnerLimitsConfig.runner_compaction_policy_mode,
         ),
     ).strip().lower()
-    if runner_compaction_policy_mode not in {"legacy", "tiered", "off"}:
+    if runner_compaction_policy_mode not in {
+        "hybrid",
+        "deterministic",
+        "semantic",
+        "legacy",
+        "tiered",
+        "off",
+    }:
         runner_compaction_policy_mode = RunnerLimitsConfig.runner_compaction_policy_mode
     compaction_pressure_ratio_soft = _float_from(
         runner_limits_data,

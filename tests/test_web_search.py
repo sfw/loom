@@ -297,7 +297,7 @@ class TestSearchBackend:
         )
 
         results = await backend.search(
-            "Blink49 Studios Canada television production",
+            "Example Studios television production",
             5,
             runtime_deadline=now["mono"] + 20.0,
         )

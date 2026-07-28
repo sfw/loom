@@ -14,6 +14,35 @@ if TYPE_CHECKING:
     from loom.processes.schema import ProcessDefinition
 
 
+def suppress_optional_output_side_effects(
+    *,
+    tool_name: str,
+    tool_args: dict[str, Any],
+) -> tuple[dict[str, Any], list[str]]:
+    """Remove optional report writes while preserving a tool's primary operation.
+
+    Some evidence tools can optionally emit convenience reports. A process run
+    should still be able to use their in-memory result when those reports are not
+    canonical deliverables.
+    """
+    normalized_name = str(tool_name or "").strip().lower()
+    optional_keys_by_tool = {
+        "fact_checker": ("output_path", "output_csv_path", "write_reports"),
+    }
+    optional_keys = optional_keys_by_tool.get(normalized_name, ())
+    if not optional_keys:
+        return dict(tool_args), []
+
+    sanitized = dict(tool_args)
+    removed: list[str] = []
+    for key in optional_keys:
+        if key not in sanitized:
+            continue
+        removed.append(key)
+        sanitized.pop(key, None)
+    return sanitized, removed
+
+
 def route_tool_call_for_process(
     *,
     tool_name: str,

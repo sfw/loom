@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from loom.engine.runner.tool_routing import route_tool_call_for_process
+from loom.engine.runner.tool_routing import (
+    route_tool_call_for_process,
+    suppress_optional_output_side_effects,
+)
 from loom.engine.verification_helpers import (
     _browser_session_executor,
     bind_verification_helper,
@@ -20,6 +23,25 @@ def _make_process(tool_success_policy: str) -> ProcessDefinition:
             static_checks={"tool_success_policy": tool_success_policy},
         ),
     )
+
+
+def test_suppress_optional_fact_checker_report_outputs() -> None:
+    sanitized, removed = suppress_optional_output_side_effects(
+        tool_name="fact_checker",
+        tool_args={
+            "claims": ["A claim"],
+            "sources": ["source.md"],
+            "write_reports": True,
+            "output_path": "fact-check-report.md",
+            "output_csv_path": "fact-check-report.csv",
+        },
+    )
+
+    assert sanitized == {
+        "claims": ["A claim"],
+        "sources": ["source.md"],
+    }
+    assert removed == ["output_path", "output_csv_path", "write_reports"]
 
 
 def test_route_tool_call_for_process_rewrites_test_commands() -> None:

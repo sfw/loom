@@ -968,6 +968,7 @@ def _trim_snippet(value: object, *, limit: int = 220) -> str:
 
 
 _FAILURE_REASON_FAMILIES: dict[str, str] = {
+    "artifact_confirmation_required": "unconfirmed_data",
     "auth_preflight_failed": "auth",
     "blocked_pending_subtasks": "scheduler",
     "coverage_below_threshold": "contract_failure",
@@ -980,6 +981,8 @@ _FAILURE_REASON_FAMILIES: dict[str, str] = {
     "dev_verifier_timeout": "verification_infra",
     "forbidden_output_path": "policy",
     "hard_invariant_failed": "contract_failure",
+    "infra_message_contract_violation": "runtime_infra",
+    "infra_runner_context_unfit": "runtime_infra",
     "infra_verifier_error": "verification_infra",
     "infra_runner_empty_response": "runtime_infra",
     "model_stream_empty": "runtime_infra",
@@ -993,6 +996,9 @@ _FAILURE_REASON_FAMILIES: dict[str, str] = {
     "tool_transient_failure": "unconfirmed_data",
     "tool_upstream_unavailable": "unconfirmed_data",
     "tool_write_retryable": "unconfirmed_data",
+    "tool_budget_exhausted": "resource_budget",
+    "iteration_budget_exceeded": "resource_budget",
+    "runner_tool_budget_exhausted": "resource_budget",
     "unconfirmed_critical_path": "unconfirmed_data",
     "uncaught_exception": "runtime",
 }
@@ -1008,6 +1014,60 @@ def _first_nonempty_line(text: object, *, limit: int = 280) -> str:
         if compact:
             return compact
     return ""
+
+
+def _format_context_unfit_detail(data: dict[str, Any]) -> str:
+    parts: list[str] = []
+    provider_status = str(data.get("provider_status", "") or "").strip()
+    stream_close_reason = str(data.get("stream_close_reason", "") or "").strip()
+    compaction_policy_mode = str(data.get("compaction_policy_mode", "") or "").strip()
+    compaction_terminal_state = str(data.get("compaction_terminal_state", "") or "").strip()
+    request_bytes = int(data.get("request_bytes", 0) or 0)
+    request_est_tokens = int(data.get("request_est_tokens", 0) or 0)
+    pressure_ratio = data.get("compaction_pressure_ratio", "")
+
+    if provider_status:
+        parts.append(f"provider_status={provider_status}")
+    if stream_close_reason:
+        parts.append(f"stream_close_reason={stream_close_reason}")
+    if compaction_policy_mode:
+        parts.append(f"compaction_policy_mode={compaction_policy_mode}")
+    if compaction_terminal_state:
+        parts.append(f"compaction_terminal_state={compaction_terminal_state}")
+    if request_bytes > 0:
+        parts.append(f"request_bytes={request_bytes:,}")
+    if request_est_tokens > 0:
+        parts.append(f"request_est_tokens={request_est_tokens:,}")
+    if pressure_ratio not in ("", None):
+        parts.append(f"compaction_pressure_ratio={pressure_ratio}")
+    if not parts:
+        return "The runner rejected the model request before sending it."
+    return "Runner context preflight: " + "; ".join(parts) + "."
+
+
+def _format_message_contract_detail(data: dict[str, Any]) -> str:
+    parts: list[str] = []
+    violation = str(data.get("message_contract_violation", "") or "").strip()
+    message_index = data.get("message_index", "")
+    assistant_index = data.get("assistant_message_index", "")
+    tool_call_id = str(data.get("tool_call_id", "") or "").strip()
+    provider_status = str(data.get("provider_status", "") or "").strip()
+    stream_close_reason = str(data.get("stream_close_reason", "") or "").strip()
+    if violation:
+        parts.append(f"violation={violation}")
+    if message_index not in ("", None):
+        parts.append(f"message_index={message_index}")
+    if assistant_index not in ("", None):
+        parts.append(f"assistant_message_index={assistant_index}")
+    if tool_call_id:
+        parts.append(f"tool_call_id={tool_call_id}")
+    if provider_status:
+        parts.append(f"provider_status={provider_status}")
+    if stream_close_reason:
+        parts.append(f"stream_close_reason={stream_close_reason}")
+    if not parts:
+        return "The runner rejected a malformed model message transcript before sending it."
+    return "Runner message contract preflight: " + "; ".join(parts) + "."
 
 
 def _latest_event(
@@ -1044,6 +1104,40 @@ def _latest_unresolved_subtask_failed_event(
             completed_after.add(subtask_id)
             continue
         if event_type == "subtask_failed" and subtask_id not in completed_after:
+            return event
+    return None
+
+
+def _latest_unsent_runner_preflight_failure_event(
+    events: list[dict[str, Any]],
+    *,
+    subtask_id: str = "",
+) -> dict[str, Any] | None:
+    for event in reversed(events):
+        if str(event.get("event_type", "") or "") != "model_invocation":
+            continue
+        data = event.get("data")
+        if not isinstance(data, dict):
+            continue
+        if subtask_id and str(data.get("subtask_id", "") or "").strip() != subtask_id:
+            continue
+        reason_code = str(data.get("reason_code", "") or "").strip()
+        failure_class = str(data.get("failure_class", "") or "").strip()
+        provider_status = str(data.get("provider_status", "") or "").strip()
+        stream_close_reason = str(data.get("stream_close_reason", "") or "").strip()
+        if reason_code in {
+            "infra_runner_context_unfit",
+            "infra_message_contract_violation",
+        } or (
+            failure_class in {
+                "context_unfit",
+                "message_contract_violation",
+            }
+            and (
+                provider_status == "not_sent"
+                or stream_close_reason == "not_started"
+            )
+        ):
             return event
     return None
 
@@ -1193,6 +1287,22 @@ def _build_run_failure_analysis(
         or (failed_subtasks[-1] if failed_subtasks else "")
         or (blocked_subtask_ids[0] if blocked_subtask_ids else "")
     )
+    runner_preflight_event = _latest_unsent_runner_preflight_failure_event(
+        events,
+        subtask_id=failing_subtask_id,
+    )
+    if runner_preflight_event is None:
+        runner_preflight_event = _latest_unsent_runner_preflight_failure_event(events)
+    runner_preflight_data = (
+        dict(runner_preflight_event.get("data", {}))
+        if isinstance((runner_preflight_event or {}).get("data"), dict)
+        else {}
+    )
+    if runner_preflight_data:
+        failing_subtask_id = (
+            str(runner_preflight_data.get("subtask_id", "") or "").strip()
+            or failing_subtask_id
+        )
     failing_subtask_label = label_lookup.get(failing_subtask_id, failing_subtask_id)
 
     verification_terminal = _latest_event(
@@ -1216,14 +1326,43 @@ def _build_run_failure_analysis(
         else {}
     )
 
+    runner_preflight_reason_code = (
+        str(runner_preflight_data.get("reason_code", "") or "").strip()
+        if runner_preflight_data
+        else ""
+    )
+    runner_preflight_failure_class = (
+        str(runner_preflight_data.get("failure_class", "") or "").strip()
+        if runner_preflight_data
+        else ""
+    )
+    if runner_preflight_data and not runner_preflight_reason_code:
+        runner_preflight_reason_code = (
+            "infra_message_contract_violation"
+            if runner_preflight_failure_class == "message_contract_violation"
+            else "infra_runner_context_unfit"
+        )
     primary_reason_code = (
-        str(verification_data.get("reason_code", "") or "").strip()
+        runner_preflight_reason_code
+        or str(verification_data.get("reason_code", "") or "").strip()
         or str(subtask_failed_data.get("reason_code", "") or "").strip()
         or str(task_failed_data.get("reason", "") or "").strip()
     )
     task_reason = str(task_failed_data.get("reason", "") or "").strip()
+    runner_preflight_feedback = ""
+    if primary_reason_code == "infra_runner_context_unfit":
+        runner_preflight_feedback = (
+            "The model request was not sent because the assembled runner context did "
+            "not fit the model context window and runner compaction was disabled."
+        )
+    elif primary_reason_code == "infra_message_contract_violation":
+        runner_preflight_feedback = (
+            "The model request was not sent because the reconstructed tool-call "
+            "transcript violated the model provider message contract."
+        )
     feedback = (
-        _first_nonempty_line(subtask_failed_data.get("feedback", ""), limit=320)
+        runner_preflight_feedback
+        or _first_nonempty_line(subtask_failed_data.get("feedback", ""), limit=320)
         or _first_nonempty_line(task_failed_data.get("message", ""), limit=320)
         or _first_nonempty_line(task_failed_data.get("error", ""), limit=320)
     )
@@ -1241,6 +1380,12 @@ def _build_run_failure_analysis(
         )
     ]
     technical_detail, tool_evidence = _build_tool_failure_detail(failed_tool_events)
+    if runner_preflight_data:
+        technical_detail = (
+            _format_message_contract_detail(runner_preflight_data)
+            if primary_reason_code == "infra_message_contract_violation"
+            else _format_context_unfit_detail(runner_preflight_data)
+        )
 
     verification_reason_counts = telemetry_data.get("verification_reason_counts", {})
     if not isinstance(verification_reason_counts, dict):
@@ -1260,10 +1405,31 @@ def _build_run_failure_analysis(
         for count in (queued_count, attempt_count, resolved_count, failed_count, expired_count)
     )
     why_not_remedied = ""
-    if primary_reason_code == "hard_invariant_failed":
+    if primary_reason_code == "infra_message_contract_violation":
+        why_not_remedied = (
+            "The provider rejected the request shape before reasoning could begin, "
+            "so downstream missing-output failures are symptoms of a Loom message "
+            "reconstruction bug."
+        )
+    elif primary_reason_code == "infra_runner_context_unfit":
+        why_not_remedied = (
+            "The execution phase never reached the model provider, so missing "
+            "required outputs are downstream symptoms. Enable runner compaction or "
+            "reduce the execution context before rerunning."
+        )
+    elif primary_reason_code == "hard_invariant_failed":
         why_not_remedied = (
             "This was treated as a hard invariant verification failure, so Loom did not "
             "queue follow-up remediation and the run stopped after retries were exhausted."
+        )
+    elif primary_reason_code in {
+        "iteration_budget_exceeded",
+        "runner_tool_budget_exhausted",
+        "tool_budget_exhausted",
+    }:
+        why_not_remedied = (
+            "The subtask made partial progress but exhausted its bounded tool/retry "
+            "budget before satisfying the remaining acceptance criteria."
         )
     elif resolved_count > 0:
         why_not_remedied = (
@@ -1306,7 +1472,8 @@ def _build_run_failure_analysis(
     if failing_subtask_label:
         evidence.append(f"Failing subtask: {failing_subtask_label}")
     if primary_reason_code:
-        evidence.append(f"Verifier reason: {primary_reason_code}")
+        reason_label = "Runner reason" if runner_preflight_data else "Verifier reason"
+        evidence.append(f"{reason_label}: {primary_reason_code}")
     if tool_evidence:
         evidence.extend(tool_evidence[:2])
     if verification_reason_counts:
@@ -1324,7 +1491,17 @@ def _build_run_failure_analysis(
 
     next_actions: list[str] = []
     summary_lower = summary.lower()
-    if "http 999" in summary_lower or "linkedin" in summary_lower:
+    if primary_reason_code == "infra_message_contract_violation":
+        next_actions = [
+            "Inspect the bad message index and tool_call_id in the model invocation event.",
+            "Rebuild clean context from durable turns before resuming the run.",
+        ]
+    elif primary_reason_code == "infra_runner_context_unfit":
+        next_actions = [
+            "Enable runner compaction for oversized execution prompts.",
+            "Reduce the execution prompt context or split the phase into smaller inputs.",
+        ]
+    elif "http 999" in summary_lower or "linkedin" in summary_lower:
         next_actions = [
             "Use authenticated or browser-backed fetches for the blocked site.",
             "Relax the LinkedIn coverage requirement or allow alternate contact channels.",
@@ -1338,6 +1515,11 @@ def _build_run_failure_analysis(
         next_actions = [
             "Adjust the process contract or write scope so the task can satisfy "
             "policy constraints.",
+        ]
+    elif reason_family == "resource_budget":
+        next_actions = [
+            "Resume from the existing deliverables and repair only the named missing targets.",
+            "Avoid repeating broad research or already successful source collection.",
         ]
 
     return RunFailureAnalysisResponse(
@@ -8350,8 +8532,15 @@ def _conversation_context_status_from_session_row(
 
 def _conversation_compaction_policy_mode(engine: Engine) -> str:
     limits = getattr(getattr(engine.config, "limits", None), "runner", None)
-    mode = str(getattr(limits, "runner_compaction_policy_mode", "off") or "off").strip().lower()
-    return mode if mode in {"legacy", "tiered", "off"} else "off"
+    mode = str(
+        getattr(limits, "runner_compaction_policy_mode", "hybrid")
+        or "hybrid"
+    ).strip().lower()
+    return (
+        mode
+        if mode in {"hybrid", "deterministic", "semantic", "legacy", "tiered", "off"}
+        else "hybrid"
+    )
 
 
 def _cowork_context_token_budget(engine: Engine) -> int:
@@ -8727,7 +8916,15 @@ async def get_run(request: Request, run_id: str):
         )
         workspace_id = str((workspace or {}).get("id", "") or "")
         latest_run = await engine.database.get_latest_task_run_for_task(run_id)
-        event_rows = await engine.database.query_events(run_id, limit=1000, ascending=True)
+        # Failure analysis is terminal-cause oriented. Fetch the newest window, then
+        # restore chronological order for lifecycle reconstruction. Fetching the
+        # oldest window mislabeled long runs using stale early tool failures.
+        event_rows = await engine.database.query_events(
+            run_id,
+            limit=1000,
+            ascending=False,
+        )
+        event_rows.reverse()
         resolved_status = await _resolve_task_status(engine, task_row)
         failure_analysis = _build_run_failure_analysis(
             resolved_status=resolved_status,

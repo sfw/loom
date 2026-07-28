@@ -223,6 +223,7 @@ class RetryManager:
     @staticmethod
     def _method_failure_reason_codes() -> set[str]:
         return {
+            "artifact_confirmation_required",
             "tool_method_failed",
             "tool_transient_failure",
             "tool_upstream_unavailable",

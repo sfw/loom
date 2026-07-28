@@ -1139,6 +1139,252 @@ class Database:
             ),
         )
 
+    # --- Unified correction lifecycle persistence ---
+
+    async def get_correction_cycle(self, *, cycle_id: str) -> dict | None:
+        row = await self.query_one(
+            "SELECT * FROM correction_cycles WHERE id=?",
+            (cycle_id,),
+        )
+        if row is None:
+            return None
+        return self._decode_json_columns(
+            row,
+            ("blocker_snapshot", "baseline_progress", "latest_progress"),
+        )
+
+    async def upsert_correction_cycle(
+        self,
+        *,
+        cycle_id: str,
+        task_id: str,
+        run_id: str,
+        subtask_id: str,
+        blocker_fingerprint: str,
+        state: str,
+        blocking: bool,
+        repairability: str,
+        handler: str,
+        reason_code: str,
+        blocker_snapshot: list[dict],
+        baseline_progress: dict,
+        latest_progress: dict,
+        attempt_count: int,
+        no_progress_count: int,
+        max_attempts: int,
+        terminal_reason: str = "",
+    ) -> None:
+        now = datetime.now().isoformat()
+        await self.execute(
+            """INSERT INTO correction_cycles
+               (id, task_id, run_id, subtask_id, blocker_fingerprint, state, blocking,
+                repairability, handler, reason_code, blocker_snapshot, baseline_progress,
+                latest_progress, attempt_count, no_progress_count, max_attempts,
+                terminal_reason, created_at, updated_at, resolved_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+               ON CONFLICT(id) DO UPDATE SET
+                   run_id=excluded.run_id,
+                   state=excluded.state,
+                   blocking=excluded.blocking,
+                   repairability=excluded.repairability,
+                   handler=excluded.handler,
+                   reason_code=excluded.reason_code,
+                   blocker_snapshot=excluded.blocker_snapshot,
+                   latest_progress=excluded.latest_progress,
+                   attempt_count=excluded.attempt_count,
+                   no_progress_count=excluded.no_progress_count,
+                   max_attempts=excluded.max_attempts,
+                   terminal_reason=excluded.terminal_reason,
+                   updated_at=excluded.updated_at,
+                   resolved_at=NULL""",
+            (
+                cycle_id,
+                task_id,
+                run_id,
+                subtask_id,
+                blocker_fingerprint,
+                state,
+                1 if blocking else 0,
+                repairability,
+                handler,
+                reason_code,
+                json.dumps(blocker_snapshot, ensure_ascii=False, sort_keys=True),
+                json.dumps(baseline_progress, ensure_ascii=False, sort_keys=True),
+                json.dumps(latest_progress, ensure_ascii=False, sort_keys=True),
+                max(1, int(attempt_count)),
+                max(0, int(no_progress_count)),
+                max(1, int(max_attempts)),
+                terminal_reason,
+                now,
+                now,
+            ),
+        )
+
+    async def insert_correction_attempt(
+        self,
+        *,
+        correction_id: str,
+        task_id: str,
+        run_id: str,
+        subtask_id: str,
+        attempt: int,
+        state: str,
+        plan: dict,
+        before_progress: dict,
+        after_progress: dict,
+        progress_made: bool,
+        outcome: str,
+        error: str = "",
+        metadata: dict | None = None,
+    ) -> int:
+        return await self.execute_returning_id(
+            """INSERT INTO correction_attempts
+               (correction_id, task_id, run_id, subtask_id, attempt, state, plan_json,
+                before_progress, after_progress, progress_made, outcome, error, metadata,
+                created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                correction_id,
+                task_id,
+                run_id,
+                subtask_id,
+                max(1, int(attempt)),
+                state,
+                json.dumps(plan, ensure_ascii=False, sort_keys=True),
+                json.dumps(before_progress, ensure_ascii=False, sort_keys=True),
+                json.dumps(after_progress, ensure_ascii=False, sort_keys=True),
+                1 if progress_made else 0,
+                outcome,
+                error,
+                json.dumps(metadata or {}, ensure_ascii=False, sort_keys=True),
+                datetime.now().isoformat(),
+            ),
+        )
+
+    async def insert_correction_action(
+        self,
+        *,
+        correction_attempt_id: int,
+        correction_id: str,
+        sequence: int,
+        action_type: str,
+        handler: str,
+        arguments: dict,
+        idempotency_key: str,
+        state: str = "planned",
+    ) -> int:
+        return await self.execute_returning_id(
+            """INSERT INTO correction_actions
+               (correction_attempt_id, correction_id, sequence, action_type, handler,
+                args_json, idempotency_key, state, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                correction_attempt_id,
+                correction_id,
+                max(1, int(sequence)),
+                action_type,
+                handler,
+                json.dumps(arguments, ensure_ascii=False, sort_keys=True),
+                idempotency_key,
+                state,
+                datetime.now().isoformat(),
+                datetime.now().isoformat(),
+            ),
+        )
+
+    async def update_correction_cycle_state(
+        self,
+        *,
+        cycle_id: str,
+        state: str,
+        terminal_reason: str = "",
+    ) -> None:
+        now = datetime.now().isoformat()
+        resolved_at = now if state == "resolved" else None
+        await self.execute(
+            """UPDATE correction_cycles
+               SET state=?, terminal_reason=?, updated_at=?, resolved_at=?
+               WHERE id=?""",
+            (state, terminal_reason, now, resolved_at, cycle_id),
+        )
+        outcome = {
+            "retrying": "retry_scheduled",
+            "replanning": "replan_requested",
+            "terminal": "terminal",
+            "human_required": "human_required",
+            "resolved": "resolved",
+        }.get(state, state)
+        await self.execute(
+            """UPDATE correction_attempts
+               SET state=?, outcome=?
+               WHERE id=(
+                   SELECT id FROM correction_attempts
+                   WHERE correction_id=?
+                   ORDER BY attempt DESC, id DESC LIMIT 1
+               )""",
+            (state, outcome, cycle_id),
+        )
+        action_state = (
+            "executing"
+            if state in {"retrying", "replanning", "executing", "reverifying"}
+            else ("completed" if state == "resolved" else "failed")
+        )
+        await self.execute(
+            """UPDATE correction_actions
+               SET state=?, updated_at=?
+               WHERE correction_attempt_id=(
+                   SELECT id FROM correction_attempts
+                   WHERE correction_id=?
+                   ORDER BY attempt DESC, id DESC LIMIT 1
+               )""",
+            (action_state, now, cycle_id),
+        )
+
+    async def resolve_correction_cycles(
+        self,
+        *,
+        task_id: str,
+        subtask_id: str,
+    ) -> list[str]:
+        rows = await self.query(
+            """SELECT id FROM correction_cycles
+               WHERE task_id=? AND subtask_id=?
+                 AND state NOT IN ('resolved', 'terminal', 'human_required')""",
+            (task_id, subtask_id),
+        )
+        cycle_ids = [str(row.get("id", "")) for row in rows if row.get("id")]
+        for cycle_id in cycle_ids:
+            await self.update_correction_cycle_state(
+                cycle_id=cycle_id,
+                state="resolved",
+            )
+        return cycle_ids
+
+    async def list_correction_cycles(
+        self,
+        *,
+        task_id: str,
+        subtask_id: str | None = None,
+    ) -> list[dict]:
+        if subtask_id:
+            rows = await self.query(
+                """SELECT * FROM correction_cycles
+                   WHERE task_id=? AND subtask_id=? ORDER BY created_at, id""",
+                (task_id, subtask_id),
+            )
+        else:
+            rows = await self.query(
+                "SELECT * FROM correction_cycles WHERE task_id=? ORDER BY created_at, id",
+                (task_id,),
+            )
+        return [
+            self._decode_json_columns(
+                row,
+                ("blocker_snapshot", "baseline_progress", "latest_progress"),
+            )
+            for row in rows
+        ]
+
     # --- Iteration loop persistence ---
 
     async def upsert_iteration_run(
@@ -2135,6 +2381,43 @@ class MemoryManager:
             transient=transient,
             reason_code=reason_code,
             error=error,
+        )
+
+    async def get_correction_cycle(self, *, cycle_id: str) -> dict | None:
+        return await self._db.get_correction_cycle(cycle_id=cycle_id)
+
+    async def upsert_correction_cycle(self, **kwargs) -> None:
+        await self._db.upsert_correction_cycle(**kwargs)
+
+    async def insert_correction_attempt(self, **kwargs) -> int:
+        return await self._db.insert_correction_attempt(**kwargs)
+
+    async def insert_correction_action(self, **kwargs) -> int:
+        return await self._db.insert_correction_action(**kwargs)
+
+    async def update_correction_cycle_state(self, **kwargs) -> None:
+        await self._db.update_correction_cycle_state(**kwargs)
+
+    async def resolve_correction_cycles(
+        self,
+        *,
+        task_id: str,
+        subtask_id: str,
+    ) -> list[str]:
+        return await self._db.resolve_correction_cycles(
+            task_id=task_id,
+            subtask_id=subtask_id,
+        )
+
+    async def list_correction_cycles(
+        self,
+        *,
+        task_id: str,
+        subtask_id: str | None = None,
+    ) -> list[dict]:
+        return await self._db.list_correction_cycles(
+            task_id=task_id,
+            subtask_id=subtask_id,
         )
 
     async def upsert_iteration_run(

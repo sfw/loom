@@ -536,7 +536,7 @@ describe("ThreadsTab", () => {
     mockApp.visibleConversationEvents = [
       makeEvent(1, "user_message", { text: "tell me again" }),
       makeEvent(2, "user_message", { text: "tell me again" }),
-      makeEvent(3, "assistant_text", { text: "Based on my research, here's the easiest" }),
+      makeEvent(3, "assistant_text", { text: "Based on synthetic research, the next step" }),
       makeEvent(4, "turn_separator", { tokens: 42, tool_count: 0 }),
     ];
     mockApp.visibleConversationMessages = [
@@ -581,7 +581,7 @@ describe("ThreadsTab", () => {
         session_id: "conversation-1",
         turn_number: 4,
         role: "assistant",
-        content: "Based on my research, here's the easiest way to get a meeting with Blink49 at Banff.",
+        content: "Based on synthetic research, the next step is to contact Example Studios about Summit Festival.",
         tool_calls: [],
         tool_call_id: null,
         tool_name: null,
@@ -594,7 +594,7 @@ describe("ThreadsTab", () => {
 
     expect(screen.queryByText("tell me againtell me again")).not.toBeInTheDocument();
     expect(screen.getAllByText("tell me again")).toHaveLength(2);
-    expect(screen.getByText(/Based on my research, here's the easiest way/)).toBeInTheDocument();
+    expect(screen.getByText(/Based on synthetic research, the next step/)).toBeInTheDocument();
     expect(screen.getByText("Earlier answer")).toBeInTheDocument();
   });
 
@@ -786,7 +786,7 @@ describe("ThreadsTab", () => {
       makeEvent(1, "user_message", { text: "hello" }),
     ];
     mockApp.streamingThinking = [
-      "Let me search for blink49 and the Banff festival specifically:",
+      "Let me search for Example Studios and Summit Festival specifically:",
       "",
       "Let me try a broader search.",
     ].join("\n");
@@ -795,7 +795,7 @@ describe("ThreadsTab", () => {
     const { container } = render(<ThreadsTab />);
 
     expect(screen.getByText("Live")).toBeInTheDocument();
-    expect(screen.getByText("Let me search for blink49 and the Banff festival specifically:")).toBeInTheDocument();
+    expect(screen.getByText("Let me search for Example Studios and Summit Festival specifically:")).toBeInTheDocument();
     expect(screen.getByText("Let me try a broader search.")).toBeInTheDocument();
     expect(screen.getByText("Working through the numbers now")).toBeInTheDocument();
     expect(screen.queryByText("Thinking...")).not.toBeInTheDocument();

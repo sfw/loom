@@ -102,7 +102,7 @@ class SubtaskRunner:
     MINIMAL_TEXT_OUTPUT_CHARS = 180
     TOOL_CALL_ARGUMENT_CONTEXT_CHARS = 700
     COMPACT_TOOL_CALL_ARGUMENT_CHARS = 1_600
-    RUNNER_COMPACTION_POLICY_MODE = "off"
+    RUNNER_COMPACTION_POLICY_MODE = "hybrid"
     PRESERVE_RECENT_CRITICAL_MESSAGES = 6
     COMPACTION_PRESSURE_RATIO_SOFT = 0.86
     COMPACTION_PRESSURE_RATIO_HARD = 1.02
@@ -650,7 +650,14 @@ class SubtaskRunner:
         ).strip().lower()
         return (
             mode
-            if mode in {"legacy", "tiered", "off"}
+            if mode in {
+                "hybrid",
+                "deterministic",
+                "semantic",
+                "legacy",
+                "tiered",
+                "off",
+            }
             else self.RUNNER_COMPACTION_POLICY_MODE
         )
 
@@ -2004,6 +2011,7 @@ class SubtaskRunner:
         tools: list[dict] | None = None,
         remaining_seconds: float | None = None,
     ) -> list[dict]:
+        started_at = time.monotonic()
         mode = self._runner_compaction_mode()
         if mode == "off":
             context_budget = int(
@@ -2039,15 +2047,38 @@ class SubtaskRunner:
                     overflow_fallback_applied=False,
                 ),
                 "compaction_compactor_calls": 0,
+                "compaction_strategy": "disabled",
+                "compaction_wall_time_ms": round(
+                    (time.monotonic() - started_at) * 1000,
+                    3,
+                ),
             })
             return messages
-        if mode == "tiered":
-            return await self._compact_messages_for_model_tiered(
+        if mode in {"hybrid", "deterministic", "semantic", "tiered"}:
+            compacted = await self._compact_messages_for_model_tiered(
                 messages,
                 tools=tools,
                 remaining_seconds=remaining_seconds,
             )
-        return await self._compact_messages_for_model_legacy(messages, tools=tools)
+        else:
+            compacted = await self._compact_messages_for_model_legacy(
+                messages,
+                tools=tools,
+            )
+        diagnostics = dict(getattr(self, "_last_compaction_diagnostics", {}))
+        diagnostics.update({
+            "compaction_strategy": (
+                mode
+                if mode in {"hybrid", "deterministic"}
+                else "model_assisted"
+            ),
+            "compaction_wall_time_ms": round(
+                (time.monotonic() - started_at) * 1000,
+                3,
+            ),
+        })
+        self._set_compaction_diagnostics(diagnostics)
+        return compacted
 
     async def _compact_messages_for_model_tiered(
         self,

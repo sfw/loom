@@ -33,6 +33,7 @@ _VALID_ASSERTION_VERDICTS = {
 }
 
 _REASON_CODE_SEVERITY: dict[str, str] = {
+    "artifact_confirmation_required": "infra",
     "dev_browser_check_failed": "semantic",
     "dev_build_failed": "semantic",
     "dev_contract_failed": "semantic",

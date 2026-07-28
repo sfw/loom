@@ -4382,8 +4382,8 @@ class TestWorkspaceFirstEndpoints:
         payload = response.json()
         assert payload["context_status"]["estimated_tokens"] == 18600
         assert payload["context_status"]["pressure_state"] == "approaching"
-        assert payload["context_status"]["compaction_enabled"] is False
-        assert payload["context_status"]["compaction_policy_mode"] == "off"
+        assert payload["context_status"]["compaction_enabled"] is True
+        assert payload["context_status"]["compaction_policy_mode"] == "hybrid"
 
     @pytest.mark.asyncio
     async def test_conversation_status_prefers_live_context_status(
@@ -4448,7 +4448,7 @@ class TestWorkspaceFirstEndpoints:
         assert payload["context_status"]["estimated_tokens"] == 22800
         assert payload["context_status"]["pressure_state"] == "compacted"
         assert payload["context_status"]["compacted_message_count"] == 18
-        assert payload["context_status"]["compaction_enabled"] is False
+        assert payload["context_status"]["compaction_enabled"] is True
 
     @pytest.mark.asyncio
     async def test_conversation_events_ignore_uncovered_partial_journal_rows(
@@ -5379,9 +5379,398 @@ class TestWorkspaceFirstEndpoints:
         assert "Prior interview analysis failed" in failure["headline"]
         assert "identity-and-source-map" not in failure["headline"]
 
+    @pytest.mark.asyncio
+    async def test_run_failure_analysis_uses_newest_event_window_for_long_runs(
+        self,
+        client,
+        tmp_path,
+        database,
+        state_manager,
+        workspace_registry,
+    ):
+        workspace_path = tmp_path / "long-run-failure-analysis-ws"
+        workspace_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(
+            str(workspace_path),
+            display_name="Long Run Failure Analysis WS",
+        )
+        assert workspace is not None
+
+        task = Task(
+            id="task-long-run-failure-analysis-1",
+            goal="Research a site with alternate sources",
+            status=TaskStatus.FAILED,
+            workspace=str(workspace_path),
+            metadata={"process": "market-research"},
+            plan=Plan(subtasks=[
+                Subtask(
+                    id="scope-company",
+                    description="Scope company",
+                    status=SubtaskStatus.COMPLETED,
+                ),
+                Subtask(
+                    id="assess-risks",
+                    description="Assess market risks",
+                    status=SubtaskStatus.FAILED,
+                ),
+            ]),
+        )
+        state_manager.save(task)
+        await database.insert_task(
+            task_id=task.id,
+            goal=task.goal,
+            workspace_path=str(workspace_path),
+            status="failed",
+            metadata={"process": "market-research"},
+        )
+        await database.insert_task_run(
+            run_id="exec-long-run-failure-analysis-1",
+            task_id=task.id,
+            status="failed",
+            process_name="market-research",
+        )
+
+        rows: list[dict[str, object]] = [
+            {
+                "task_id": task.id,
+                "run_id": "exec-long-run-failure-analysis-1",
+                "correlation_id": "corr-long-run",
+                "event_id": "evt-1",
+                "sequence": 1,
+                "event_type": "tool_call_completed",
+                "data": {
+                    "subtask_id": "scope-company",
+                    "tool": "web_fetch",
+                    "success": False,
+                    "error": "HTTP 403: https://example.com/login-only",
+                },
+            },
+        ]
+        rows.extend(
+            {
+                "task_id": task.id,
+                "run_id": "exec-long-run-failure-analysis-1",
+                "correlation_id": "corr-long-run",
+                "event_id": f"evt-{sequence}",
+                "sequence": sequence,
+                "event_type": "model_invocation",
+                "data": {"subtask_id": "assess-risks", "phase": "progress"},
+            }
+            for sequence in range(2, 1003)
+        )
+        rows.extend([
+            {
+                "task_id": task.id,
+                "run_id": "exec-long-run-failure-analysis-1",
+                "correlation_id": "corr-long-run",
+                "event_id": "evt-1003",
+                "sequence": 1003,
+                "event_type": "verification_failed",
+                "data": {
+                    "subtask_id": "assess-risks",
+                    "reason_code": "tool_budget_exhausted",
+                    "outcome": "fail",
+                },
+            },
+            {
+                "task_id": task.id,
+                "run_id": "exec-long-run-failure-analysis-1",
+                "correlation_id": "corr-long-run",
+                "event_id": "evt-1004",
+                "sequence": 1004,
+                "event_type": "subtask_failed",
+                "data": {
+                    "subtask_id": "assess-risks",
+                    "reason_code": "tool_budget_exhausted",
+                    "feedback": "The risk register remained incomplete at the tool budget.",
+                },
+            },
+            {
+                "task_id": task.id,
+                "run_id": "exec-long-run-failure-analysis-1",
+                "correlation_id": "corr-long-run",
+                "event_id": "evt-1005",
+                "sequence": 1005,
+                "event_type": "task_failed",
+                "data": {
+                    "failed_subtasks": ["assess-risks"],
+                    "reason": "subtask_failure",
+                },
+            },
+        ])
+        await database.insert_events_batch(rows)
+
+        response = await client.get(f"/runs/{task.id}")
+        assert response.status_code == 200
+        detail = response.json()
+        failure = detail["failure_analysis"]
+        assert detail["events_count"] == 1000
+        assert failure["failing_subtask_id"] == "assess-risks"
+        assert failure["primary_reason_code"] == "tool_budget_exhausted"
+        assert failure["reason_family"] == "resource_budget"
+        assert "risk register remained incomplete" in failure["summary"]
+        assert "HTTP 403" not in failure["summary"]
+
+    @pytest.mark.asyncio
+    async def test_run_failure_analysis_prefers_unsent_context_failure_over_verifier_symptom(
+        self,
+        client,
+        tmp_path,
+        database,
+        state_manager,
+        workspace_registry,
+    ):
+        workspace_path = tmp_path / "run-context-unfit-failure-analysis-ws"
+        workspace_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(
+            str(workspace_path),
+            display_name="Run Context Unfit Failure Analysis WS",
+        )
+        assert workspace is not None
+
+        task = Task(
+            id="task-run-context-unfit-failure-analysis-1",
+            goal="Generate a process report",
+            status=TaskStatus.FAILED,
+            workspace=str(workspace_path),
+            metadata={"process": "custom-report"},
+            plan=Plan(subtasks=[
+                Subtask(
+                    id="assemble-report",
+                    description="Assemble report",
+                    status=SubtaskStatus.FAILED,
+                ),
+            ]),
+        )
+        state_manager.save(task)
+
+        await database.insert_task(
+            task_id=task.id,
+            goal=task.goal,
+            workspace_path=str(workspace_path),
+            status="failed",
+            metadata={"process": "custom-report"},
+        )
+        await database.insert_task_run(
+            run_id="exec-run-context-unfit-failure-analysis-1",
+            task_id=task.id,
+            status="failed",
+            process_name="custom-report",
+        )
+        await database.insert_event(
+            task_id=task.id,
+            correlation_id="corr-context-unfit-failure-analysis-1",
+            run_id="exec-run-context-unfit-failure-analysis-1",
+            event_type="model_invocation",
+            data={
+                "subtask_id": "assemble-report",
+                "phase": "done",
+                "reason_code": "infra_runner_context_unfit",
+                "failure_class": "context_unfit",
+                "provider_status": "not_sent",
+                "stream_close_reason": "not_started",
+                "invocation_attempt": 0,
+                "compaction_policy_mode": "off",
+                "compaction_terminal_state": "unfit",
+                "compaction_pressure_ratio": 1.47,
+                "request_bytes": 141539,
+            },
+            sequence=1,
+        )
+        await database.insert_event(
+            task_id=task.id,
+            correlation_id="corr-context-unfit-failure-analysis-1",
+            run_id="exec-run-context-unfit-failure-analysis-1",
+            event_type="verification_failed",
+            data={
+                "subtask_id": "assemble-report",
+                "reason_code": "hard_invariant_failed",
+                "outcome": "fail",
+            },
+            sequence=2,
+        )
+        await database.insert_event(
+            task_id=task.id,
+            correlation_id="corr-context-unfit-failure-analysis-1",
+            run_id="exec-run-context-unfit-failure-analysis-1",
+            event_type="subtask_failed",
+            data={
+                "subtask_id": "assemble-report",
+                "feedback": "Expected deliverable 'report.md' not found",
+                "reason_code": "hard_invariant_failed",
+            },
+            sequence=3,
+        )
+        await database.insert_event(
+            task_id=task.id,
+            correlation_id="corr-context-unfit-failure-analysis-1",
+            run_id="exec-run-context-unfit-failure-analysis-1",
+            event_type="telemetry_run_summary",
+            data={
+                "verification_reason_counts": {"hard_invariant_failed": 1},
+                "remediation_lifecycle_counts": {
+                    "queued": 0,
+                    "attempt": 0,
+                    "resolved": 0,
+                    "failed": 0,
+                    "expired": 0,
+                },
+            },
+            sequence=4,
+        )
+        await database.insert_event(
+            task_id=task.id,
+            correlation_id="corr-context-unfit-failure-analysis-1",
+            run_id="exec-run-context-unfit-failure-analysis-1",
+            event_type="task_failed",
+            data={
+                "failed_subtasks": ["assemble-report"],
+                "reason": "subtask_failure",
+            },
+            sequence=5,
+        )
+
+        response = await client.get(f"/runs/{task.id}")
+        assert response.status_code == 200
+        failure = response.json()["failure_analysis"]
+        assert failure["failing_subtask_id"] == "assemble-report"
+        assert failure["failing_subtask_label"] == "Assemble report"
+        assert failure["primary_reason_code"] == "infra_runner_context_unfit"
+        assert failure["reason_family"] == "runtime_infra"
+        assert "not sent" in failure["summary"]
+        assert "missing required outputs are downstream symptoms" in (
+            failure["remediation"]["why_not_remedied"]
+        )
+        assert "request_bytes=141,539" in failure["technical_detail"]
+        assert "Runner reason: infra_runner_context_unfit" in failure["evidence"]
+
+    @pytest.mark.asyncio
+    async def test_run_failure_analysis_prefers_message_contract_violation_over_stale_failure(
+        self,
+        client,
+        tmp_path,
+        database,
+        state_manager,
+        workspace_registry,
+    ):
+        workspace_path = tmp_path / "run-message-contract-failure-analysis-ws"
+        workspace_path.mkdir()
+        workspace = await workspace_registry.ensure_workspace(
+            str(workspace_path),
+            display_name="Run Message Contract Failure Analysis WS",
+        )
+        assert workspace is not None
+
+        task = Task(
+            id="task-run-message-contract-failure-analysis-1",
+            goal="Build interview dossier",
+            status=TaskStatus.FAILED,
+            workspace=str(workspace_path),
+            metadata={"process": "interview-dossier"},
+            plan=Plan(subtasks=[
+                Subtask(
+                    id="intake-and-angle",
+                    description="Intake and angle",
+                    status=SubtaskStatus.FAILED,
+                ),
+                Subtask(
+                    id="current-context-and-news",
+                    description="Current context and news",
+                    status=SubtaskStatus.FAILED,
+                ),
+            ]),
+        )
+        state_manager.save(task)
+
+        await database.insert_task(
+            task_id=task.id,
+            goal=task.goal,
+            workspace_path=str(workspace_path),
+            status="failed",
+            metadata={"process": "interview-dossier"},
+        )
+        await database.insert_task_run(
+            run_id="exec-run-message-contract-failure-analysis-1",
+            task_id=task.id,
+            status="failed",
+            process_name="interview-dossier",
+        )
+        await database.insert_event(
+            task_id=task.id,
+            correlation_id="corr-message-contract-failure-analysis-1",
+            run_id="exec-run-message-contract-failure-analysis-1",
+            event_type="subtask_failed",
+            data={
+                "subtask_id": "intake-and-angle",
+                "feedback": "Earlier attempt failed to produce interview-brief.md",
+                "reason_code": "hard_invariant_failed",
+            },
+            sequence=1,
+        )
+        await database.insert_event(
+            task_id=task.id,
+            correlation_id="corr-message-contract-failure-analysis-1",
+            run_id="exec-run-message-contract-failure-analysis-1",
+            event_type="subtask_completed",
+            data={"subtask_id": "intake-and-angle"},
+            sequence=2,
+        )
+        await database.insert_event(
+            task_id=task.id,
+            correlation_id="corr-message-contract-failure-analysis-1",
+            run_id="exec-run-message-contract-failure-analysis-1",
+            event_type="model_invocation",
+            data={
+                "subtask_id": "current-context-and-news",
+                "phase": "done",
+                "reason_code": "infra_message_contract_violation",
+                "failure_class": "message_contract_violation",
+                "provider_status": "not_sent",
+                "stream_close_reason": "not_started",
+                "message_contract_violation": "tool_call_id_not_found",
+                "message_index": 42,
+                "tool_call_id": "call-orphan",
+                "invocation_attempt": 1,
+                "retry_count": 0,
+            },
+            sequence=3,
+        )
+        await database.insert_event(
+            task_id=task.id,
+            correlation_id="corr-message-contract-failure-analysis-1",
+            run_id="exec-run-message-contract-failure-analysis-1",
+            event_type="task_failed",
+            data={
+                "failed_subtasks": [
+                    "intake-and-angle",
+                    "current-context-and-news",
+                ],
+                "reason": "subtask_failure",
+            },
+            sequence=4,
+        )
+
+        response = await client.get(f"/runs/{task.id}")
+        assert response.status_code == 200
+        failure = response.json()["failure_analysis"]
+        assert failure["failing_subtask_id"] == "current-context-and-news"
+        assert failure["failing_subtask_label"] == "Current context and news"
+        assert failure["primary_reason_code"] == "infra_message_contract_violation"
+        assert failure["reason_family"] == "runtime_infra"
+        assert "tool-call transcript violated" in failure["summary"]
+        assert "message_index=42" in failure["technical_detail"]
+        assert "tool_call_id=call-orphan" in failure["technical_detail"]
+        assert "Runner reason: infra_message_contract_violation" in failure["evidence"]
+        assert "Loom message reconstruction bug" in (
+            failure["remediation"]["why_not_remedied"]
+        )
+
     def test_reason_family_maps_method_failures_to_unconfirmed_data(self):
         from loom.api.routes import _reason_family
 
+        assert _reason_family("artifact_confirmation_required", "") == (
+            "unconfirmed_data"
+        )
         assert _reason_family("tool_upstream_unavailable", "") == "unconfirmed_data"
 
     @pytest.mark.asyncio

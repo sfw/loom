@@ -214,7 +214,63 @@ Pipeline behavior:
 
 ### 3.1.5 Failure handling, retries, remediation, replan
 
-`_handle_failure` decides strategy based on structured verification output and error text:
+`CorrectionController` is the durable control plane above retry, remediation, iteration,
+and replan. `_handle_failure` and iteration gates submit normalized blocker observations
+to it before selecting an execution mechanism.
+
+Correction lifecycle:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Detected
+    Detected --> Classified
+    Classified --> Planned
+    Planned --> Retrying
+    Planned --> Replanning
+    Planned --> HumanRequired
+    Planned --> Terminal
+    Retrying --> Planned: blocker remains
+    Retrying --> Resolved: verification passes
+    Replanning --> Resolved: replacement path passes
+    Replanning --> Planned: blocker remains
+```
+
+The controller:
+
+- Separates `blocking` from repairability (`automatic`, `conditional`,
+  `human_required`, `terminal`).
+- Uses stable blocker fingerprints so recovery survives process restarts.
+- Selects deterministic handlers before asking a model for a free-form plan.
+- Compares structured progress vectors (blockers, failed checks, missing targets,
+  contradicted/supported claims, deliverables, confidence), not error-message wording.
+- Persists cycles, attempts, and idempotent planned actions.
+- Never auto-heals safety/path violations, unexplained artifact-seal changes,
+  forbidden canonical writes, destructive approval requirements, or authentication.
+
+The current handler adapters are:
+
+- verification-only retry
+- targeted execution retry
+- context/artifact refresh
+- alternate source or tool method
+- deterministic placeholder prepass
+- confirm-or-prune remediation
+- structural replan
+- human review / terminal stop
+
+For runner tool-budget exhaustion, equivalent verifier reason codes normalize to one
+`checkpoint_continue` cycle. The continuation reuses existing deliverables and
+validated evidence, repairs only named gaps, and receives at most one bounded retry
+beyond the ordinary subtask retry ceiling when the structured progress vector improved.
+This prevents a nearly complete artifact from being discarded because earlier retries
+fixed different blockers.
+
+Within one runner pass, a URL that returns a terminal method-level response (401, 403,
+404, 410, anti-bot denial, or login requirement) is marked exhausted for `web_fetch`.
+Further attempts against the same URL are short-circuited with an instruction to use
+search or another public source; query/extraction hints do not bypass this guard.
+
+Within that control plane, `_handle_failure` maps decisions to existing retry strategies:
 - `generic`
 - `rate_limit`
 - `verifier_parse`
@@ -235,6 +291,10 @@ Remediation queue:
 - Per-item attempt counts, bounded exponential backoff, TTL expiry.
 - Finalization step forces unresolved blocking remediations to terminal failed state.
 - Optional SQLite dual-write/read hydration (`execution.enable_sqlite_remediation_queue`) via `remediation_items` and `remediation_attempts`.
+
+Correction persistence is always durable when the task database is available. The
+legacy remediation queue flag only controls the older queue projection; it does not
+disable `correction_cycles`, `correction_attempts`, or `correction_actions`.
 
 ### 3.1.6 Finalization
 
@@ -326,7 +386,8 @@ Top-level domains:
 Notable characteristics:
 - Strong default values.
 - Integer/float/bool parsing with clamping and normalization.
-- `runner_compaction_policy_mode` constrained to `legacy|tiered|off`.
+- `runner_compaction_policy_mode` constrained to
+  `hybrid|deterministic|semantic|legacy|tiered|off`.
 - Verification scan suffix list normalization.
 - Retry-delay range normalization (max >= base).
 - Hardening flags for budgeting, planner degradation policy, completion protocol, remediation persistence, durability, idempotency, and SLO snapshots.
@@ -569,6 +630,9 @@ Templates in `prompts/templates/*.yaml` define text protocol and output contract
 - `subtask_attempts`
 - `remediation_items`
 - `remediation_attempts`
+- `correction_cycles`
+- `correction_attempts`
+- `correction_actions`
 - `tool_mutation_ledger`
 
 Schema evolution is managed by a versioned migration subsystem:
@@ -692,6 +756,11 @@ Outcomes support nuanced semantics:
 
 ## 5.3 Retry/remediation model
 
+- `CorrectionCycle`: stable blocker identity, state, repairability, selected handler,
+  baseline/latest progress vectors, no-progress count, and terminal reason.
+- `CorrectionAttempt`: immutable plan and before/after progress snapshots for one
+  observation/repair pass.
+- `CorrectionAction`: ordered typed action with a unique idempotency key.
 - `AttemptRecord`: attempt number, tier, feedback/error, strategy, missing targets, error category.
 - Remediation queue item in task metadata:
   - id, subtask_id, strategy, reason_code
@@ -712,6 +781,8 @@ Outcomes support nuanced semantics:
 - `task_runs` persists queued/running/terminal run lifecycle with lease/heartbeat fields for crash recovery.
 - `subtask_attempts` stores attempt lineage by task/subtask/run.
 - `remediation_items` and `remediation_attempts` persist remediation lifecycle and retries.
+- `correction_cycles`, `correction_attempts`, and `correction_actions` provide the
+  authoritative operational projection for cross-mechanism self-correction.
 - `tool_mutation_ledger` records mutating tool execution signatures and cached results for dedupe.
 - `cowork_chat_events` persists UI transcript replay events (`seq` ordered) for resumable cowork chat and history paging.
 - `SessionState.ui_state` persists TUI process-run tab state so resumed sessions restore run panes and status context.
@@ -1168,9 +1239,17 @@ Targeted retry context can include:
 ## 8.1 Policy modes
 
 `runner_compaction_policy_mode`:
-- `off`: no semantic compaction.
-- `legacy`: eager multi-pass compaction.
-- `tiered`: pressure-driven staged compaction (recommended default).
+- `hybrid`: deterministic structural reduction followed, only near context
+  pressure, by one bounded and cached semantic checkpoint. Exact URLs, paths,
+  IDs, dates, and numbers are validated and repaired before source messages are
+  replaced (default).
+- `deterministic`: pressure-driven, structure-preserving compaction with no
+  additional model calls. Used for emergency fallback.
+- `semantic`: pressure-driven model-assisted rewriting (explicit opt-in).
+- `off`: no proactive compaction; emergency deterministic rescue can still run
+  before an otherwise invalid provider request.
+- `legacy`: eager multi-pass semantic compatibility mode.
+- `tiered`: previous pressure-driven semantic compatibility mode.
 
 ## 8.2 Pressure model
 
@@ -1188,11 +1267,14 @@ Pressure tiers:
 
 1. Compact assistant tool-call arguments.
 2. Compact tool outputs.
-3. Compact historical narrative text.
-4. Merge old context into synthetic compact summary (critical only).
+3. Compact historical narrative text. Deterministic mode retains exact
+   head/salient/tail excerpts; semantic modes may summarize.
+4. Merge old context into a bounded historical context block (critical only),
+   while keeping assistant/tool protocol exchanges atomic.
 
 Guards and brakes:
-- Timeout guard can skip expensive stages near deadline.
+- Timeout guard can skip model-assisted stages near deadline; deterministic
+  compaction remains available because it is local and bounded.
 - No-gain tracking avoids repeated ineffective compactions.
 - Overshoot cache avoids retrying labels that exceed char budgets.
 - Churn warning event/logging when compactor calls exceed threshold.
