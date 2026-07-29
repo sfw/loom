@@ -29,6 +29,7 @@ from loom.engine.verification import VerificationGates, VerificationResult
 from loom.events.bus import EventBus
 from loom.events.types import (
     SUBTASK_BLOCKED,
+    SUBTASK_COMPLETED,
     SUBTASK_OUTCOME_STALE,
     SUBTASK_OUTPUT_CONFLICT_DEFERRED,
     SUBTASK_OUTPUT_CONFLICT_STARVATION_WARNING,
@@ -487,6 +488,11 @@ class Orchestrator:
                     first_id = str(first.get("subtask_id", "") or "").strip()
                     conflicting_paths = list(first.get("conflicting_paths", []))
                     conflicting_with = list(first.get("conflicting_with", []))
+                    task.metadata["catastrophic_failure"] = {
+                        "blocker_classes": ["integrity"],
+                        "reason_codes": ["canonical_output_writer_conflict"],
+                        "subtask_id": first_id,
+                    }
                     raise RuntimeError(
                         "Output conflict policy fail_fast blocked dispatch for "
                         f"subtask '{first_id}' due to overlapping canonical paths "
@@ -643,18 +649,54 @@ class Orchestrator:
             return result_task
 
         except Exception as e:
-            logger.exception("Fatal error in task %s", task.id)
-            task.status = TaskStatus.FAILED
+            catastrophic = bool(task.metadata.get("catastrophic_failure"))
+            logger.exception(
+                "%s orchestration error in task %s",
+                "Catastrophic" if catastrophic else "Recoverable",
+                task.id,
+            )
+            if catastrophic:
+                task.status = TaskStatus.FAILED
+                task.metadata["completion_grade"] = "catastrophic_failure"
+                task.add_error("orchestrator", f"{type(e).__name__}: {e}")
+                try:
+                    await self._save_task_state(task)
+                except Exception as save_err:
+                    logger.error("Failed to save after catastrophic error: %s", save_err)
+                self._emit(TASK_FAILED, task.id, {
+                    "error": str(e),
+                    "error_type": type(e).__name__,
+                    "reason": "catastrophic_integrity_error",
+                    "outcome": "failed",
+                })
+                self._emit_telemetry_run_summary(task)
+                self._export_evidence_ledger_csv(task)
+                await self._learn_from_task(task)
+                return task
+
+            recovery_attempts = int(task.metadata.get("orchestrator_recovery_attempts", 0)) + 1
+            task.metadata["orchestrator_recovery_attempts"] = recovery_attempts
+            recovery_limit = max(
+                1,
+                int(getattr(self._config.execution, "max_correction_retries", 3)),
+            )
+            can_retry = recovery_attempts <= recovery_limit
+            task.status = TaskStatus.PENDING if can_retry else TaskStatus.PAUSED
+            task.metadata["automatic_recovery_requested"] = can_retry
+            task.metadata["recovery_required"] = True
             task.add_error("orchestrator", f"{type(e).__name__}: {e}")
             try:
                 await self._save_task_state(task)
             except Exception as save_err:
                 logger.error("Failed to save after fatal: %s", save_err)
-            self._emit(TASK_FAILED, task.id, {
+            self._emit(TASK_PAUSED, task.id, {
                 "error": str(e),
                 "error_type": type(e).__name__,
-                "reason": "uncaught_exception",
-                "outcome": "failed",
+                "reason": "orchestrator_recovery_checkpoint",
+                "outcome": "retrying" if can_retry else "paused",
+                "automatic_recovery_requested": can_retry,
+                "recovery_attempt": recovery_attempts,
+                "recovery_limit": recovery_limit,
             })
             self._emit_telemetry_run_summary(task)
             self._export_evidence_ledger_csv(task)
@@ -1146,7 +1188,44 @@ class Orchestrator:
         subtask: Subtask,
         verification: VerificationResult,
     ) -> None:
-        """Abort remaining work when a critical-path subtask exhausts retries."""
+        """Resolve a critical-path retry exhaustion through the outcome arbiter.
+
+        Only a classified catastrophic blocker may terminate the run. Ordinary
+        source, tool, schema, and budget exhaustion preserves the best checkpoint
+        as partial output so dependent work can continue with explicit caveats.
+        """
+        catastrophic = bool(task.metadata.get("catastrophic_failure"))
+        if not catastrophic:
+            async with self._state_lock:
+                subtask.status = SubtaskStatus.PARTIAL
+                subtask.active_issue = verification.feedback or subtask.active_issue
+                if not subtask.summary:
+                    subtask.summary = (
+                        "Recovery budget exhausted; best available checkpoint "
+                        "preserved for downstream synthesis."
+                    )
+                task.update_subtask(
+                    subtask.id,
+                    status=SubtaskStatus.PARTIAL,
+                    summary=subtask.summary,
+                    active_issue=subtask.active_issue,
+                )
+                task.metadata.setdefault("recoverable_gaps", []).append({
+                    "subtask_id": subtask.id,
+                    "reason_code": verification.reason_code,
+                    "feedback": verification.feedback,
+                })
+                task.status = TaskStatus.EXECUTING
+                await self._save_task_state(task)
+            self._emit(SUBTASK_COMPLETED, task.id, {
+                "subtask_id": subtask.id,
+                "status": "partial",
+                "outcome": "partial_verified",
+                "reason_code": verification.reason_code,
+                "feedback": verification.feedback,
+            })
+            return
+
         block_summary = (
             f"Skipped: blocked by critical-path failure in {subtask.id}"
         )

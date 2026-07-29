@@ -3,6 +3,7 @@
 from loom.engine.correction.controller import CorrectionController
 from loom.engine.correction.types import (
     Blocker,
+    BlockerClass,
     CorrectionDecision,
     CorrectionHandler,
     CorrectionState,
@@ -12,6 +13,7 @@ from loom.engine.correction.types import (
 
 __all__ = [
     "Blocker",
+    "BlockerClass",
     "CorrectionController",
     "CorrectionDecision",
     "CorrectionHandler",

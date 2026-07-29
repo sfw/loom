@@ -9,7 +9,7 @@ import pytest
 
 import loom.engine.runner as runner_module
 from loom.auth.runtime import AuthResolutionError
-from loom.config import Config, ExecutionConfig
+from loom.config import Config, ExecutionConfig, LimitsConfig, RunnerLimitsConfig
 from loom.engine.runner import SubtaskResultStatus, SubtaskRunner
 from loom.engine.verification import VerificationResult
 from loom.models.base import ModelResponse, StreamChunk, TokenUsage, ToolCall
@@ -550,6 +550,77 @@ async def test_run_does_not_refetch_access_denied_url_with_different_query_hint(
     assert len(result.tool_calls) == 2
     assert "SOURCE METHOD EXHAUSTED" in result.tool_calls[1].result.error
     assert "Use web_search" in result.tool_calls[1].result.error
+
+
+@pytest.mark.asyncio
+async def test_tool_budget_exhaustion_returns_canonical_checkpoint_signal(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        runner_module,
+        "build_run_auth_context",
+        lambda **kwargs: {},
+    )
+    model_complete = AsyncMock(side_effect=[
+        ModelResponse(
+            text="",
+            tool_calls=[
+                ToolCall(
+                    id="call-1",
+                    name="web_search",
+                    arguments={"query": "synthetic market evidence"},
+                ),
+            ],
+            usage=TokenUsage(total_tokens=10),
+        ),
+        ModelResponse(
+            text="",
+            tool_calls=[
+                ToolCall(
+                    id="call-2",
+                    name="web_search",
+                    arguments={"query": "synthetic market geography"},
+                ),
+            ],
+            usage=TokenUsage(total_tokens=10),
+        ),
+    ])
+    runner = _make_runner(
+        memory_query=AsyncMock(return_value=[]),
+        model_complete=model_complete,
+        config=Config(
+            execution=ExecutionConfig(
+                enable_streaming=False,
+                runner_checkpoint_reserve_iterations=1,
+            ),
+            limits=LimitsConfig(runner=RunnerLimitsConfig(max_tool_iterations=2)),
+        ),
+    )
+    runner._tools.all_schemas = MagicMock(return_value=[
+        {
+            "name": "web_search",
+            "parameters": {"type": "object", "required": ["query"]},
+        },
+    ])
+    search_tool = MagicMock()
+    search_tool.is_mutating = False
+    search_tool.mutation_target_arg_keys = ()
+    runner._tools.get = MagicMock(return_value=search_tool)
+    runner._tools.execute = AsyncMock(return_value=ToolResult.ok("synthetic result"))
+
+    task, subtask = _make_task(tmp_path)
+    result, verification = await runner.run(task, subtask)
+
+    assert result.status == SubtaskResultStatus.FAILED
+    assert verification.reason_code == "runner_tool_budget_exhausted"
+    assert verification.metadata["checkpoint_required"] is True
+    second_call = model_complete.await_args_list[1]
+    second_messages = second_call.kwargs.get("messages", second_call.args[0])
+    assert any(
+        "EXECUTION BUDGET CHECKPOINT" in str(message.get("content", ""))
+        for message in second_messages
+    )
 
 
 @pytest.mark.asyncio

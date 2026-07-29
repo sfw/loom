@@ -9,7 +9,7 @@ from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 
-from loom.engine.correction import CorrectionHandler, CorrectionState
+from loom.engine.correction import CorrectionHandler, CorrectionState, Repairability
 from loom.engine.iteration_gates import IterationEvaluation
 from loom.engine.runner import SubtaskResult, SubtaskResultStatus, ToolCallRecord
 from loom.engine.verification import Check, VerificationResult
@@ -810,6 +810,13 @@ async def handle_failure(
                 for blocker in correction_decision.blockers
                 for target in blocker.targets
             })
+        elif correction_decision.handler == CorrectionHandler.OUTPUT_REROUTE:
+            strategy = RetryStrategy.GENERIC
+            missing_targets = sorted({
+                target
+                for blocker in correction_decision.blockers
+                for target in blocker.targets
+            })
         elif correction_decision.handler in {
             CorrectionHandler.SOURCE_FALLBACK,
             CorrectionHandler.CONFIRM_OR_PRUNE,
@@ -824,7 +831,7 @@ async def handle_failure(
                 for target in blocker.targets
             })
         elif correction_decision.handler == CorrectionHandler.CHECKPOINT_CONTINUE:
-            strategy = RetryStrategy.GENERIC
+            strategy = RetryStrategy.CHECKPOINT_CONTINUE
         verification_metadata["correction"] = {
             "cycle_id": correction_decision.cycle_id,
             "state": correction_decision.state.value,
@@ -840,6 +847,7 @@ async def handle_failure(
             CorrectionHandler.CONTEXT_REFRESH,
             CorrectionHandler.CHECKPOINT_CONTINUE,
             CorrectionHandler.PLACEHOLDER_PREPASS,
+            CorrectionHandler.OUTPUT_REROUTE,
             CorrectionHandler.RETRY_VERIFICATION,
             CorrectionHandler.SCHEMA_REPAIR,
             CorrectionHandler.SOURCE_FALLBACK,
@@ -1054,6 +1062,20 @@ async def handle_failure(
             verification.metadata = metadata
 
     if correction_decision is not None:
+        if correction_decision.repairability == Repairability.TERMINAL:
+            metadata = task.metadata if isinstance(task.metadata, dict) else {}
+            metadata["catastrophic_failure"] = {
+                "subtask_id": subtask.id,
+                "cycle_id": correction_decision.cycle_id,
+                "reason_codes": sorted({
+                    blocker.code for blocker in correction_decision.blockers
+                }),
+                "blocker_classes": sorted({
+                    blocker.blocker_class.value
+                    for blocker in correction_decision.blockers
+                }),
+            }
+            task.metadata = metadata
         no_progress_exhausted = (
             correction_decision.stop_for_no_progress
             or correction_decision.state
@@ -1099,19 +1121,35 @@ async def handle_failure(
         )
 
     progress_extension_limit = int(subtask.max_retries)
+    correction_retry_reserve = max(
+        0,
+        int(
+            getattr(
+                orchestrator._config.execution,
+                "max_correction_retries",
+                3,
+            )
+            or 0
+        ),
+    )
     if (
         correction_decision is not None
+        and correction_decision.repairability
+        in {Repairability.AUTOMATIC, Repairability.CONDITIONAL}
         and correction_decision.handler
         in {
             CorrectionHandler.CHECKPOINT_CONTINUE,
+            CorrectionHandler.OUTPUT_REROUTE,
+            CorrectionHandler.PLACEHOLDER_PREPASS,
+            CorrectionHandler.RETRY_VERIFICATION,
             CorrectionHandler.SCHEMA_REPAIR,
+            CorrectionHandler.SOURCE_FALLBACK,
         }
-        and correction_decision.progress_made
     ):
-        # One bounded continuation is safer than discarding a nearly complete
-        # checkpoint or a mechanically repairable structured output merely
-        # because earlier retries fixed different blockers.
-        progress_extension_limit += 1
+        # Correction is an independently budgeted recovery lane. Earlier broad
+        # execution retries must not consume the attempts reserved for precise,
+        # verifier-targeted repair actions.
+        progress_extension_limit += correction_retry_reserve
     if (
         not no_progress_exhausted
         and not runner_cap_exhausted

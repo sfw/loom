@@ -285,7 +285,7 @@ def test_engine_binds_delegate_task_for_api_cowork(engine):
 
 class TestInterruptedRunReconciliation:
     @pytest.mark.asyncio
-    async def test_marks_non_durable_interrupted_runs_failed(
+    async def test_preserves_non_durable_interrupted_runs_as_paused(
         self,
         event_bus,
         database,
@@ -345,14 +345,15 @@ class TestInterruptedRunReconciliation:
         assert reconciled == 1
         updated_row = await database.get_task(task.id)
         assert updated_row is not None
-        assert updated_row["status"] == TaskStatus.FAILED.value
+        assert updated_row["status"] == TaskStatus.PAUSED.value
         updated_task = state_manager.load(task.id)
-        assert updated_task.status == TaskStatus.FAILED
+        assert updated_task.status == TaskStatus.PAUSED
+        assert updated_task.metadata["recovery_required"] is True
         assert updated_task.errors_encountered
-        assert "marked failed" in updated_task.errors_encountered[-1].error
+        assert "checkpoint was preserved" in updated_task.errors_encountered[-1].error
 
     @pytest.mark.asyncio
-    async def test_marks_existing_task_run_failed_when_reconciling(
+    async def test_marks_existing_task_run_paused_when_reconciling(
         self,
         event_bus,
         database,
@@ -418,7 +419,7 @@ class TestInterruptedRunReconciliation:
         assert reconciled == 1
         task_run = await database.get_task_run("exec-run-2")
         assert task_run is not None
-        assert task_run["status"] == "failed"
+        assert task_run["status"] == "paused"
 
     @pytest.mark.asyncio
     async def test_skips_reconciliation_when_durable_runner_enabled(

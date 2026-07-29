@@ -4545,9 +4545,18 @@ async def _execute_in_background(engine: Engine, task, process_def=None) -> None
         except Exception:
             _bg_logger.warning("Failed to sync task %s status to DB", result.id)
     except Exception as e:
-        _bg_logger.exception("Task %s failed with uncaught exception: %s", task.id, e)
+        _bg_logger.exception("Task %s paused after uncaught exception: %s", task.id, e)
         try:
-            task.status = TaskStatus.FAILED
+            task.status = TaskStatus.PAUSED
+            if not isinstance(getattr(task, "metadata", None), dict):
+                task.metadata = {}
+            task.metadata["recovery_required"] = True
+            task.metadata["automatic_recovery_requested"] = False
+            task.add_error(
+                "system",
+                f"{type(e).__name__}: {e}",
+                resolution="Resume the preserved checkpoint.",
+            )
             await _persist_task_snapshot(engine, task)
         except Exception:
             _bg_logger.exception("Failed to save error state for task %s", task.id)
@@ -8954,6 +8963,11 @@ async def get_run(request: Request, run_id: str):
                     "is_critical_path": s.is_critical_path,
                     "is_synthesis": s.is_synthesis,
                 })
+        task_metadata = (
+            task_obj.metadata
+            if task_obj is not None and isinstance(task_obj.metadata, dict)
+            else _json_object(task_row.get("metadata"))
+        )
 
         return {
             **summary.model_dump(),
@@ -8962,6 +8976,10 @@ async def get_run(request: Request, run_id: str):
             "events_count": len(event_rows),
             "workspace": workspace or {},
             "plan_subtasks": plan_data,
+            "completion_grade": str(
+                task_metadata.get("completion_grade", "") or "",
+            ),
+            "degraded_completion": task_metadata.get("degraded_completion", {}),
         }
 
 

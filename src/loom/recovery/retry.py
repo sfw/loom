@@ -22,6 +22,7 @@ from loom.recovery.errors import ErrorCategory, categorize_error
 
 
 class RetryStrategy(StrEnum):
+    CHECKPOINT_CONTINUE = "checkpoint_continue"
     GENERIC = "generic"
     RATE_LIMIT = "rate_limit"
     SCHEMA_REPAIR = "schema_repair"
@@ -138,7 +139,15 @@ class RetryManager:
             )
 
         strategy = attempts[-1].retry_strategy if attempts else RetryStrategy.GENERIC
-        if strategy == RetryStrategy.SCHEMA_REPAIR:
+        if strategy == RetryStrategy.CHECKPOINT_CONTINUE:
+            lines.append(
+                "\nCHECKPOINT CONTINUATION:\n"
+                "- Reuse existing artifacts, evidence, and completed analysis.\n"
+                "- Read only the files needed to recover exact remaining work.\n"
+                "- Do not repeat broad discovery or revisit accepted findings.\n"
+                "- Complete the smallest remaining deliverable gap, then stop."
+            )
+        elif strategy == RetryStrategy.SCHEMA_REPAIR:
             lines.append(
                 "\nTARGETED SCHEMA REPAIR:\n"
                 "- Inspect the named existing files and malformed rows.\n"

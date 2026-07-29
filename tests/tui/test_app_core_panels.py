@@ -390,7 +390,7 @@ class TestProcessRunPane:
         run = ProcessRunState(
             run_id="abc123",
             process_name="market-research",
-            goal="Analyze EPCOR",
+            goal="Analyze Example Utility",
             run_workspace=Path("/tmp"),
             process_defn=None,
             pane_id="tab-run-abc123",
@@ -514,7 +514,7 @@ class TestProcessRunPane:
         run = ProcessRunState(
             run_id="abc777",
             process_name="market-research",
-            goal="Analyze EPCOR",
+            goal="Analyze Example Utility",
             run_workspace=Path("/tmp"),
             process_defn=None,
             pane_id="tab-run-abc777",
@@ -541,7 +541,7 @@ class TestProcessRunPane:
         run = ProcessRunState(
             run_id="abc125",
             process_name="market-research",
-            goal="Analyze EPCOR",
+            goal="Analyze Example Utility",
             run_workspace=Path("/tmp"),
             process_defn=None,
             pane_id="tab-run-abc125",

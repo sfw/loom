@@ -801,6 +801,7 @@ async def run_subtask(
         )
         last_model_failure_metadata: dict[str, Any] = {}
         last_model_failure_reason_code = ""
+        checkpoint_instruction_sent = False
 
         for iteration in range(iteration_budget):
             if not await runner._wait_for_task_control_window(task):
@@ -814,6 +815,38 @@ async def run_subtask(
                     f"({runner._max_subtask_wall_clock_seconds}s) before completion."
                 )
                 break
+            remaining_iterations = iteration_budget - iteration
+            checkpoint_reserve = min(
+                max(
+                    1,
+                    int(
+                        getattr(
+                            runner,
+                            "_runner_checkpoint_reserve_iterations",
+                            2,
+                        )
+                        or 2
+                    ),
+                ),
+                iteration_budget,
+            )
+            if (
+                remaining_iterations <= checkpoint_reserve
+                and not checkpoint_instruction_sent
+                and not completion_only_after_deliverables
+            ):
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "EXECUTION BUDGET CHECKPOINT: only "
+                        f"{remaining_iterations} model/tool turn(s) remain in this pass. "
+                        "Stop broad exploration. Reuse current evidence and artifacts. "
+                        "Either complete the smallest remaining deliverable work now, or "
+                        "return a concise partial completion contract that names exact "
+                        "remaining targets so Loom can continue from this checkpoint."
+                    ),
+                })
+                checkpoint_instruction_sent = True
             if completion_only_after_deliverables and not completion_only_instruction_sent:
                 session.messages.append({
                     "role": "user",
@@ -2046,6 +2079,33 @@ async def run_subtask(
                     else ""
                 ),
                 metadata=metadata,
+            )
+            runner._spawn_memory_extraction(task.id, subtask.id, result)
+            return result, verification
+
+        if session.budget_exhaustion_note:
+            result.status = SubtaskResultStatus.FAILED
+            verification = VerificationResult(
+                tier=1,
+                passed=False,
+                confidence=0.0,
+                checks=[Check(
+                    name="runner_budget_checkpoint",
+                    passed=False,
+                    detail=session.budget_exhaustion_note,
+                )],
+                feedback=(
+                    f"{session.budget_exhaustion_note} Preserve existing artifacts and "
+                    "continue only the exact unfinished work from this checkpoint."
+                ),
+                outcome="fail",
+                reason_code="runner_tool_budget_exhausted",
+                severity_class="infra",
+                metadata={
+                    "checkpoint_required": True,
+                    "iteration_budget": iteration_budget,
+                    "tool_call_count": len(tool_calls_record),
+                },
             )
             runner._spawn_memory_extraction(task.id, subtask.id, result)
             return result, verification

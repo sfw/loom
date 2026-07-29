@@ -131,6 +131,84 @@ class TestHistoricalFailureReplay:
             decision.actions[0].arguments["guardrails"]
         )
 
+    async def test_open_ended_budget_label_routes_to_checkpoint_continuation(
+        self,
+        correction_runtime,
+    ):
+        _database, _memory, controller, _events = correction_runtime
+        verification = VerificationResult(
+            tier=1,
+            passed=False,
+            outcome="fail",
+            reason_code="budget_exhausted_incomplete",
+            severity_class="infra",
+            feedback="Tool iteration limit reached while preserving draft output.",
+        )
+
+        decision = await controller.record_failure(
+            task_id="task-1",
+            run_id="run-1",
+            subtask_id="collect-evidence",
+            result=_result(),
+            verification=verification,
+        )
+
+        assert decision.repairability == Repairability.CONDITIONAL
+        assert decision.handler == CorrectionHandler.CHECKPOINT_CONTINUE
+        assert decision.actions[0].action_type == "continue_from_partial_checkpoint"
+
+    async def test_output_policy_failure_routes_to_allowed_path_repair(
+        self,
+        correction_runtime,
+    ):
+        _database, _memory, controller, _events = correction_runtime
+        verification = VerificationResult(
+            tier=1,
+            passed=False,
+            outcome="fail",
+            reason_code="forbidden_canonical_write",
+            severity_class="hard_invariant",
+            feedback="Output must be written through the declared staging path.",
+            metadata={"missing_targets": ["deliverables/summary.md"]},
+        )
+
+        decision = await controller.record_failure(
+            task_id="task-1",
+            run_id="run-1",
+            subtask_id="publish-summary",
+            result=_result(),
+            verification=verification,
+        )
+
+        assert decision.repairability == Repairability.AUTOMATIC
+        assert decision.handler == CorrectionHandler.OUTPUT_REROUTE
+        assert decision.actions[0].action_type == "reroute_output_to_allowed_path"
+
+    async def test_verifier_specific_missing_field_routes_to_artifact_repair(
+        self,
+        correction_runtime,
+    ):
+        _database, _memory, controller, _events = correction_runtime
+        verification = VerificationResult(
+            tier=1,
+            passed=False,
+            outcome="fail",
+            reason_code="missing_required_register_entry",
+            severity_class="semantic",
+            feedback="One required output field is absent.",
+        )
+
+        decision = await controller.record_failure(
+            task_id="task-1",
+            run_id="run-1",
+            subtask_id="build-register",
+            result=_result(),
+            verification=verification,
+        )
+
+        assert decision.repairability == Repairability.AUTOMATIC
+        assert decision.handler == CorrectionHandler.PLACEHOLDER_PREPASS
+
     async def test_integrity_failure_is_not_auto_healed(self, correction_runtime):
         _database, _memory, controller, events = correction_runtime
         verification = VerificationResult(
@@ -154,6 +232,28 @@ class TestHistoricalFailureReplay:
         assert decision.handler == CorrectionHandler.NONE
         assert decision.state == CorrectionState.TERMINAL
         assert any(event_type == "correction_terminal" for event_type, _, _ in events)
+
+    async def test_workspace_escape_remains_terminal(self, correction_runtime):
+        _database, _memory, controller, _events = correction_runtime
+        verification = VerificationResult(
+            tier=1,
+            passed=False,
+            outcome="fail",
+            reason_code="path_policy_violation",
+            severity_class="hard_invariant",
+            feedback="Output attempted a path traversal outside workspace.",
+        )
+
+        decision = await controller.record_failure(
+            task_id="task-1",
+            run_id="run-1",
+            subtask_id="publish",
+            result=_result(),
+            verification=verification,
+        )
+
+        assert decision.repairability == Repairability.TERMINAL
+        assert decision.handler == CorrectionHandler.NONE
 
     async def test_structured_no_progress_survives_controller_restart(
         self,

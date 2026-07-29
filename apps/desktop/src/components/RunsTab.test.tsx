@@ -157,6 +157,44 @@ describe("RunsTab", () => {
     expect(screen.getByText(/did not queue follow-up remediation/i)).toBeInTheDocument();
   });
 
+  it("shows recoverable partial work as completed with gaps", () => {
+    mockApp.selectedRunId = "run-partial";
+    mockApp.runDetail = {
+      id: "run-partial",
+      goal: "Build a synthetic market brief",
+      status: "completed",
+      process_name: "market-research",
+      plan_subtasks: [
+        {
+          id: "collect-evidence",
+          description: "Collect public evidence",
+          status: "partial",
+          summary: "One source remained unavailable; alternate evidence was preserved.",
+          depends_on: [],
+          phase_id: "",
+          is_critical_path: true,
+          is_synthesis: false,
+        },
+        {
+          id: "synthesize",
+          description: "Synthesize the brief",
+          status: "completed",
+          summary: "Completed with caveats.",
+          depends_on: ["collect-evidence"],
+          phase_id: "",
+          is_critical_path: true,
+          is_synthesis: true,
+        },
+      ],
+    };
+
+    render(<RunsTab />);
+
+    expect(screen.getByText("Completed with recoverable gaps")).toBeInTheDocument();
+    expect(screen.getByText("completed with gaps")).toBeInTheDocument();
+    expect(screen.queryByText("Why This Failed")).not.toBeInTheDocument();
+  });
+
   it("does not mount tool-call payloads until the row is expanded", async () => {
     const user = userEvent.setup();
     mockApp.selectedRunId = "run-abc";

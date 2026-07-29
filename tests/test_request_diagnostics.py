@@ -11,7 +11,7 @@ from loom.models.request_diagnostics import (
 def test_collect_request_diagnostics_counts_messages_and_tool_args() -> None:
     messages = [
         {"role": "system", "content": "System rules"},
-        {"role": "user", "content": "Find competitors for Encor by EPCOR."},
+        {"role": "user", "content": "Find competitors for Example Retailer by Example Utility."},
         {
             "role": "assistant",
             "content": "",

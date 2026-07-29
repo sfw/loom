@@ -12,10 +12,10 @@ import pytest
 from loom.config import Config, ExecutionConfig
 from loom.engine.orchestrator import Orchestrator, SubtaskResult
 from loom.engine.verification import VerificationResult
-from loom.events.types import TASK_CANCEL_REQUESTED, TASK_FAILED, TASK_PAUSED, TASK_RESUMED
+from loom.events.types import TASK_CANCEL_REQUESTED, TASK_PAUSED, TASK_RESUMED
 from loom.models.base import ModelConnectionError, ModelResponse, TokenUsage, ToolCall
 from loom.models.router import ModelRouter
-from loom.state.task_state import Plan, Subtask, TaskStatus
+from loom.state.task_state import Plan, Subtask, SubtaskStatus, TaskStatus
 from loom.tools.registry import ToolResult
 from tests.orchestrator.conftest import (
     _make_config,
@@ -124,7 +124,7 @@ class TestOrchestratorFinalize:
         assert not (workspace / "evidence-ledger.csv").exists()
 
     @pytest.mark.asyncio
-    async def test_wrap_up_exports_evidence_csv_for_failed_task(self, tmp_path):
+    async def test_wrap_up_exports_evidence_csv_for_degraded_task(self, tmp_path):
         plan_json = json.dumps({
             "subtasks": [{
                 "id": "s1",
@@ -142,7 +142,10 @@ class TestOrchestratorFinalize:
             prompt_assembler=_make_mock_prompts(),
             state_manager=_make_state_manager(tmp_path / "state"),
             event_bus=_make_event_bus(),
-            config=Config(execution=ExecutionConfig(max_subtask_retries=0)),
+            config=Config(execution=ExecutionConfig(
+                max_subtask_retries=0,
+                max_correction_retries=0,
+            )),
         )
         orch._runner.run = AsyncMock(return_value=(
             SubtaskResult(
@@ -164,7 +167,9 @@ class TestOrchestratorFinalize:
         task = _make_task(workspace=str(workspace))
         result = await orch.execute_task(task)
 
-        assert result.status == TaskStatus.FAILED
+        assert result.status == TaskStatus.COMPLETED
+        assert result.metadata["completion_grade"] == "degraded"
+        assert result.get_subtask("s1").status == SubtaskStatus.PARTIAL
         ledger_csv = workspace / "evidence-ledger.csv"
         assert ledger_csv.exists()
         with ledger_csv.open(encoding="utf-8", newline="") as handle:
@@ -363,8 +368,8 @@ class TestOrchestratorFinalize:
         assert executor_model.complete.await_count >= 2
 
     @pytest.mark.asyncio
-    async def test_failed_on_exception(self, tmp_path):
-        """If an exception occurs during execution, task should be FAILED."""
+    async def test_uncaught_exception_requests_checkpoint_recovery(self, tmp_path):
+        """An unexpected infrastructure error preserves state for recovery."""
         router = _make_mock_router(plan_response_text="bad")
         # Force planner to raise
         planner_model = AsyncMock()
@@ -385,14 +390,17 @@ class TestOrchestratorFinalize:
             event_bus=bus,
             config=_make_config(),
         )
+        orch._plan_task = AsyncMock(side_effect=RuntimeError("Model crashed"))
 
         task = _make_task()
         result = await orch.execute_task(task)
 
-        assert result.status == TaskStatus.FAILED
+        assert result.status == TaskStatus.PENDING
+        assert result.metadata["automatic_recovery_requested"] is True
+        assert result.metadata["recovery_required"] is True
         assert len(result.errors_encountered) > 0
         event_types = [e.event_type for e in events]
-        assert TASK_FAILED in event_types
+        assert TASK_PAUSED in event_types
 
     @pytest.mark.asyncio
     async def test_planning_model_connection_errors_fallback_to_safe_plan(self, tmp_path):

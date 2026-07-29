@@ -98,6 +98,7 @@ state separate from the default CLI/TUI database and scratch paths.
 | `max_parallel_subtasks` | `int` | `5` | Max concurrently runnable subtasks. |
 | `auto_approve_confidence_threshold` | `float` | `0.8` | Auto-approval threshold in confidence-gated flows. |
 | `enable_streaming` | `bool` | `true` | Enables streaming behavior where supported. |
+| `max_correction_retries` | `int` | `3` | Dedicated bounded retry reserve for targeted self-correction after ordinary subtask retries. |
 | `enable_global_run_budget` | `bool` | `false` | Enforces task-level global resource budgets when limits are configured. |
 | `max_task_wall_clock_seconds` | `int` | `0` | Task-level wall-clock cap (`0` disables). |
 | `max_task_total_tokens` | `int` | `0` | Task-level total model token cap (`0` disables). |
@@ -116,6 +117,8 @@ state separate from the default CLI/TUI database and scratch paths.
 | `enable_durable_task_runner` | `bool` | `false` | Enables durable queued/running task run leasing and recovery. |
 | `enable_mutation_idempotency` | `bool` | `false` | Enables mutating-tool idempotency ledger dedupe. |
 | `sealed_artifact_post_call_guard` | `string` | `"warn"` | Defense-in-depth sealed-artifact post-call mutation guard (`off`, `warn`, `enforce`). |
+| `runner_checkpoint_reserve_iterations` | `int` | `2` | Remaining runner turns at which Loom instructs the executor to finish or emit an exact resumable checkpoint. |
+| `noncatastrophic_outcome` | `string` | `"degraded"` | Outcome for unresolved recoverable gaps: complete with explicit degradation (`degraded`) or preserve a resumable pause (`paused`). |
 | `enable_slo_metrics` | `bool` | `false` | Enables `/slo` snapshot endpoint. |
 | `delegate_task_timeout_seconds` | `int` | `14400` | Timeout for delegated orchestration calls (`/run`, `delegate_task`). |
 | `model_call_max_attempts` | `int` | `5` | Max retry attempts for model invocation retry policy. |

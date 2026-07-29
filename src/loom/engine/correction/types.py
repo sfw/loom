@@ -15,6 +15,27 @@ class Repairability(StrEnum):
     TERMINAL = "terminal"
 
 
+class BlockerClass(StrEnum):
+    """Closed routing taxonomy independent of verifier-authored reason labels."""
+
+    RESOURCE_EXHAUSTION = "resource_exhaustion"
+    SOURCE_UNAVAILABLE = "source_unavailable"
+    TOOL_FAILURE = "tool_failure"
+    ARTIFACT_MISSING = "artifact_missing"
+    ARTIFACT_SCHEMA = "artifact_schema"
+    ARTIFACT_WRITE_POLICY = "artifact_write_policy"
+    EVIDENCE_GAP = "evidence_gap"
+    SEMANTIC_GAP = "semantic_gap"
+    CONTRADICTION = "contradiction"
+    VERIFIER_FAILURE = "verifier_failure"
+    AUTHENTICATION = "authentication"
+    AUTHORIZATION = "authorization"
+    SAFETY = "safety"
+    INTEGRITY = "integrity"
+    INFRASTRUCTURE = "infrastructure"
+    UNKNOWN = "unknown"
+
+
 class CorrectionState(StrEnum):
     DETECTED = "detected"
     CLASSIFIED = "classified"
@@ -33,6 +54,7 @@ class CorrectionState(StrEnum):
 class CorrectionHandler(StrEnum):
     RETRY_EXECUTION = "retry_execution"
     SCHEMA_REPAIR = "schema_repair"
+    OUTPUT_REROUTE = "output_reroute"
     RETRY_VERIFICATION = "retry_verification"
     CONTEXT_REFRESH = "context_refresh"
     CHECKPOINT_CONTINUE = "checkpoint_continue"
@@ -52,6 +74,7 @@ class Blocker:
     message: str
     blocking: bool
     repairability: Repairability
+    blocker_class: BlockerClass = BlockerClass.UNKNOWN
     source: str = "verification"
     targets: tuple[str, ...] = ()
     metadata: dict[str, object] = field(default_factory=dict)
@@ -59,13 +82,14 @@ class Blocker:
     def to_dict(self) -> dict[str, object]:
         payload = asdict(self)
         payload["repairability"] = self.repairability.value
+        payload["blocker_class"] = self.blocker_class.value
         payload["targets"] = list(self.targets)
         return payload
 
     @property
     def fingerprint(self) -> str:
         payload = {
-            "code": self.code,
+            "blocker_class": self.blocker_class.value,
             "source": self.source,
         }
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))

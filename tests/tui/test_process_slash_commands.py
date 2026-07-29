@@ -3442,7 +3442,7 @@ class TestProcessSlashCommands:
             run_id="abc123",
             process_name="market-research",
             process_defn=None,
-            goal="Analyze EPCOR",
+            goal="Analyze Example Utility",
             status="failed",
             task_id="cowork-9",
             run_workspace=Path("/tmp/process-run"),
@@ -3508,7 +3508,7 @@ class TestProcessSlashCommands:
             run_id="abc123",
             process_name="market-research",
             process_defn=None,
-            goal="Analyze EPCOR",
+            goal="Analyze Example Utility",
             status="failed",
             task_id="",
             run_workspace=Path("/tmp/process-run"),
@@ -3628,7 +3628,7 @@ class TestProcessSlashCommands:
             run_id="abc123",
             process_name="market-research",
             process_defn=None,
-            goal="Analyze EPCOR",
+            goal="Analyze Example Utility",
             status="failed",
             task_id="cowork-9",
             run_workspace=Path("/tmp/process-run"),
@@ -3670,7 +3670,7 @@ class TestProcessSlashCommands:
         run = SimpleNamespace(
             run_id="abc123",
             process_name="market-research",
-            goal="Analyze EPCOR",
+            goal="Analyze Example Utility",
             status="paused",
             task_id="cowork-9",
             worker=None,
@@ -3870,7 +3870,7 @@ class TestProcessSlashCommands:
         run = ProcessRunState(
             run_id="abc123",
             process_name="market-research",
-            goal="Analyze EPCOR",
+            goal="Analyze Example Utility",
             run_workspace=tmp_path,
             process_defn=SimpleNamespace(name="market-research"),
             pane_id="tab-run-abc123",
@@ -3882,7 +3882,7 @@ class TestProcessSlashCommands:
         prepared = await app._prepare_process_run_launch(
             "abc123",
             ProcessRunLaunchRequest(
-                goal="Analyze EPCOR",
+                goal="Analyze Example Utility",
                 process_defn=SimpleNamespace(name="market-research"),
             ),
         )
@@ -3917,7 +3917,7 @@ class TestProcessSlashCommands:
         run = ProcessRunState(
             run_id="abc123",
             process_name="market-research",
-            goal="Analyze EPCOR",
+            goal="Analyze Example Utility",
             run_workspace=tmp_path,
             process_defn=SimpleNamespace(name="market-research"),
             pane_id="tab-run-abc123",
@@ -3929,7 +3929,7 @@ class TestProcessSlashCommands:
         prepared = await app._prepare_process_run_launch(
             "abc123",
             ProcessRunLaunchRequest(
-                goal="Analyze EPCOR",
+                goal="Analyze Example Utility",
                 process_defn=SimpleNamespace(name="market-research"),
             ),
         )
@@ -5231,7 +5231,7 @@ class TestProcessSlashCommands:
             "abc123": SimpleNamespace(
                 run_id="abc123",
                 process_name="market-research",
-                goal="Analyze EPCOR",
+                goal="Analyze Example Utility",
                 status="completed",
                 task_id="cowork-1",
                 started_at=0.0,
@@ -5254,7 +5254,7 @@ class TestProcessSlashCommands:
         tabs = payload["process_tabs"]
         assert tabs["active_run_id"] == "abc123"
         assert tabs["runs"][0]["process_name"] == "market-research"
-        assert tabs["runs"][0]["goal"] == "Analyze EPCOR"
+        assert tabs["runs"][0]["goal"] == "Analyze Example Utility"
 
     @pytest.mark.asyncio
     async def test_restore_process_run_tabs_from_session_state(self):
@@ -5274,7 +5274,7 @@ class TestProcessSlashCommands:
                             {
                                 "run_id": "abc123",
                                 "process_name": "market-research",
-                                "goal": "Analyze EPCOR",
+                                "goal": "Analyze Example Utility",
                                 "status": "running",
                                 "task_id": "cowork-9",
                                 "elapsed_seconds": 42.0,
@@ -5315,13 +5315,14 @@ class TestProcessSlashCommands:
         assert len(app._process_runs) == 1
         run = app._process_runs["abc123"]
         assert run.process_name == "market-research"
-        assert run.status == "failed"  # interrupted running runs cannot be resumed
+        assert run.status == "paused"
         tabs.add_pane.assert_awaited_once()
         assert tabs.active == run.pane_id
         chat.add_info.assert_called_once()
         message = chat.add_info.call_args.args[0]
         assert "Restored Process Tabs" in message
         assert "Count:[/] 1" in message
+        assert "interrupted run(s) were paused" in message
 
     @pytest.mark.asyncio
     async def test_restore_process_run_tabs_keeps_paused_run_resumable(self, monkeypatch):
@@ -5341,7 +5342,7 @@ class TestProcessSlashCommands:
                             {
                                 "run_id": "abc123",
                                 "process_name": "market-research",
-                                "goal": "Analyze EPCOR",
+                                "goal": "Analyze Example Utility",
                                 "status": "paused",
                                 "task_id": "cowork-9",
                                 "elapsed_seconds": 42.0,

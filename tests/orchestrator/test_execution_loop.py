@@ -26,6 +26,7 @@ from loom.events.types import (
     SUBTASK_BLOCKED,
     SUBTASK_OUTPUT_CONFLICT_DEFERRED,
     SUBTASK_OUTPUT_CONFLICT_STARVATION_WARNING,
+    TASK_COMPLETED,
     TASK_FAILED,
     TASK_STALLED,
 )
@@ -1145,7 +1146,7 @@ class TestOrchestratorExecution:
         assert "scratch-notes.md" in list(payload.get("attempted_paths", []))
 
     @pytest.mark.asyncio
-    async def test_stalled_plan_emits_blocked_subtasks_on_failure(self, tmp_path):
+    async def test_stalled_plan_emits_blocked_subtasks_on_degraded_completion(self, tmp_path):
         bus = _make_event_bus()
         events = []
         bus.subscribe_all(lambda e: events.append(e))
@@ -1181,12 +1182,13 @@ class TestOrchestratorExecution:
 
         result = await orch.execute_task(task, reuse_existing_plan=True)
 
-        assert result.status == TaskStatus.FAILED
+        assert result.status == TaskStatus.COMPLETED
+        assert result.metadata["completion_grade"] == "degraded"
         assert TASK_STALLED in [e.event_type for e in events]
         assert SUBTASK_BLOCKED in [e.event_type for e in events]
-        failed_events = [e for e in events if e.event_type == TASK_FAILED]
-        assert failed_events
-        blocked_subtasks = failed_events[-1].data.get("blocked_subtasks")
+        completed_events = [e for e in events if e.event_type == TASK_COMPLETED]
+        assert completed_events
+        blocked_subtasks = result.metadata["degraded_completion"]["blocked_subtasks"]
         assert isinstance(blocked_subtasks, list)
         assert blocked_subtasks[0]["subtask_id"] == "downstream-pending"
         orch._replan_task.assert_awaited_once()

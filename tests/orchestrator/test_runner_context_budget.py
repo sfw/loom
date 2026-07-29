@@ -1564,7 +1564,7 @@ class TestSubtaskRunnerContextBudget:
         assert len(overflow_events) == 1
         assert runner._active_subtask_telemetry_counters["overflow_fallback_count"] == 1
 
-    def test_tool_iteration_budget_uses_global_limit(self):
+    def test_tool_iteration_budget_scales_with_work_and_recovery_context(self):
         from loom.engine.runner import SubtaskRunner
 
         research_subtask = Subtask(
@@ -1608,11 +1608,12 @@ class TestSubtaskRunnerContextBudget:
             base_budget=37,
         )
 
-        assert research_budget == SubtaskRunner.MAX_TOOL_ITERATIONS
+        assert research_budget > SubtaskRunner.MAX_TOOL_ITERATIONS
         assert verify_budget == SubtaskRunner.MAX_TOOL_ITERATIONS
         assert final_budget == SubtaskRunner.MAX_TOOL_ITERATIONS
-        assert remediation_budget == SubtaskRunner.MAX_TOOL_ITERATIONS
-        assert custom_budget == 37
+        assert remediation_budget > research_budget
+        assert custom_budget > 37
+        assert custom_budget <= 74
 
     def test_deliverable_policy_blocks_variant_and_noncanonical_retry_paths(self, tmp_path):
         from loom.engine.runner import SubtaskRunner

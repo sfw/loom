@@ -213,6 +213,17 @@ class SubtaskRunner:
         self._task_snapshot_writer = task_snapshot_writer
         settings = RunnerSettings.from_config(config, runner_defaults=self)
         self._max_tool_iterations = settings.max_tool_iterations
+        self._runner_checkpoint_reserve_iterations = max(
+            1,
+            int(
+                getattr(
+                    config.execution,
+                    "runner_checkpoint_reserve_iterations",
+                    2,
+                )
+                or 2
+            ),
+        )
         self._max_subtask_wall_clock_seconds = settings.max_subtask_wall_clock_seconds
         self._max_model_context_tokens = settings.max_model_context_tokens
         self._max_state_summary_chars = settings.max_state_summary_chars
@@ -1331,9 +1342,34 @@ class SubtaskRunner:
         has_expected_deliverables: bool,
         base_budget: int | None = None,
     ) -> int:
-        del subtask, retry_strategy, has_expected_deliverables  # configured globally
-        budget = int(base_budget) if isinstance(base_budget, int) else cls.MAX_TOOL_ITERATIONS
-        return max(1, min(200, budget))
+        base = int(base_budget) if isinstance(base_budget, int) else cls.MAX_TOOL_ITERATIONS
+        base = max(1, min(200, base))
+        budget = base
+        strategy = str(getattr(retry_strategy, "value", retry_strategy) or "").lower()
+        task_text = " ".join([
+            str(subtask.description or ""),
+            str(subtask.acceptance_criteria or ""),
+        ]).lower()
+
+        # Research and artifact production routinely need more than the global
+        # baseline, while precise repair actions should remain bounded.
+        if any(
+            token in task_text
+            for token in ("research", "evidence", "analyze", "investigate", "compare")
+        ):
+            budget += max(2, base // 4)
+        if has_expected_deliverables:
+            budget += max(2, base // 4)
+        if strategy in {
+            "checkpoint_continue",
+            "evidence_gap",
+            "unconfirmed_data",
+        }:
+            budget += max(2, base // 2)
+
+        # A contextual pass may use up to twice the configured baseline. Global
+        # task budgets remain the outer guardrail across retries and subtasks.
+        return max(1, min(200, base * 2, budget))
 
     @staticmethod
     def _normalize_path_for_policy(path_text: str, workspace: Path | None) -> str:

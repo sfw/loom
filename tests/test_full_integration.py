@@ -620,14 +620,14 @@ class TestVerificationFailureRetry:
 
 
 # ---------------------------------------------------------------------------
-# Test: All retries exhausted → task fails
+# Test: All retries exhausted → degraded checkpoint
 # ---------------------------------------------------------------------------
 
 class TestAllRetriesExhausted:
-    """Subtask keeps failing → all retries exhausted → task fails."""
+    """Subtask keeps failing → best checkpoint is preserved explicitly."""
 
     @pytest.mark.asyncio
-    async def test_task_fails_when_retries_exhausted(
+    async def test_task_degrades_when_retries_exhausted(
         self, tmp_path: Path, db: Database, workspace: Path,
     ):
         planner = FakeModelProvider(
@@ -704,7 +704,8 @@ class TestAllRetriesExhausted:
         )
         result = await orch.execute_task(task)
 
-        assert result.status == TaskStatus.FAILED
+        assert result.status == TaskStatus.COMPLETED
+        assert result.metadata["completion_grade"] == "degraded"
         assert len(result.errors_encountered) >= 1
 
         # Learning still captured patterns from the failure

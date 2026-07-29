@@ -584,6 +584,8 @@ export interface RunDetail extends RunSummary {
   events_count: number;
   workspace: WorkspaceSummary;
   plan_subtasks: PlanSubtask[];
+  completion_grade?: string;
+  degraded_completion?: Record<string, unknown>;
 }
 
 export interface RunArtifact {

@@ -128,7 +128,7 @@ class TestOrchestratorValidityPolicy:
         )
 
     @pytest.mark.asyncio
-    async def test_regression_cowork_3df9d4dd_guardrail_chain_blocks_invalid_final_synthesis(
+    async def test_regression_guardrail_chain_degrades_invalid_final_synthesis(
         self,
         tmp_path,
     ):
@@ -199,7 +199,9 @@ class TestOrchestratorValidityPolicy:
         resumed = state_manager.load(task.id)
         result = await orch.execute_task(resumed, reuse_existing_plan=True)
 
-        assert result.status == TaskStatus.FAILED
+        assert result.status == TaskStatus.COMPLETED
+        assert result.metadata["completion_grade"] == "degraded"
+        assert result.get_subtask("final").status == SubtaskStatus.PARTIAL
         orch._runner.run.assert_not_awaited()
         gate_events = [
             event for event in events

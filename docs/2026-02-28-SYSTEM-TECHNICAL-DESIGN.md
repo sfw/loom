@@ -244,14 +244,17 @@ The controller:
 - Compares structured progress vectors (blockers, failed checks, missing targets,
   contradicted/supported claims, deliverables, confidence), not error-message wording.
 - Persists cycles, attempts, and idempotent planned actions.
-- Never auto-heals safety/path violations, unexplained artifact-seal changes,
-  forbidden canonical writes, destructive approval requirements, or authentication.
+- Never auto-heals safety violations, workspace escapes, or unexplained
+  artifact-seal changes. Authentication and approval blockers pause for a human;
+  canonical/staging output-path mistakes are automatically rerouted.
 
 The current handler adapters are:
 
 - verification-only retry
 - targeted execution retry
 - LLM-planned structured-output schema repair
+- canonical/staging output-path reroute
+- progress-aware checkpoint continuation
 - context/artifact refresh
 - alternate source or tool method
 - deterministic placeholder prepass
@@ -261,19 +264,25 @@ The current handler adapters are:
 
 For runner tool-budget exhaustion, equivalent verifier reason codes normalize to one
 `checkpoint_continue` cycle. The continuation reuses existing deliverables and
-validated evidence, repairs only named gaps, and receives at most one bounded retry
-beyond the ordinary subtask retry ceiling when the structured progress vector improved.
+validated evidence, repairs only named gaps, and draws from a bounded correction
+reserve beyond the ordinary subtask retry ceiling.
 This prevents a nearly complete artifact from being discarded because earlier retries
 fixed different blockers.
+
+Correction execution has a dedicated retry reserve
+(`execution.max_correction_retries`) independent of broad execution retries. The
+runner also scales its per-pass tool budget for evidence-heavy work, declared
+deliverables, and checkpoint continuation, and injects a checkpoint instruction
+before the final turns. Exhaustion emits the canonical
+`runner_tool_budget_exhausted` signal rather than a verifier-invented label.
 
 CSV field-count/schema mismatches use a dedicated `schema_repair` cycle. Failed syntax
 checks identify the existing files to edit; a bounded planner call produces the repair
 plan, and the executor receives guardrails to preserve the canonical header and valid
 values, fix only delimiter/quoting/escaping/field-placement errors in place, avoid
 repeating research or creating versioned copies, and finish with deterministic schema
-verification. A progressing schema-repair cycle can receive one attempt beyond the
-ordinary subtask retry ceiling so an unrelated earlier semantic retry does not make a
-mechanical output defect terminal.
+verification. Schema repair draws from the correction reserve so an unrelated earlier
+semantic retry does not make a mechanical output defect terminal.
 
 Within one runner pass, a URL that returns a terminal method-level response (401, 403,
 404, 410, anti-bot denial, or login requirement) is marked exhausted for `web_fetch`.
@@ -293,14 +302,16 @@ Main outcomes:
 - Failure-resolution planner can generate compact actionable remediation snippets from bounded verification metadata.
 - If retries remain: increment retry count and return subtask to pending.
 - If retries exhausted:
-  - Critical path failures can abort, or run confirm-or-prune remediation, or queue follow-up depending on process policy.
+  - Recoverable critical-path failures become `partial` checkpoints and unblock
+    downstream synthesis with explicit caveats.
+  - Safety and integrity blockers remain terminal and abort the plan.
   - Non-critical failures request replanning at batch boundary.
 
 Remediation queue:
 - Stores remediation work items in task metadata.
 - Supports dedupe/merge for matching unresolved items.
 - Per-item attempt counts, bounded exponential backoff, TTL expiry.
-- Finalization step forces unresolved blocking remediations to terminal failed state.
+- Finalization records unresolved blocking remediations as degraded-completion gaps.
 - Optional SQLite dual-write/read hydration (`execution.enable_sqlite_remediation_queue`) via `remediation_items` and `remediation_attempts`.
 
 Correction persistence is always durable when the task database is available. The
@@ -308,6 +319,23 @@ legacy remediation queue flag only controls the older queue projection; it does 
 disable `correction_cycles`, `correction_attempts`, or `correction_actions`.
 
 ### 3.1.6 Finalization
+
+Finalization is the outcome arbiter. A task-level `FAILED` status is assigned only
+when correction classified a blocker as catastrophic (currently safety or artifact
+integrity). Other terminal execution shapes are separated from lifecycle failure:
+
+- fully verified work -> `completed`, `completion_grade=verified`
+- usable work with partial/skipped stages -> `completed`,
+  `completion_grade=degraded`
+- global budget, human input, or operator policy pause -> `paused`,
+  `completion_grade=paused_recoverable`
+- cancellation -> `cancelled`
+
+`partial` is a dependency-satisfying subtask state. It means the best checkpoint is
+usable, not that all acceptance criteria passed. Desktop renders it in amber, and
+synthesis is expected to surface its caveats. Process interruption preserves a
+checkpoint: durable workers requeue automatically, while non-durable sessions pause
+for explicit resume.
 
 Final task outcome is computed from:
 - Completed vs total subtasks.
