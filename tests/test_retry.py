@@ -236,7 +236,6 @@ class TestRetryManager:
         "insufficient_evidence",
         "recommendation_unconfirmed",
         "missing_precedent_transactions",
-        "csv_schema_mismatch",
     ])
     def test_classify_failure_routes_semantic_reason_codes_to_unconfirmed_data(
         self,
@@ -249,6 +248,36 @@ class TestRetryManager:
         )
         assert strategy == RetryStrategy.UNCONFIRMED_DATA
         assert markets == []
+
+    def test_classify_failure_routes_csv_mismatch_to_schema_repair(self):
+        strategy, targets = RetryManager.classify_failure(
+            verification_feedback="CSV row 8 has 13 columns (expected 11).",
+            execution_error="",
+            verification={
+                "reason_code": "csv_schema_mismatch",
+                "metadata": {"missing_targets": ["comparison-matrix.csv"]},
+            },
+        )
+
+        assert strategy == RetryStrategy.SCHEMA_REPAIR
+        assert targets == ["comparison-matrix.csv"]
+
+    def test_retry_context_constrains_schema_repair_to_in_place_edits(self):
+        context = RetryManager().build_retry_context([
+            AttemptRecord(
+                attempt=1,
+                tier=2,
+                feedback="CSV row 8 has 13 columns (expected 11).",
+                retry_strategy=RetryStrategy.SCHEMA_REPAIR,
+                missing_targets=["comparison-matrix.csv"],
+                resolution_plan="Inspect row 8 and correct its quoting.",
+            ),
+        ])
+
+        assert "TARGETED SCHEMA REPAIR" in context
+        assert "comparison-matrix.csv" in context
+        assert "Do not repeat research" in context
+        assert "checking every non-empty row" in context
 
     def test_classify_failure_keeps_hard_invariant_on_strict_path(self):
         strategy, markets = RetryManager.classify_failure(

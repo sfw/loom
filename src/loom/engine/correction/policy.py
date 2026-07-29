@@ -48,6 +48,9 @@ _PLACEHOLDER_CODES = frozenset({
     "incomplete_deliverable_content",
     "incomplete_deliverable_placeholder",
 })
+_SCHEMA_CODES = frozenset({
+    "csv_schema_mismatch",
+})
 _REASON_CODE_ALIASES = {
     "iteration_budget_exceeded": "runner_tool_budget_exhausted",
     "tool_budget_exhausted": "runner_tool_budget_exhausted",
@@ -93,7 +96,12 @@ def classify_blockers(verification) -> tuple[Blocker, ...]:
             or bool(metadata.get("prune_authorized", False))
             else Repairability.HUMAN_REQUIRED
         )
-    elif code in _VERIFIER_CODES or code in _TOOL_CODES or code in _PLACEHOLDER_CODES:
+    elif (
+        code in _VERIFIER_CODES
+        or code in _TOOL_CODES
+        or code in _PLACEHOLDER_CODES
+        or code in _SCHEMA_CODES
+    ):
         repairability = Repairability.AUTOMATIC
     elif code == "artifact_confirmation_required":
         repairability = Repairability.AUTOMATIC
@@ -124,6 +132,11 @@ def classify_blockers(verification) -> tuple[Blocker, ...]:
         for check in failed_checks:
             check_name = str(getattr(check, "name", "") or "verification_check")
             detail = str(getattr(check, "detail", "") or feedback or check_name)
+            blocker_targets = list(targets)
+            if code in _SCHEMA_CODES and check_name.startswith("syntax_"):
+                path = check_name.removeprefix("syntax_").strip()
+                if path and path not in blocker_targets:
+                    blocker_targets.append(path)
             blockers.append(
                 Blocker(
                     code=code or check_name.lower().replace(" ", "_"),
@@ -131,7 +144,7 @@ def classify_blockers(verification) -> tuple[Blocker, ...]:
                     blocking=True,
                     repairability=repairability,
                     source=f"verification:{check_name}",
-                    targets=targets,
+                    targets=tuple(blocker_targets),
                 )
             )
         return tuple(blockers)
@@ -155,6 +168,8 @@ def select_handler(blockers: tuple[Blocker, ...]) -> CorrectionHandler:
         return CorrectionHandler.HUMAN_REVIEW
     if codes & _VERIFIER_CODES:
         return CorrectionHandler.RETRY_VERIFICATION
+    if codes & _SCHEMA_CODES:
+        return CorrectionHandler.SCHEMA_REPAIR
     if "runner_tool_budget_exhausted" in codes:
         return CorrectionHandler.CHECKPOINT_CONTINUE
     if codes & _PLACEHOLDER_CODES:
@@ -183,6 +198,7 @@ def build_actions(
     targets = sorted({target for blocker in blockers for target in blocker.targets})
     action_type = {
         CorrectionHandler.RETRY_VERIFICATION: "rerun_verifier",
+        CorrectionHandler.SCHEMA_REPAIR: "repair_structured_output_schema",
         CorrectionHandler.CHECKPOINT_CONTINUE: "continue_from_partial_checkpoint",
         CorrectionHandler.PLACEHOLDER_PREPASS: "confirm_or_prune_placeholders",
         CorrectionHandler.CONTEXT_REFRESH: "refresh_artifact_context",
@@ -202,6 +218,14 @@ def build_actions(
                 "targets": targets,
                 "guardrails": (
                     [
+                        "edit the existing structured output in place",
+                        "preserve the declared header and valid row values",
+                        "repair delimiter, quoting, escaping, or field-count errors only",
+                        "do not repeat research or create alternate output files",
+                        "rerun deterministic schema verification after editing",
+                    ]
+                    if handler == CorrectionHandler.SCHEMA_REPAIR
+                    else [
                         "reuse existing deliverables and validated evidence",
                         "do not repeat broad research",
                         "repair only named missing targets",

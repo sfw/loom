@@ -251,6 +251,7 @@ The current handler adapters are:
 
 - verification-only retry
 - targeted execution retry
+- LLM-planned structured-output schema repair
 - context/artifact refresh
 - alternate source or tool method
 - deterministic placeholder prepass
@@ -265,6 +266,15 @@ beyond the ordinary subtask retry ceiling when the structured progress vector im
 This prevents a nearly complete artifact from being discarded because earlier retries
 fixed different blockers.
 
+CSV field-count/schema mismatches use a dedicated `schema_repair` cycle. Failed syntax
+checks identify the existing files to edit; a bounded planner call produces the repair
+plan, and the executor receives guardrails to preserve the canonical header and valid
+values, fix only delimiter/quoting/escaping/field-placement errors in place, avoid
+repeating research or creating versioned copies, and finish with deterministic schema
+verification. A progressing schema-repair cycle can receive one attempt beyond the
+ordinary subtask retry ceiling so an unrelated earlier semantic retry does not make a
+mechanical output defect terminal.
+
 Within one runner pass, a URL that returns a terminal method-level response (401, 403,
 404, 410, anti-bot denial, or login requirement) is marked exhausted for `web_fetch`.
 Further attempts against the same URL are short-circuited with an instruction to use
@@ -273,6 +283,7 @@ search or another public source; query/extraction hints do not bypass this guard
 Within that control plane, `_handle_failure` maps decisions to existing retry strategies:
 - `generic`
 - `rate_limit`
+- `schema_repair`
 - `verifier_parse`
 - `evidence_gap`
 - `unconfirmed_data`

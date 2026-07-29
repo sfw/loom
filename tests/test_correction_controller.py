@@ -91,6 +91,46 @@ class TestHistoricalFailureReplay:
         assert decision.handler == CorrectionHandler.RETRY_VERIFICATION
         assert decision.actions[0].action_type == "rerun_verifier"
 
+    async def test_csv_mismatch_routes_to_bounded_schema_repair(
+        self,
+        correction_runtime,
+    ):
+        _database, _memory, controller, _events = correction_runtime
+        verification = VerificationResult(
+            tier=1,
+            passed=False,
+            outcome="fail",
+            reason_code="csv_schema_mismatch",
+            severity_class="semantic",
+            feedback="A structured output row does not match its header.",
+            checks=[
+                Check(
+                    name="syntax_comparison-matrix.csv",
+                    passed=False,
+                    detail=(
+                        "reason_code=csv_schema_mismatch; "
+                        "CSV row 8 has 13 columns (expected 11)."
+                    ),
+                ),
+            ],
+        )
+
+        decision = await controller.record_failure(
+            task_id="task-1",
+            run_id="run-1",
+            subtask_id="structured-output",
+            result=_result(),
+            verification=verification,
+        )
+
+        assert decision.repairability == Repairability.AUTOMATIC
+        assert decision.handler == CorrectionHandler.SCHEMA_REPAIR
+        assert decision.actions[0].action_type == "repair_structured_output_schema"
+        assert decision.actions[0].arguments["targets"] == ["comparison-matrix.csv"]
+        assert "edit the existing structured output in place" in (
+            decision.actions[0].arguments["guardrails"]
+        )
+
     async def test_integrity_failure_is_not_auto_healed(self, correction_runtime):
         _database, _memory, controller, events = correction_runtime
         verification = VerificationResult(

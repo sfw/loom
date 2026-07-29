@@ -32,6 +32,7 @@ class CorrectionState(StrEnum):
 
 class CorrectionHandler(StrEnum):
     RETRY_EXECUTION = "retry_execution"
+    SCHEMA_REPAIR = "schema_repair"
     RETRY_VERIFICATION = "retry_verification"
     CONTEXT_REFRESH = "context_refresh"
     CHECKPOINT_CONTINUE = "checkpoint_continue"

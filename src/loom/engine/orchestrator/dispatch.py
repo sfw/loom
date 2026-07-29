@@ -803,6 +803,13 @@ async def handle_failure(
     if correction_decision is not None:
         if correction_decision.handler == CorrectionHandler.RETRY_VERIFICATION:
             strategy = RetryStrategy.VERIFIER_PARSE
+        elif correction_decision.handler == CorrectionHandler.SCHEMA_REPAIR:
+            strategy = RetryStrategy.SCHEMA_REPAIR
+            missing_targets = sorted({
+                target
+                for blocker in correction_decision.blockers
+                for target in blocker.targets
+            })
         elif correction_decision.handler in {
             CorrectionHandler.SOURCE_FALLBACK,
             CorrectionHandler.CONFIRM_OR_PRUNE,
@@ -834,6 +841,7 @@ async def handle_failure(
             CorrectionHandler.CHECKPOINT_CONTINUE,
             CorrectionHandler.PLACEHOLDER_PREPASS,
             CorrectionHandler.RETRY_VERIFICATION,
+            CorrectionHandler.SCHEMA_REPAIR,
             CorrectionHandler.SOURCE_FALLBACK,
         }
     )
@@ -904,7 +912,11 @@ async def handle_failure(
     resolution_plan = ""
     if (
         correction_decision is not None
-        and correction_decision.handler != CorrectionHandler.RETRY_EXECUTION
+        and correction_decision.handler
+        not in {
+            CorrectionHandler.RETRY_EXECUTION,
+            CorrectionHandler.SCHEMA_REPAIR,
+        }
     ):
         action = correction_decision.actions[0]
         resolution_plan = (
@@ -1089,11 +1101,16 @@ async def handle_failure(
     progress_extension_limit = int(subtask.max_retries)
     if (
         correction_decision is not None
-        and correction_decision.handler == CorrectionHandler.CHECKPOINT_CONTINUE
+        and correction_decision.handler
+        in {
+            CorrectionHandler.CHECKPOINT_CONTINUE,
+            CorrectionHandler.SCHEMA_REPAIR,
+        }
         and correction_decision.progress_made
     ):
         # One bounded continuation is safer than discarding a nearly complete
-        # checkpoint merely because earlier retries fixed different blockers.
+        # checkpoint or a mechanically repairable structured output merely
+        # because earlier retries fixed different blockers.
         progress_extension_limit += 1
     if (
         not no_progress_exhausted

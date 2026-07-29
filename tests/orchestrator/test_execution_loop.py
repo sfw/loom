@@ -16,7 +16,7 @@ from loom.engine.orchestrator import (
     SubtaskResultStatus,
     ToolCallRecord,
 )
-from loom.engine.verification import VerificationResult
+from loom.engine.verification import Check, VerificationResult
 from loom.events.types import (
     FORBIDDEN_CANONICAL_WRITE_BLOCKED,
     PLACEHOLDER_CONFIRM_OR_PRUNE_STARTED,
@@ -1573,6 +1573,82 @@ class TestOrchestratorExecution:
 
         assert subtask.retry_count == 4
         assert subtask.status == SubtaskStatus.PENDING
+        orch._abort_on_critical_path_failure.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_handle_failure_grants_llm_planned_schema_repair_at_retry_ceiling(
+        self,
+        tmp_path,
+    ):
+        state_manager = _make_state_manager(tmp_path)
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text='{"subtasks": []}'),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=state_manager,
+            event_bus=_make_event_bus(),
+            config=Config(execution=ExecutionConfig(max_subtask_retries=3)),
+        )
+        task = _make_task()
+        subtask = Subtask(
+            id="structured-output",
+            description="Produce a comparison matrix",
+            is_critical_path=True,
+            retry_count=3,
+            max_retries=3,
+        )
+        task.plan.subtasks = [subtask]
+        state_manager.create(task)
+        result = SubtaskResult(
+            status="failed",
+            summary="The comparison matrix was written.",
+        )
+        verification = VerificationResult(
+            tier=1,
+            passed=False,
+            outcome="fail",
+            reason_code="csv_schema_mismatch",
+            severity_class="semantic",
+            feedback=(
+                "Verification failed: syntax_comparison-matrix.csv — "
+                "CSV row 8 has 13 columns (expected 11)."
+            ),
+            checks=[
+                Check(
+                    name="syntax_comparison-matrix.csv",
+                    passed=False,
+                    detail="CSV row 8 has 13 columns (expected 11).",
+                ),
+            ],
+        )
+        attempts_by_subtask: dict[str, list[AttemptRecord]] = {}
+        orch._plan_failure_resolution = AsyncMock(
+            return_value=(
+                "Edit comparison-matrix.csv in place, correct row 8 quoting, "
+                "then validate all row widths."
+            ),
+        )
+        orch._abort_on_critical_path_failure = AsyncMock()
+
+        await orch._handle_failure(
+            task,
+            subtask,
+            result,
+            verification,
+            attempts_by_subtask,
+        )
+
+        assert subtask.retry_count == 4
+        assert subtask.status == SubtaskStatus.PENDING
+        assert (
+            attempts_by_subtask["structured-output"][0].retry_strategy
+            == RetryStrategy.SCHEMA_REPAIR
+        )
+        assert "comparison-matrix.csv" in (
+            attempts_by_subtask["structured-output"][0].missing_targets
+        )
+        orch._plan_failure_resolution.assert_awaited_once()
         orch._abort_on_critical_path_failure.assert_not_awaited()
 
     @pytest.mark.asyncio

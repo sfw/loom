@@ -1961,8 +1961,13 @@ def _build_remediation_retry_context(
     elif normalized_reason == "csv_schema_mismatch":
         lines.extend([
             "REASON-SPECIFIC REMEDIATION:",
-            "- Repair CSV row-width mismatches so every non-empty row matches the header.",
-            "- Re-check appended rows and delimiter/quoting consistency before retry.",
+            "- Inspect the verifier-named CSV files and rows.",
+            "- Treat the current header as canonical unless an explicit expected schema "
+            "is provided.",
+            "- Repair row-width, delimiter, quoting, escaping, and field-placement "
+            "mismatches in place while preserving valid values.",
+            "- Do not repeat research or create alternate/versioned output files.",
+            "- Re-check every non-empty row against the header before retry.",
         ])
     process = self._process
     if process is not None:

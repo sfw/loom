@@ -24,6 +24,7 @@ from loom.recovery.errors import ErrorCategory, categorize_error
 class RetryStrategy(StrEnum):
     GENERIC = "generic"
     RATE_LIMIT = "rate_limit"
+    SCHEMA_REPAIR = "schema_repair"
     VERIFIER_PARSE = "verifier_parse"
     EVIDENCE_GAP = "evidence_gap"
     UNCONFIRMED_DATA = "unconfirmed_data"
@@ -137,6 +138,18 @@ class RetryManager:
             )
 
         strategy = attempts[-1].retry_strategy if attempts else RetryStrategy.GENERIC
+        if strategy == RetryStrategy.SCHEMA_REPAIR:
+            lines.append(
+                "\nTARGETED SCHEMA REPAIR:\n"
+                "- Inspect the named existing files and malformed rows.\n"
+                "- Treat the current header as canonical unless the verifier explicitly "
+                "provides a different expected schema.\n"
+                "- Repair field counts, delimiters, quoting, and escaping in place while "
+                "preserving valid values.\n"
+                "- Do not repeat research or create replacement/versioned files.\n"
+                "- Finish by re-reading the edited rows and checking every non-empty row "
+                "against the header width."
+            )
         if strategy == RetryStrategy.RATE_LIMIT:
             lines.append(
                 "\nTARGETED RETRY PLAN:\n"
@@ -297,8 +310,9 @@ class RetryManager:
             "partial_evidence_coverage",
             "unverified_entries_remaining",
             "missing_precedent_transactions",
-            "csv_schema_mismatch",
         }
+        if reason_code == "csv_schema_mismatch":
+            return RetryStrategy.SCHEMA_REPAIR, missing_targets
         capability_unavailable_reason_codes = RetryManager._capability_unavailable_reason_codes()
         method_failure_reason_codes = RetryManager._method_failure_reason_codes()
 
