@@ -10,6 +10,16 @@ from unittest.mock import ANY, AsyncMock, MagicMock
 import pytest
 
 from loom.config import Config, ExecutionConfig, VerificationConfig
+from loom.engine.correction import (
+    Blocker,
+    BlockerClass,
+    CorrectionDecision,
+    CorrectionHandler,
+    CorrectionState,
+    ProgressVector,
+    Repairability,
+    RepairAction,
+)
 from loom.engine.orchestrator import (
     Orchestrator,
     SubtaskResult,
@@ -1526,6 +1536,207 @@ class TestOrchestratorExecution:
         assert attempts[0].error is not None
 
     @pytest.mark.asyncio
+    async def test_failed_verification_only_retry_is_reclassified_without_stale_fallthrough(
+        self,
+        tmp_path,
+    ):
+        state_manager = _make_state_manager(tmp_path)
+        bus = _make_event_bus()
+        events = []
+        bus.subscribe_all(lambda event: events.append(event))
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text='{"subtasks": []}'),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=state_manager,
+            event_bus=bus,
+            config=Config(execution=ExecutionConfig(max_subtask_retries=3)),
+        )
+        task = _make_task()
+        subtask = Subtask(
+            id="synthesis",
+            description="Produce recommendations",
+            is_critical_path=True,
+            max_retries=3,
+        )
+        task.plan.subtasks = [subtask]
+        state_manager.create(task)
+        progress = ProgressVector(1, 1, 1, 0, 0, 1, 0.4)
+        verifier_blocker = Blocker(
+            code="infra_verifier_error",
+            message="Verifier output could not be parsed.",
+            blocking=True,
+            repairability=Repairability.AUTOMATIC,
+            blocker_class=BlockerClass.VERIFIER_FAILURE,
+        )
+        contract_blocker = Blocker(
+            code="missing_required_contract_field",
+            message="Market-specific recommendations are missing.",
+            blocking=True,
+            repairability=Repairability.AUTOMATIC,
+            blocker_class=BlockerClass.ARTIFACT_CONTRACT,
+            targets=("recommendations.md",),
+        )
+        verifier_decision = CorrectionDecision(
+            cycle_id="corr-verifier",
+            blockers=(verifier_blocker,),
+            repairability=Repairability.AUTOMATIC,
+            handler=CorrectionHandler.RETRY_VERIFICATION,
+            state=CorrectionState.PLANNED,
+            actions=(
+                RepairAction(
+                    action_type="rerun_verifier",
+                    handler=CorrectionHandler.RETRY_VERIFICATION,
+                ),
+            ),
+            progress=progress,
+            progress_made=True,
+            no_progress_count=0,
+            stop_for_no_progress=False,
+            total_attempt_count=1,
+        )
+        contract_decision = CorrectionDecision(
+            cycle_id="corr-contract",
+            blockers=(contract_blocker,),
+            repairability=Repairability.AUTOMATIC,
+            handler=CorrectionHandler.CONTRACT_REPAIR,
+            state=CorrectionState.PLANNED,
+            actions=(
+                RepairAction(
+                    action_type="repair_structured_output_contract",
+                    handler=CorrectionHandler.CONTRACT_REPAIR,
+                    arguments={"targets": ["recommendations.md"], "guardrails": []},
+                ),
+            ),
+            progress=progress,
+            progress_made=True,
+            no_progress_count=0,
+            stop_for_no_progress=False,
+            total_attempt_count=2,
+        )
+        orch._correction.record_failure = AsyncMock(
+            side_effect=[verifier_decision, contract_decision],
+        )
+        orch._correction.mark_routed = AsyncMock()
+        orch._retry_verification_only = AsyncMock(return_value=VerificationResult(
+            tier=2,
+            passed=False,
+            outcome="partial_verified",
+            reason_code="missing_required_contract_field",
+            severity_class="semantic",
+            feedback="Market-specific recommendations are missing.",
+            metadata={"missing_targets": ["recommendations.md"]},
+        ))
+        orch._handle_success = AsyncMock()
+
+        await orch._handle_failure(
+            task,
+            subtask,
+            SubtaskResult(status="failed", summary="Usable draft."),
+            VerificationResult(
+                tier=2,
+                passed=False,
+                outcome="fail",
+                reason_code="parse_inconclusive",
+                severity_class="infra",
+                feedback="Verifier output could not be parsed.",
+            ),
+            attempts_by_subtask={},
+        )
+
+        orch._retry_verification_only.assert_awaited_once()
+        orch._handle_success.assert_not_awaited()
+        assert subtask.retry_count == 1
+        retry_events = [
+            event for event in events
+            if event.event_type == "subtask_retrying"
+            and event.data.get("correction_handler")
+        ]
+        assert retry_events[-1].data["correction_handler"] == "contract_repair"
+        assert retry_events[-1].data["retry_strategy"] == "contract_repair"
+
+    @pytest.mark.asyncio
+    async def test_exhausted_verifier_lane_completes_with_caveats_without_executor_retry(
+        self,
+        tmp_path,
+    ):
+        state_manager = _make_state_manager(tmp_path)
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text='{"subtasks": []}'),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=state_manager,
+            event_bus=_make_event_bus(),
+            config=Config(execution=ExecutionConfig(max_subtask_retries=3)),
+        )
+        task = _make_task()
+        subtask = Subtask(
+            id="synthesis",
+            description="Produce recommendations",
+            is_critical_path=True,
+            is_synthesis=True,
+            max_retries=3,
+        )
+        task.plan.subtasks = [subtask]
+        state_manager.create(task)
+        decision = CorrectionDecision(
+            cycle_id="corr-verifier",
+            blockers=(
+                Blocker(
+                    code="infra_verifier_error",
+                    message="Verifier remained unavailable.",
+                    blocking=True,
+                    repairability=Repairability.AUTOMATIC,
+                    blocker_class=BlockerClass.VERIFIER_FAILURE,
+                ),
+            ),
+            repairability=Repairability.AUTOMATIC,
+            handler=CorrectionHandler.RETRY_VERIFICATION,
+            state=CorrectionState.TERMINAL,
+            actions=(
+                RepairAction(
+                    action_type="rerun_verifier",
+                    handler=CorrectionHandler.RETRY_VERIFICATION,
+                ),
+            ),
+            progress=ProgressVector(1, 1, 0, 0, 0, 1, 0.4),
+            progress_made=False,
+            no_progress_count=2,
+            stop_for_no_progress=True,
+            total_attempt_count=2,
+        )
+        orch._correction.record_failure = AsyncMock(return_value=decision)
+        orch._retry_verification_only = AsyncMock()
+        orch._handle_success = AsyncMock()
+        result = SubtaskResult(status="failed", summary="Usable final draft.")
+        verification = VerificationResult(
+            tier=2,
+            passed=False,
+            outcome="fail",
+            reason_code="infra_verifier_error",
+            severity_class="infra",
+            feedback="Verifier remained unavailable.",
+        )
+
+        await orch._handle_failure(
+            task,
+            subtask,
+            result,
+            verification,
+            attempts_by_subtask={},
+        )
+
+        orch._retry_verification_only.assert_not_awaited()
+        orch._handle_success.assert_awaited_once()
+        assert result.status == SubtaskResultStatus.SUCCESS
+        assert verification.passed is True
+        assert verification.outcome == "pass_with_warnings"
+        assert verification.metadata["verifier_retry_exhausted"] is True
+        assert subtask.retry_count == 0
+
+    @pytest.mark.asyncio
     async def test_handle_failure_grants_one_progressing_checkpoint_continuation(
         self,
         tmp_path,
@@ -1652,6 +1863,77 @@ class TestOrchestratorExecution:
         )
         orch._plan_failure_resolution.assert_awaited_once()
         orch._abort_on_critical_path_failure.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_handle_failure_repairs_unambiguous_csv_without_runner_rerun(
+        self,
+        tmp_path,
+    ):
+        state_manager = _make_state_manager(tmp_path)
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text='{"subtasks": []}'),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=state_manager,
+            event_bus=_make_event_bus(),
+            config=Config(execution=ExecutionConfig(max_subtask_retries=3)),
+        )
+        task = _make_task(workspace=str(tmp_path))
+        subtask = Subtask(
+            id="structured-output",
+            description="Produce a comparison matrix",
+            is_critical_path=True,
+            max_retries=3,
+        )
+        task.plan.subtasks = [subtask]
+        state_manager.create(task)
+        target = tmp_path / "comparison-matrix.csv"
+        target.write_text(
+            "company,score,source\nExample,5,public,,\n",
+            encoding="utf-8",
+        )
+        result = SubtaskResult(
+            status="failed",
+            summary="The comparison matrix was written.",
+        )
+        verification = VerificationResult(
+            tier=1,
+            passed=False,
+            outcome="fail",
+            reason_code="csv_schema_mismatch",
+            severity_class="semantic",
+            feedback="CSV row 2 has 5 columns (expected 3).",
+            checks=[
+                Check(
+                    name="syntax_comparison-matrix.csv",
+                    passed=False,
+                    detail="CSV row 2 has 5 columns (expected 3).",
+                ),
+            ],
+        )
+        orch._retry_verification_only = AsyncMock(return_value=VerificationResult(
+            tier=2,
+            passed=True,
+            outcome="pass",
+            feedback="Schema repaired.",
+        ))
+        orch._handle_success = AsyncMock()
+
+        await orch._handle_failure(
+            task,
+            subtask,
+            result,
+            verification,
+            attempts_by_subtask={},
+        )
+
+        assert target.read_text(encoding="utf-8") == (
+            "company,score,source\nExample,5,public\n"
+        )
+        orch._retry_verification_only.assert_awaited_once()
+        orch._handle_success.assert_awaited_once()
+        assert subtask.retry_count == 0
 
     @pytest.mark.asyncio
     async def test_handle_failure_allows_optional_dev_verifier_warning_success(self, tmp_path):

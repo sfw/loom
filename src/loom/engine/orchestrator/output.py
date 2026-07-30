@@ -1041,6 +1041,8 @@ def _augment_retry_context_for_outputs(
             )
     if (
         strategy in {
+            RetryStrategy.CONTRACT_REPAIR,
+            RetryStrategy.OUTPUT_REROUTE,
             RetryStrategy.RATE_LIMIT,
             RetryStrategy.EVIDENCE_GAP,
             RetryStrategy.UNCONFIRMED_DATA,

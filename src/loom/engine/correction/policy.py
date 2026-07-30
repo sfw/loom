@@ -51,6 +51,16 @@ _PLACEHOLDER_CODES = frozenset({
 _SCHEMA_CODES = frozenset({
     "csv_schema_mismatch",
 })
+_CONTRACT_CODES = frozenset({
+    "aggregate_scan_not_zonal",
+    "incomplete_pestle_coverage_unverified_assumptions_remain",
+    "missing_leading_indicators_and_geographic_granularity",
+    "missing_market_specific_recommendations",
+    "missing_required_contract_field",
+    "missing_structured_leading_indicators",
+    "structured_output_contract_failed",
+    "unverified_primary_deliverables",
+})
 _REASON_CODE_ALIASES = {
     "budget_exhausted_incomplete": "runner_tool_budget_exhausted",
     "iteration_budget_exceeded": "runner_tool_budget_exhausted",
@@ -120,6 +130,21 @@ def canonicalize_reason_code(
         "schema" in text and any(token in text for token in ("csv", "column", "row"))
     ):
         return "csv_schema_mismatch", BlockerClass.ARTIFACT_SCHEMA
+    if (
+        "verification" in text
+        and any(token in text for token in ("budget", "tool method", "tool_method"))
+        and any(token in text for token in ("exhaust", "failed", "failure"))
+    ):
+        return (
+            aliased or "infra_verifier_error",
+            BlockerClass.VERIFIER_FAILURE,
+        )
+    if aliased in _CONTRACT_CODES or (
+        any(token in text for token in ("structured", "required", "primary"))
+        and any(token in text for token in ("field", "indicator", "deliverable", "contract"))
+        and any(token in text for token in ("missing", "unverified", "invalid", "failed"))
+    ):
+        return aliased or "structured_output_contract_failed", BlockerClass.ARTIFACT_CONTRACT
     if aliased == "runner_tool_budget_exhausted" or _BUDGET_REASON_RE.search(raw):
         return "runner_tool_budget_exhausted", BlockerClass.RESOURCE_EXHAUSTION
     if aliased in _VERIFIER_CODES or "verifier" in aliased and (
@@ -174,6 +199,99 @@ def _metadata_list(metadata: dict[str, object], key: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(str(item).strip() for item in value if str(item).strip()))
 
 
+def _schema_diagnostics(detail: str) -> dict[str, object]:
+    """Extract stable CSV diagnostics from deterministic verifier feedback."""
+    match = re.search(
+        r"CSV row\s+(?P<row>\d+)\s+has\s+(?P<actual>\d+)\s+columns?\s+"
+        r"\(expected\s+(?P<expected>\d+)\)",
+        str(detail or ""),
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return {}
+    return {
+        "row_number": int(match.group("row")),
+        "actual_columns": int(match.group("actual")),
+        "expected_columns": int(match.group("expected")),
+    }
+
+
+def _repairability_for(
+    *,
+    code: str,
+    blocker_class: BlockerClass,
+    metadata: dict[str, object],
+    severity: str,
+    check_text: str,
+) -> Repairability:
+    """Resolve repairability for one normalized blocker."""
+    if blocker_class in {BlockerClass.SAFETY, BlockerClass.INTEGRITY}:
+        return Repairability.TERMINAL
+    if blocker_class in {BlockerClass.AUTHENTICATION, BlockerClass.AUTHORIZATION}:
+        return Repairability.HUMAN_REQUIRED
+    if code == "claim_contradicted":
+        remediation_mode = str(metadata.get("remediation_mode", "") or "").strip().lower()
+        if (
+            remediation_mode in {"confirm_or_prune", "confirm_or_prune_then_queue"}
+            or bool(metadata.get("prune_authorized", False))
+        ):
+            return Repairability.CONDITIONAL
+        return Repairability.HUMAN_REQUIRED
+    if blocker_class in {
+        BlockerClass.ARTIFACT_MISSING,
+        BlockerClass.ARTIFACT_SCHEMA,
+        BlockerClass.ARTIFACT_CONTRACT,
+        BlockerClass.ARTIFACT_WRITE_POLICY,
+        BlockerClass.INFRASTRUCTURE,
+        BlockerClass.SOURCE_UNAVAILABLE,
+        BlockerClass.TOOL_FAILURE,
+        BlockerClass.VERIFIER_FAILURE,
+    } or code in {"artifact_confirmation_required", "iteration_gate_failed"}:
+        return Repairability.AUTOMATIC
+    if code in _EVIDENCE_CODES or code in {
+        "iteration_budget_exhausted",
+        "iteration_exhausted",
+        "max_attempts_exhausted",
+        "max_runner_invocations_exhausted",
+        "no_improvement",
+    }:
+        return Repairability.CONDITIONAL
+    if code == "hard_invariant_failed" or severity == "hard_invariant":
+        check_text_lower = check_text.lower()
+        if any(
+            token in check_text_lower
+            for token in ("safety", "seal", "canonical write", "integrity")
+        ):
+            return Repairability.TERMINAL
+        if any(
+            token in check_text_lower
+            for token in ("placeholder", "deliverable", "missing", "field")
+        ):
+            return Repairability.AUTOMATIC
+    return Repairability.CONDITIONAL
+
+
+def _check_reason_code(check_name: str, detail: str, fallback: str) -> str:
+    """Prefer a verifier check's own reason code when it supplied one."""
+    match = re.search(
+        r"\breason_code\s*[=:]\s*([a-z0-9_-]+)",
+        str(detail or ""),
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return match.group(1).lower()
+    normalized_name = str(check_name or "").strip().lower()
+    if normalized_name in (
+        _SCHEMA_CODES
+        | _CONTRACT_CODES
+        | _VERIFIER_CODES
+        | _TOOL_CODES
+        | _EVIDENCE_CODES
+    ):
+        return normalized_name
+    return fallback
+
+
 def classify_blockers(verification) -> tuple[Blocker, ...]:
     """Convert a verification result into stable, typed blockers."""
     metadata = (
@@ -199,76 +317,53 @@ def classify_blockers(verification) -> tuple[Blocker, ...]:
         check_text=check_text,
     )
 
-    repairability = Repairability.CONDITIONAL
-    if blocker_class in {BlockerClass.SAFETY, BlockerClass.INTEGRITY}:
-        repairability = Repairability.TERMINAL
-    elif blocker_class in {BlockerClass.AUTHENTICATION, BlockerClass.AUTHORIZATION}:
-        repairability = Repairability.HUMAN_REQUIRED
-    elif code == "claim_contradicted":
-        remediation_mode = str(metadata.get("remediation_mode", "") or "").strip().lower()
-        repairability = (
-            Repairability.CONDITIONAL
-            if remediation_mode in {"confirm_or_prune", "confirm_or_prune_then_queue"}
-            or bool(metadata.get("prune_authorized", False))
-            else Repairability.HUMAN_REQUIRED
-        )
-    elif blocker_class in {
-        BlockerClass.ARTIFACT_MISSING,
-        BlockerClass.ARTIFACT_SCHEMA,
-        BlockerClass.ARTIFACT_WRITE_POLICY,
-        BlockerClass.INFRASTRUCTURE,
-        BlockerClass.SOURCE_UNAVAILABLE,
-        BlockerClass.TOOL_FAILURE,
-        BlockerClass.VERIFIER_FAILURE,
-    }:
-        repairability = Repairability.AUTOMATIC
-    elif code == "artifact_confirmation_required":
-        repairability = Repairability.AUTOMATIC
-    elif code in _EVIDENCE_CODES:
-        repairability = Repairability.CONDITIONAL
-    elif code == "iteration_gate_failed":
-        repairability = Repairability.AUTOMATIC
-    elif code in {
-        "iteration_budget_exhausted",
-        "iteration_exhausted",
-        "max_attempts_exhausted",
-        "max_runner_invocations_exhausted",
-        "no_improvement",
-    }:
-        repairability = Repairability.CONDITIONAL
-    elif code == "hard_invariant_failed" or severity == "hard_invariant":
-        check_text_lower = check_text.lower()
-        if any(
-            token in check_text_lower
-            for token in ("safety", "seal", "canonical write", "integrity")
-        ):
-            repairability = Repairability.TERMINAL
-        elif any(
-            token in check_text_lower
-            for token in ("placeholder", "deliverable", "missing", "field")
-        ):
-            repairability = Repairability.AUTOMATIC
+    repairability = _repairability_for(
+        code=code,
+        blocker_class=blocker_class,
+        metadata=metadata,
+        severity=severity,
+        check_text=check_text,
+    )
 
     if failed_checks:
         blockers = []
         for check in failed_checks:
             check_name = str(getattr(check, "name", "") or "verification_check")
             detail = str(getattr(check, "detail", "") or feedback or check_name)
+            check_code, check_class = canonicalize_reason_code(
+                _check_reason_code(check_name, detail, raw_code),
+                feedback=feedback,
+                check_text=f"{check_name} {detail}",
+            )
+            check_repairability = _repairability_for(
+                code=check_code,
+                blocker_class=check_class,
+                metadata=metadata,
+                severity=severity,
+                check_text=f"{check_name} {detail}",
+            )
             blocker_targets = list(targets)
-            if code in _SCHEMA_CODES and check_name.startswith("syntax_"):
+            if check_code in _SCHEMA_CODES and check_name.startswith("syntax_"):
                 path = check_name.removeprefix("syntax_").strip()
                 if path and path not in blocker_targets:
                     blocker_targets.append(path)
             blockers.append(
                 Blocker(
-                    code=code or check_name.lower().replace(" ", "_"),
+                    code=check_code or check_name.lower().replace(" ", "_"),
                     message=detail,
                     blocking=True,
-                    repairability=repairability,
-                    blocker_class=blocker_class,
+                    repairability=check_repairability,
+                    blocker_class=check_class,
                     source=f"verification:{check_name}",
                     targets=tuple(blocker_targets),
-                    metadata={"original_reason_code": raw_code},
+                    metadata={
+                        "original_reason_code": raw_code,
+                        **(
+                            _schema_diagnostics(detail)
+                            if check_code in _SCHEMA_CODES
+                            else {}
+                        ),
+                    },
                 )
             )
         return tuple(blockers)
@@ -297,6 +392,8 @@ def select_handler(blockers: tuple[Blocker, ...]) -> CorrectionHandler:
         return CorrectionHandler.RETRY_VERIFICATION
     if BlockerClass.ARTIFACT_SCHEMA in classes:
         return CorrectionHandler.SCHEMA_REPAIR
+    if BlockerClass.ARTIFACT_CONTRACT in classes:
+        return CorrectionHandler.CONTRACT_REPAIR
     if BlockerClass.RESOURCE_EXHAUSTION in classes:
         return CorrectionHandler.CHECKPOINT_CONTINUE
     if BlockerClass.ARTIFACT_WRITE_POLICY in classes:
@@ -325,9 +422,26 @@ def build_actions(
     blockers: tuple[Blocker, ...],
 ) -> tuple[RepairAction, ...]:
     targets = sorted({target for blocker in blockers for target in blocker.targets})
+    diagnostics = [
+        {
+            "target": target,
+            **{
+                key: value
+                for key, value in blocker.metadata.items()
+                if key in {"row_number", "actual_columns", "expected_columns"}
+            },
+        }
+        for blocker in blockers
+        for target in (blocker.targets or ("",))
+        if any(
+            key in blocker.metadata
+            for key in {"row_number", "actual_columns", "expected_columns"}
+        )
+    ]
     action_type = {
         CorrectionHandler.RETRY_VERIFICATION: "rerun_verifier",
         CorrectionHandler.SCHEMA_REPAIR: "repair_structured_output_schema",
+        CorrectionHandler.CONTRACT_REPAIR: "repair_structured_output_contract",
         CorrectionHandler.OUTPUT_REROUTE: "reroute_output_to_allowed_path",
         CorrectionHandler.CHECKPOINT_CONTINUE: "continue_from_partial_checkpoint",
         CorrectionHandler.PLACEHOLDER_PREPASS: "confirm_or_prune_placeholders",
@@ -346,6 +460,7 @@ def build_actions(
             arguments={
                 "reason_codes": sorted({blocker.code for blocker in blockers}),
                 "targets": targets,
+                "diagnostics": diagnostics,
                 "guardrails": (
                     [
                         "edit the existing structured output in place",
@@ -355,6 +470,13 @@ def build_actions(
                         "rerun deterministic schema verification after editing",
                     ]
                     if handler == CorrectionHandler.SCHEMA_REPAIR
+                    else [
+                        "edit only verifier-named fields, rows, or sections",
+                        "preserve validated content and evidence",
+                        "do not repeat broad discovery or research",
+                        "rerun only the failed contract checks",
+                    ]
+                    if handler == CorrectionHandler.CONTRACT_REPAIR
                     else [
                         "use only verifier-declared canonical or staging paths",
                         "patch existing deliverables instead of creating variants",

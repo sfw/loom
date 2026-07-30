@@ -413,10 +413,15 @@ def test_runner_resolves_post_call_guard_mode_from_config() -> None:
     assert runner._sealed_artifact_post_call_guard_mode() == "warn"
 
 
+@pytest.mark.parametrize(
+    "retry_strategy",
+    ["", "contract_repair", "output_reroute", "schema_repair"],
+)
 @pytest.mark.asyncio
 async def test_run_locks_to_text_completion_after_writing_expected_deliverable(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    retry_strategy: str,
 ) -> None:
     monkeypatch.setattr(
         runner_module,
@@ -466,6 +471,7 @@ async def test_run_locks_to_text_completion_after_writing_expected_deliverable(
         task,
         subtask,
         expected_deliverables=["report.md"],
+        retry_strategy=retry_strategy,
     )
 
     assert result.status == SubtaskResultStatus.SUCCESS

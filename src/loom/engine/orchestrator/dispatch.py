@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 import uuid
@@ -17,6 +18,7 @@ from loom.engine.verification.development import optional_failure_capability_for
 from loom.engine.verification.policy import normalize_profile, resolve_policy_decision
 from loom.events.types import (
     ARTIFACT_SEAL_VALIDATION,
+    CORRECTION_ACTION_APPLIED,
     ITERATION_COMPLETED,
     ITERATION_GATE_FAILED,
     ITERATION_RETRYING,
@@ -35,6 +37,7 @@ from loom.recovery.approval import ApprovalDecision, ApprovalRequest
 from loom.recovery.retry import AttemptRecord, RetryStrategy
 from loom.state.evidence import merge_evidence_records
 from loom.state.task_state import Subtask, SubtaskStatus, Task, TaskStatus
+from loom.tools.registry import ToolResult
 
 logger = logging.getLogger(__name__)
 
@@ -810,8 +813,15 @@ async def handle_failure(
                 for blocker in correction_decision.blockers
                 for target in blocker.targets
             })
+        elif correction_decision.handler == CorrectionHandler.CONTRACT_REPAIR:
+            strategy = RetryStrategy.CONTRACT_REPAIR
+            missing_targets = sorted({
+                target
+                for blocker in correction_decision.blockers
+                for target in blocker.targets
+            })
         elif correction_decision.handler == CorrectionHandler.OUTPUT_REROUTE:
-            strategy = RetryStrategy.GENERIC
+            strategy = RetryStrategy.OUTPUT_REROUTE
             missing_targets = sorted({
                 target
                 for blocker in correction_decision.blockers
@@ -838,6 +848,8 @@ async def handle_failure(
             "repairability": correction_decision.repairability.value,
             "handler": correction_decision.handler.value,
             "no_progress_count": correction_decision.no_progress_count,
+            "total_attempt_count": correction_decision.total_attempt_count,
+            "stop_for_attempt_budget": correction_decision.stop_for_attempt_budget,
         }
         verification.metadata = verification_metadata
     correction_requires_inline_repair = bool(
@@ -850,6 +862,7 @@ async def handle_failure(
             CorrectionHandler.OUTPUT_REROUTE,
             CorrectionHandler.RETRY_VERIFICATION,
             CorrectionHandler.SCHEMA_REPAIR,
+            CorrectionHandler.CONTRACT_REPAIR,
             CorrectionHandler.SOURCE_FALLBACK,
         }
     )
@@ -894,11 +907,74 @@ async def handle_failure(
         verification=verification,
     )
 
+    if (
+        correction_decision is not None
+        and correction_decision.handler == CorrectionHandler.SCHEMA_REPAIR
+        and not correction_decision.stop_for_no_progress
+        and not correction_decision.stop_for_attempt_budget
+    ):
+        execution_result = await asyncio.to_thread(
+            orchestrator._correction_executor.execute,
+            workspace=Path(task.workspace) if task.workspace else None,
+            decision=correction_decision,
+        )
+        if execution_result.applied:
+            synthetic_call = ToolCallRecord(
+                tool="correction_schema_repair",
+                args={"targets": list(execution_result.changed_targets)},
+                result=ToolResult.ok(
+                    "Applied deterministic schema repair.",
+                    files_changed=list(execution_result.changed_targets),
+                    data={
+                        "correction_cycle_id": correction_decision.cycle_id,
+                        "repair_reason": execution_result.reason,
+                    },
+                ),
+                call_id=f"{correction_decision.cycle_id}:deterministic",
+            )
+            result.tool_calls.append(synthetic_call)
+            orchestrator._emit(CORRECTION_ACTION_APPLIED, task.id, {
+                "subtask_id": subtask.id,
+                "cycle_id": correction_decision.cycle_id,
+                "handler": correction_decision.handler.value,
+                "targets": list(execution_result.changed_targets),
+                "reason": execution_result.reason,
+            })
+            verification_retry = await orchestrator._retry_verification_only(
+                task=task,
+                subtask=subtask,
+                result=result,
+                attempts=attempt_list,
+            )
+            if verification_retry.passed:
+                await orchestrator._handle_success(
+                    task,
+                    subtask,
+                    result,
+                    verification_retry,
+                )
+                return None
+            return await handle_failure(
+                orchestrator,
+                task,
+                subtask,
+                result,
+                verification_retry,
+                attempts_by_subtask,
+            )
+
     # Parse failures in verifier output should retry verification only
     # instead of re-running full subtask execution.
     if (
         strategy == RetryStrategy.VERIFIER_PARSE
         and subtask.retry_count < subtask.max_retries
+        and not (
+            correction_decision is not None
+            and (
+                correction_decision.stop_for_no_progress
+                or correction_decision.stop_for_attempt_budget
+            )
+        )
     ):
         verification_retry = await orchestrator._retry_verification_only(
             task=task,
@@ -909,13 +985,47 @@ async def handle_failure(
         if verification_retry.passed:
             await orchestrator._handle_success(task, subtask, result, verification_retry)
             return None
-        verification = verification_retry
-        attempt_record.feedback = verification_retry.feedback or attempt_record.feedback
-        if verification_retry.feedback:
-            attempt_record.error = " | ".join(
-                part for part in [attempt_record.error, verification_retry.feedback]
-                if part
-            )
+        # A failed verifier-only retry must be classified as a new failure.
+        # Falling through here schedules an ordinary executor retry using the
+        # stale VERIFIER_PARSE strategy, which can turn an infrastructure-only
+        # verifier problem into a broad research/synthesis rerun.
+        return await handle_failure(
+            orchestrator,
+            task,
+            subtask,
+            result,
+            verification_retry,
+            attempts_by_subtask,
+        )
+
+    if (
+        correction_decision is not None
+        and correction_decision.handler == CorrectionHandler.RETRY_VERIFICATION
+        and (
+            correction_decision.stop_for_no_progress
+            or correction_decision.stop_for_attempt_budget
+        )
+    ):
+        note = (
+            "Verification infrastructure could not produce a stronger verdict "
+            "within its isolated retry budget. Preserving the usable deliverable "
+            "and completing with explicit verification caveats."
+        )
+        verification = _apply_warning_success(
+            result=result,
+            verification=verification,
+            note=note,
+        )
+        metadata = (
+            dict(verification.metadata)
+            if isinstance(verification.metadata, dict)
+            else {}
+        )
+        metadata["verifier_retry_exhausted"] = True
+        metadata["completion_disposition"] = "completed_with_caveats"
+        verification.metadata = metadata
+        await orchestrator._handle_success(task, subtask, result, verification)
+        return None
 
     resolution_plan = ""
     if (
@@ -1078,6 +1188,7 @@ async def handle_failure(
             task.metadata = metadata
         no_progress_exhausted = (
             correction_decision.stop_for_no_progress
+            or correction_decision.stop_for_attempt_budget
             or correction_decision.state
             in {CorrectionState.TERMINAL, CorrectionState.HUMAN_REQUIRED}
         )
@@ -1143,6 +1254,7 @@ async def handle_failure(
             CorrectionHandler.PLACEHOLDER_PREPASS,
             CorrectionHandler.RETRY_VERIFICATION,
             CorrectionHandler.SCHEMA_REPAIR,
+            CorrectionHandler.CONTRACT_REPAIR,
             CorrectionHandler.SOURCE_FALLBACK,
         }
     ):

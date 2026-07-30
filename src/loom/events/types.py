@@ -112,6 +112,7 @@ PLACEHOLDER_REMEDIATION_UNRESOLVED = "placeholder_remediation_unresolved"
 CORRECTION_DETECTED = "correction_detected"
 CORRECTION_PLANNED = "correction_planned"
 CORRECTION_PROGRESS = "correction_progress"
+CORRECTION_ACTION_APPLIED = "correction_action_applied"
 CORRECTION_RESOLVED = "correction_resolved"
 CORRECTION_TERMINAL = "correction_terminal"
 
@@ -265,6 +266,7 @@ EVENT_LIFECYCLE: dict[str, EventLifecycle] = {
     CORRECTION_DETECTED: "active",
     CORRECTION_PLANNED: "active",
     CORRECTION_PROGRESS: "active",
+    CORRECTION_ACTION_APPLIED: "active",
     CORRECTION_RESOLVED: "active",
     CORRECTION_TERMINAL: "active",
     # Iteration events

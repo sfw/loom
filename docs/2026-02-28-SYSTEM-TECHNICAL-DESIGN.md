@@ -277,12 +277,36 @@ before the final turns. Exhaustion emits the canonical
 `runner_tool_budget_exhausted` signal rather than a verifier-invented label.
 
 CSV field-count/schema mismatches use a dedicated `schema_repair` cycle. Failed syntax
-checks identify the existing files to edit; a bounded planner call produces the repair
-plan, and the executor receives guardrails to preserve the canonical header and valid
-values, fix only delimiter/quoting/escaping/field-placement errors in place, avoid
-repeating research or creating versioned copies, and finish with deterministic schema
-verification. Schema repair draws from the correction reserve so an unrelated earlier
-semantic retry does not make a mechanical output defect terminal.
+checks emit machine-readable target, row, actual-width, and expected-width diagnostics.
+A narrow correction executor repairs only provably safe cases (currently surplus
+trailing empty fields) atomically and re-runs verification without restarting research.
+Ambiguous cases retain bounded LLM repair with guardrails to preserve the canonical
+header and valid values, fix only delimiter/quoting/escaping/field-placement errors in
+place, avoid creating versioned copies, and finish with deterministic schema
+verification. Repair transactions allow multiple edits to the same canonical artifact
+before one reseal. Schema repair draws from the correction reserve so an unrelated
+earlier semantic retry does not make a mechanical output defect terminal.
+
+Structured contract gaps use `contract_repair`, while output ownership/path failures
+use `output_reroute`; neither is collapsed into a generic retry. Correction convergence
+is bounded across the whole subtask, not only one reason-code cycle. The controller
+also carries no-progress state across different reason codes that select the same
+repair lane. Changing blocker labels therefore cannot reset recovery indefinitely.
+When a verifier returns several failed checks, each check is normalized independently
+and the complete blocker set is persisted in one correction decision instead of
+serializing one newly discovered gap per retry.
+
+Verification-only recovery is mutually exclusive with executor recovery. A failed
+verifier rerun is sent back through blocker classification using the new result; it
+cannot fall through with the stale verifier-failure strategy and accidentally schedule
+a broad executor pass. If that verifier-only lane exhausts its bounded attempts while
+usable deliverables exist, the subtask completes with explicit caveats rather than
+discarding the work.
+
+After a runner pass writes every expected canonical deliverable, normal and repair
+transactions both enter text-only completion mode. Artifact tools are removed for the
+remainder of the pass, preventing post-seal write loops while still allowing the model
+to return its completion summary.
 
 Within one runner pass, a URL that returns a terminal method-level response (401, 403,
 404, 410, anti-bot denial, or login requirement) is marked exhausted for `web_fetch`.
@@ -291,6 +315,8 @@ search or another public source; query/extraction hints do not bypass this guard
 
 Within that control plane, `_handle_failure` maps decisions to existing retry strategies:
 - `generic`
+- `contract_repair`
+- `output_reroute`
 - `rate_limit`
 - `schema_repair`
 - `verifier_parse`

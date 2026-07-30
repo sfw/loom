@@ -30,10 +30,15 @@ class CorrectionController:
         emit: Callable[[str, str, dict], None],
         *,
         max_no_progress_attempts: int = 2,
+        max_total_attempts_per_subtask: int = 6,
     ) -> None:
         self._memory = memory
         self._emit = emit
         self._max_no_progress_attempts = max(1, int(max_no_progress_attempts))
+        self._max_total_attempts_per_subtask = max(
+            1,
+            int(max_total_attempts_per_subtask),
+        )
 
     async def record_failure(
         self,
@@ -69,16 +74,47 @@ class CorrectionController:
         previous = await self._memory.get_correction_cycle(cycle_id=cycle_id)
         if not isinstance(previous, dict):
             previous = None
+        existing_cycles = await self._memory.list_correction_cycles(
+            task_id=task_id,
+            subtask_id=subtask_id,
+        )
+        recent_same_lane = next(
+            (
+                item
+                for item in reversed(existing_cycles)
+                if isinstance(item, dict)
+                and str(item.get("id", "") or "") != cycle_id
+                and str(item.get("handler", "") or "") == handler.value
+                and str(item.get("state", "") or "") not in {"resolved"}
+            ),
+            None,
+        )
+        comparison_cycle = previous or recent_same_lane
         previous_progress = ProgressVector.from_dict(
-            previous.get("latest_progress") if previous else None
+            comparison_cycle.get("latest_progress") if comparison_cycle else None
         )
         progress_made = progress.improved_from(previous_progress)
-        previous_stalled = int((previous or {}).get("no_progress_count", 0) or 0)
+        previous_stalled = int(
+            (comparison_cycle or {}).get("no_progress_count", 0) or 0
+        )
         no_progress_count = 0 if progress_made else previous_stalled + 1
         stop_for_no_progress = no_progress_count >= self._max_no_progress_attempts
+        total_prior_attempts = sum(
+            int(item.get("attempt_count", 0) or 0)
+            for item in existing_cycles
+            if isinstance(item, dict)
+        )
+        total_attempt_count = total_prior_attempts + 1
+        stop_for_attempt_budget = (
+            total_attempt_count >= self._max_total_attempts_per_subtask
+        )
         state = (
             CorrectionState.TERMINAL
-            if repairability == Repairability.TERMINAL or stop_for_no_progress
+            if (
+                repairability == Repairability.TERMINAL
+                or stop_for_no_progress
+                or stop_for_attempt_budget
+            )
             else (
                 CorrectionState.HUMAN_REQUIRED
                 if repairability == Repairability.HUMAN_REQUIRED
@@ -97,6 +133,8 @@ class CorrectionController:
             progress_made=progress_made,
             no_progress_count=no_progress_count,
             stop_for_no_progress=stop_for_no_progress,
+            total_attempt_count=total_attempt_count,
+            stop_for_attempt_budget=stop_for_attempt_budget,
         )
 
         await self._memory.upsert_correction_cycle(
@@ -123,7 +161,15 @@ class CorrectionController:
             terminal_reason=(
                 "no_progress"
                 if stop_for_no_progress
-                else ("non_repairable_blocker" if state == CorrectionState.TERMINAL else "")
+                else (
+                    "repair_attempt_budget_exhausted"
+                    if stop_for_attempt_budget
+                    else (
+                        "non_repairable_blocker"
+                        if state == CorrectionState.TERMINAL
+                        else ""
+                    )
+                )
             ),
         )
         attempt_id = await self._memory.insert_correction_attempt(
@@ -138,7 +184,11 @@ class CorrectionController:
             after_progress=progress.to_dict(),
             progress_made=progress_made,
             outcome="terminal" if state == CorrectionState.TERMINAL else "planned",
-            metadata={"no_progress_count": no_progress_count},
+            metadata={
+                "no_progress_count": no_progress_count,
+                "total_attempt_count": total_attempt_count,
+                "max_total_attempts_per_subtask": self._max_total_attempts_per_subtask,
+            },
         )
         for sequence, action in enumerate(actions, start=1):
             await self._memory.insert_correction_action(
@@ -173,7 +223,15 @@ class CorrectionController:
         await self._memory.update_correction_cycle_state(
             cycle_id=decision.cycle_id,
             state=state.value,
-            terminal_reason="no_progress" if decision.stop_for_no_progress else "",
+            terminal_reason=(
+                "no_progress"
+                if decision.stop_for_no_progress
+                else (
+                    "repair_attempt_budget_exhausted"
+                    if decision.stop_for_attempt_budget
+                    else ""
+                )
+            ),
         )
 
     async def resolve_subtask(self, *, task_id: str, subtask_id: str) -> None:
@@ -235,4 +293,6 @@ class CorrectionController:
             "progress_made": decision.progress_made,
             "no_progress_count": decision.no_progress_count,
             "stop_for_no_progress": decision.stop_for_no_progress,
+            "total_attempt_count": decision.total_attempt_count,
+            "stop_for_attempt_budget": decision.stop_for_attempt_budget,
         }

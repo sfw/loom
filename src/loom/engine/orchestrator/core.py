@@ -21,7 +21,7 @@ from loom.config import Config
 
 if TYPE_CHECKING:
     from loom.processes.schema import IterationPolicy, ProcessDefinition
-from loom.engine.correction import CorrectionController
+from loom.engine.correction import CorrectionController, CorrectionExecutor
 from loom.engine.iteration_gates import IterationEvaluation, IterationGateEvaluator
 from loom.engine.runner import SubtaskResult, SubtaskRunner, ToolCallRecord
 from loom.engine.scheduler import Scheduler
@@ -240,7 +240,12 @@ class Orchestrator:
             max_no_progress_attempts=int(
                 getattr(config.verification, "resilience_no_progress_attempts", 2) or 2
             ),
+            max_total_attempts_per_subtask=(
+                int(getattr(config.execution, "max_subtask_retries", 3) or 0)
+                + int(getattr(config.execution, "max_correction_retries", 3) or 0)
+            ),
         )
+        self._correction_executor = CorrectionExecutor()
         self._state_lock = asyncio.Lock()
         self._changelog_cache: dict[str, ChangeLog] = {}
         self._telemetry_rollup: dict[str, int] = self._new_telemetry_rollup()

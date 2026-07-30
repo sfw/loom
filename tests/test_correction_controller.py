@@ -127,9 +127,168 @@ class TestHistoricalFailureReplay:
         assert decision.handler == CorrectionHandler.SCHEMA_REPAIR
         assert decision.actions[0].action_type == "repair_structured_output_schema"
         assert decision.actions[0].arguments["targets"] == ["comparison-matrix.csv"]
+        assert decision.actions[0].arguments["diagnostics"] == [{
+            "target": "comparison-matrix.csv",
+            "row_number": 8,
+            "actual_columns": 13,
+            "expected_columns": 11,
+        }]
         assert "edit the existing structured output in place" in (
             decision.actions[0].arguments["guardrails"]
         )
+
+    async def test_mixed_failed_checks_are_classified_in_one_pass(
+        self,
+        correction_runtime,
+    ):
+        _database, _memory, controller, _events = correction_runtime
+        verification = VerificationResult(
+            tier=1,
+            passed=False,
+            outcome="fail",
+            reason_code="verification_failed",
+            severity_class="semantic",
+            feedback="The deliverables have multiple independently repairable gaps.",
+            checks=[
+                Check(
+                    name="syntax_competitors.csv",
+                    passed=False,
+                    detail=(
+                        "reason_code=csv_schema_mismatch; "
+                        "CSV row 3 has 8 columns (expected 7)."
+                    ),
+                ),
+                Check(
+                    name="market_recommendations",
+                    passed=False,
+                    detail=(
+                        "reason_code=missing_market_specific_recommendations; "
+                        "market-specific recommendations are required."
+                    ),
+                ),
+            ],
+        )
+
+        decision = await controller.record_failure(
+            task_id="task-1",
+            run_id="run-1",
+            subtask_id="competitive-research",
+            result=_result(),
+            verification=verification,
+        )
+
+        assert {blocker.code for blocker in decision.blockers} == {
+            "csv_schema_mismatch",
+            "missing_market_specific_recommendations",
+        }
+        assert decision.handler == CorrectionHandler.SCHEMA_REPAIR
+        assert decision.actions[0].arguments["diagnostics"] == [{
+            "target": "competitors.csv",
+            "row_number": 3,
+            "actual_columns": 8,
+            "expected_columns": 7,
+        }]
+
+    async def test_same_repair_lane_tracks_no_progress_across_reason_changes(
+        self,
+        correction_runtime,
+    ):
+        _database, _memory, controller, _events = correction_runtime
+
+        first = await controller.record_failure(
+            task_id="task-1",
+            run_id="run-1",
+            subtask_id="environmental-scan",
+            result=_result(),
+            verification=VerificationResult(
+                tier=1,
+                passed=False,
+                outcome="fail",
+                reason_code="aggregate_scan_not_zonal",
+            ),
+        )
+        second = await controller.record_failure(
+            task_id="task-1",
+            run_id="run-1",
+            subtask_id="environmental-scan",
+            result=_result(),
+            verification=VerificationResult(
+                tier=1,
+                passed=False,
+                outcome="fail",
+                reason_code="missing_leading_indicators_and_geographic_granularity",
+            ),
+        )
+        third = await controller.record_failure(
+            task_id="task-1",
+            run_id="run-1",
+            subtask_id="environmental-scan",
+            result=_result(),
+            verification=VerificationResult(
+                tier=1,
+                passed=False,
+                outcome="fail",
+                reason_code="missing_leading_indicators_and_geographic_granularity",
+            ),
+        )
+
+        assert first.handler == second.handler == CorrectionHandler.CONTRACT_REPAIR
+        assert first.cycle_id != second.cycle_id
+        assert second.no_progress_count == 1
+        assert third.stop_for_no_progress is True
+
+    async def test_subtask_wide_attempt_budget_spans_changing_blockers(
+        self,
+        correction_runtime,
+    ):
+        _database, memory, _controller, events = correction_runtime
+        controller = CorrectionController(
+            memory,
+            lambda event_type, task_id, data: events.append(
+                (event_type, task_id, data),
+            ),
+            max_no_progress_attempts=5,
+            max_total_attempts_per_subtask=2,
+        )
+
+        first = await controller.record_failure(
+            task_id="task-1",
+            run_id="run-1",
+            subtask_id="risk-register",
+            result=_result(),
+            verification=VerificationResult(
+                tier=1,
+                passed=False,
+                outcome="fail",
+                reason_code="csv_schema_mismatch",
+                feedback="CSV row 2 has 4 columns (expected 3).",
+                checks=[
+                    Check(
+                        name="syntax_risk-register.csv",
+                        passed=False,
+                        detail="CSV row 2 has 4 columns (expected 3).",
+                    ),
+                ],
+            ),
+        )
+        second = await controller.record_failure(
+            task_id="task-1",
+            run_id="run-1",
+            subtask_id="risk-register",
+            result=_result(),
+            verification=VerificationResult(
+                tier=1,
+                passed=False,
+                outcome="partial_verified",
+                reason_code="missing_structured_leading_indicators",
+                feedback="A required structured field remains missing.",
+            ),
+        )
+
+        assert first.state == CorrectionState.PLANNED
+        assert second.total_attempt_count == 2
+        assert second.stop_for_attempt_budget is True
+        assert second.state == CorrectionState.TERMINAL
 
     async def test_open_ended_budget_label_routes_to_checkpoint_continuation(
         self,
@@ -207,7 +366,8 @@ class TestHistoricalFailureReplay:
         )
 
         assert decision.repairability == Repairability.AUTOMATIC
-        assert decision.handler == CorrectionHandler.PLACEHOLDER_PREPASS
+        assert decision.handler == CorrectionHandler.CONTRACT_REPAIR
+        assert decision.actions[0].action_type == "repair_structured_output_contract"
 
     async def test_integrity_failure_is_not_auto_healed(self, correction_runtime):
         _database, _memory, controller, events = correction_runtime

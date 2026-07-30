@@ -23,6 +23,7 @@ class BlockerClass(StrEnum):
     TOOL_FAILURE = "tool_failure"
     ARTIFACT_MISSING = "artifact_missing"
     ARTIFACT_SCHEMA = "artifact_schema"
+    ARTIFACT_CONTRACT = "artifact_contract"
     ARTIFACT_WRITE_POLICY = "artifact_write_policy"
     EVIDENCE_GAP = "evidence_gap"
     SEMANTIC_GAP = "semantic_gap"
@@ -54,6 +55,7 @@ class CorrectionState(StrEnum):
 class CorrectionHandler(StrEnum):
     RETRY_EXECUTION = "retry_execution"
     SCHEMA_REPAIR = "schema_repair"
+    CONTRACT_REPAIR = "contract_repair"
     OUTPUT_REROUTE = "output_reroute"
     RETRY_VERIFICATION = "retry_verification"
     CONTEXT_REFRESH = "context_refresh"
@@ -89,6 +91,7 @@ class Blocker:
     @property
     def fingerprint(self) -> str:
         payload = {
+            "code": self.code,
             "blocker_class": self.blocker_class.value,
             "source": self.source,
         }
@@ -186,6 +189,8 @@ class CorrectionDecision:
     progress_made: bool
     no_progress_count: int
     stop_for_no_progress: bool
+    total_attempt_count: int = 0
+    stop_for_attempt_budget: bool = False
 
     @property
     def blocker_fingerprint(self) -> str:

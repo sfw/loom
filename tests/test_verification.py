@@ -877,6 +877,13 @@ class TestDeterministicVerifier:
         result = await v.verify(_make_subtask(), "output", [tc], tmp_path)
         assert not result.passed
         assert result.reason_code == "csv_schema_mismatch"
+        assert result.metadata["missing_targets"] == ["bad.csv"]
+        assert result.metadata["schema_diagnostics"] == [{
+            "target": "bad.csv",
+            "row_number": 3,
+            "actual_columns": 2,
+            "expected_columns": 3,
+        }]
         assert any(
             (c.detail or "").find("reason_code=csv_schema_mismatch") >= 0
             for c in result.checks

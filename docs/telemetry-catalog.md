@@ -133,6 +133,7 @@ Self-correction is auditable through:
 - `correction_detected`
 - `correction_planned`
 - `correction_progress`
+- `correction_action_applied`
 - `correction_resolved`
 - `correction_terminal`
 
