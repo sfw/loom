@@ -78,6 +78,17 @@ class TestSchedulerNextRunnable:
         assert len(runnable) == 1
         assert runnable[0].id == "b"
 
+    def test_partial_checkpoint_unlocks_dependent_work(self):
+        scheduler = Scheduler()
+        plan = _plan(
+            _subtask("a", status="partial"),
+            _subtask("b", depends_on=["a"]),
+        )
+
+        runnable = scheduler.runnable_subtasks(plan)
+
+        assert [subtask.id for subtask in runnable] == ["b"]
+
     def test_multiple_deps_must_all_complete(self):
         scheduler = Scheduler()
         plan = _plan(
@@ -137,6 +148,18 @@ class TestSchedulerRunnableSubtasks:
             _subtask("synthesize", is_synthesis=True),
         )
         runnable = scheduler.runnable_subtasks(plan)
+        assert [s.id for s in runnable] == ["synthesize"]
+
+    def test_synthesis_runs_with_explicit_partial_inputs(self):
+        scheduler = Scheduler()
+        plan = _plan(
+            _subtask("prep-a", status="completed"),
+            _subtask("prep-b", status="partial"),
+            _subtask("synthesize", is_synthesis=True),
+        )
+
+        runnable = scheduler.runnable_subtasks(plan)
+
         assert [s.id for s in runnable] == ["synthesize"]
 
     def test_non_terminal_synthesis_is_not_globally_gated(self):

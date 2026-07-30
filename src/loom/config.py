@@ -212,6 +212,7 @@ class WorkspaceConfig:
 @dataclass(frozen=True)
 class ExecutionConfig:
     max_subtask_retries: int = 3
+    max_correction_retries: int = 3
     max_loop_iterations: int = 50
     max_parallel_subtasks: int = 5
     auto_approve_confidence_threshold: float = 0.8
@@ -248,6 +249,8 @@ class ExecutionConfig:
     enable_durable_task_runner: bool = True
     enable_mutation_idempotency: bool = False
     sealed_artifact_post_call_guard: str = "warn"  # off | warn | enforce
+    runner_checkpoint_reserve_iterations: int = 2
+    noncatastrophic_outcome: str = "degraded"  # degraded | paused
     enable_slo_metrics: bool = False
     delegate_task_timeout_seconds: int = 14_400
     ask_user_v2_enabled: bool = True
@@ -420,7 +423,7 @@ class RunnerLimitsConfig:
     minimal_text_output_chars: int = 260
     tool_call_argument_context_chars: int = 700
     compact_tool_call_argument_chars: int = 1600
-    runner_compaction_policy_mode: str = "off"  # "legacy" | "tiered" | "off"
+    runner_compaction_policy_mode: str = "hybrid"
     enable_filetype_ingest_router: bool = True
     enable_artifact_telemetry_events: bool = True
     artifact_telemetry_max_metadata_chars: int = 1200
@@ -833,6 +836,13 @@ def load_config(path: Path | None = None) -> Config:
             "max_subtask_retries",
             ExecutionConfig.max_subtask_retries,
         ),
+        max_correction_retries=_int_from(
+            exec_data,
+            "max_correction_retries",
+            ExecutionConfig.max_correction_retries,
+            minimum=0,
+            maximum=20,
+        ),
         max_loop_iterations=exec_data.get(
             "max_loop_iterations",
             ExecutionConfig.max_loop_iterations,
@@ -960,6 +970,19 @@ def load_config(path: Path | None = None) -> Config:
             exec_data.get(
                 "sealed_artifact_post_call_guard",
                 ExecutionConfig.sealed_artifact_post_call_guard,
+            ),
+        ).strip().lower(),
+        runner_checkpoint_reserve_iterations=_int_from(
+            exec_data,
+            "runner_checkpoint_reserve_iterations",
+            ExecutionConfig.runner_checkpoint_reserve_iterations,
+            minimum=1,
+            maximum=20,
+        ),
+        noncatastrophic_outcome=str(
+            exec_data.get(
+                "noncatastrophic_outcome",
+                ExecutionConfig.noncatastrophic_outcome,
             ),
         ).strip().lower(),
         enable_slo_metrics=_bool_from(
@@ -1129,6 +1152,9 @@ def load_config(path: Path | None = None) -> Config:
     planner_mode = execution.planner_degraded_mode
     if planner_mode not in {"allow", "require_approval", "deny"}:
         planner_mode = ExecutionConfig.planner_degraded_mode
+    noncatastrophic_outcome = execution.noncatastrophic_outcome
+    if noncatastrophic_outcome not in {"degraded", "paused"}:
+        noncatastrophic_outcome = ExecutionConfig.noncatastrophic_outcome
     cowork_tool_exposure_mode = execution.cowork_tool_exposure_mode
     if cowork_tool_exposure_mode not in {"full", "adaptive", "hybrid"}:
         cowork_tool_exposure_mode = ExecutionConfig.cowork_tool_exposure_mode
@@ -1176,6 +1202,7 @@ def load_config(path: Path | None = None) -> Config:
             "executor_completion_contract_mode": completion_mode,
             "sealed_artifact_post_call_guard": sealed_artifact_post_call_guard,
             "planner_degraded_mode": planner_mode,
+            "noncatastrophic_outcome": noncatastrophic_outcome,
             "cowork_tool_exposure_mode": cowork_tool_exposure_mode,
             "cowork_memory_index_queue_max_batches": cowork_memory_index_queue_max_batches,
             "cowork_memory_index_section_limit": cowork_memory_index_section_limit,
@@ -1605,7 +1632,14 @@ def load_config(path: Path | None = None) -> Config:
             RunnerLimitsConfig.runner_compaction_policy_mode,
         ),
     ).strip().lower()
-    if runner_compaction_policy_mode not in {"legacy", "tiered", "off"}:
+    if runner_compaction_policy_mode not in {
+        "hybrid",
+        "deterministic",
+        "semantic",
+        "legacy",
+        "tiered",
+        "off",
+    }:
         runner_compaction_policy_mode = RunnerLimitsConfig.runner_compaction_policy_mode
     compaction_pressure_ratio_soft = _float_from(
         runner_limits_data,

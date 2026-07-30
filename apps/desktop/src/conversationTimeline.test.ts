@@ -454,7 +454,7 @@ describe("conversationTimeline", () => {
     const liveItems = buildConversationTimelineItems([
       makeEvent(1, "user_message", { text: "tell me again" }),
       makeEvent(2, "user_message", { text: "tell me again" }),
-      makeEvent(3, "assistant_text", { text: "Based on my research, here's the easiest" }),
+      makeEvent(3, "assistant_text", { text: "Based on synthetic research, the next step" }),
       makeEvent(4, "turn_separator", { tokens: 42, tool_count: 0 }),
     ]);
     const historicalItems = buildConversationMessageTimelineItems([
@@ -464,7 +464,7 @@ describe("conversationTimeline", () => {
       makeMessage(
         4,
         "assistant",
-        "Based on my research, here's the easiest way to get a meeting with Blink49 at Banff.",
+        "Based on synthetic research, the next step is to contact Example Studios about Summit Festival.",
         "2026-03-29T12:00:03Z",
       ),
     ]);

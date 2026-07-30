@@ -24,11 +24,14 @@ def new_subtask_telemetry_counters() -> dict[str, int]:
     return {
         "model_invocations": 0,
         "tool_calls": 0,
+        "tool_failures": 0,
+        "read_cache_hits": 0,
         "mutating_tool_calls": 0,
         "artifact_ingests": 0,
         "artifact_reads": 0,
         "artifact_retention_deletes": 0,
         "compaction_policy_decisions": 0,
+        "degraded_fit_count": 0,
         "overflow_fallback_count": 0,
         "compactor_warning_count": 0,
         "sealed_policy_preflight_blocked": 0,
@@ -455,9 +458,18 @@ def emit_compaction_policy_decision_from_diagnostics(
             "tool_schema_pruned": bool(
                 diagnostics.get("compaction_tool_schema_pruned", False),
             ),
+            "process_tool_scope": (
+                dict(diagnostics.get("process_tool_scope", {}))
+                if isinstance(diagnostics.get("process_tool_scope"), dict)
+                else {}
+            ),
         },
         counter_key="compaction_policy_decisions",
     )
+    if str(diagnostics.get("compaction_terminal_state", "") or "").strip().lower() == (
+        "degraded_fit"
+    ):
+        increment_subtask_counter(runner, "degraded_fit_count")
 
 
 def emit_overflow_fallback_telemetry(

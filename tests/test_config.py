@@ -28,6 +28,7 @@ class TestDefaultConfig:
     def test_default_execution(self):
         config = Config()
         assert config.execution.max_subtask_retries == 3
+        assert config.execution.max_correction_retries == 3
         assert config.execution.max_loop_iterations == 50
         assert config.execution.max_parallel_subtasks == 5
         assert config.execution.auto_approve_confidence_threshold == 0.8
@@ -42,6 +43,8 @@ class TestDefaultConfig:
         assert config.execution.max_task_remediation_attempts == 0
         assert config.execution.executor_completion_contract_mode == "off"
         assert config.execution.sealed_artifact_post_call_guard == "warn"
+        assert config.execution.runner_checkpoint_reserve_iterations == 2
+        assert config.execution.noncatastrophic_outcome == "degraded"
         assert config.execution.planner_degraded_mode == "allow"
         assert config.execution.enable_sqlite_remediation_queue is False
         assert config.execution.enable_durable_task_runner is True
@@ -154,7 +157,7 @@ class TestDefaultConfig:
         assert config.limits.adhoc_repair_source_max_chars == 0
         assert config.limits.evidence_context_text_max_chars == 8192
         assert config.limits.runner.default_tool_result_output_chars == 2800
-        assert config.limits.runner.runner_compaction_policy_mode == "off"
+        assert config.limits.runner.runner_compaction_policy_mode == "hybrid"
         assert config.limits.runner.enable_filetype_ingest_router is True
         assert config.limits.runner.enable_artifact_telemetry_events is True
         assert config.limits.runner.artifact_telemetry_max_metadata_chars == 1200
@@ -367,6 +370,9 @@ enable_sqlite_remediation_queue = true
 enable_durable_task_runner = true
 enable_mutation_idempotency = true
 sealed_artifact_post_call_guard = "enforce"
+max_correction_retries = 5
+runner_checkpoint_reserve_iterations = 4
+noncatastrophic_outcome = "paused"
 enable_slo_metrics = true
 ask_user_v2_enabled = true
 ask_user_runtime_blocking_enabled = true
@@ -403,6 +409,9 @@ cowork_recall_index_max_chars = 1900
         assert config.execution.enable_durable_task_runner is True
         assert config.execution.enable_mutation_idempotency is True
         assert config.execution.sealed_artifact_post_call_guard == "enforce"
+        assert config.execution.max_correction_retries == 5
+        assert config.execution.runner_checkpoint_reserve_iterations == 4
+        assert config.execution.noncatastrophic_outcome == "paused"
         assert config.execution.enable_slo_metrics is True
         assert config.execution.ask_user_v2_enabled is True
         assert config.execution.ask_user_runtime_blocking_enabled is True
@@ -846,6 +855,33 @@ runner_compaction_policy_mode = "off"
         config = load_config(toml_file)
         assert config.limits.runner.runner_compaction_policy_mode == "off"
 
+    def test_load_runner_compaction_policy_mode_deterministic(self, tmp_path: Path):
+        toml_file = tmp_path / "loom.toml"
+        toml_file.write_text("""\
+[limits.runner]
+runner_compaction_policy_mode = "deterministic"
+""")
+        config = load_config(toml_file)
+        assert config.limits.runner.runner_compaction_policy_mode == "deterministic"
+
+    def test_load_runner_compaction_policy_mode_hybrid(self, tmp_path: Path):
+        toml_file = tmp_path / "loom.toml"
+        toml_file.write_text("""\
+[limits.runner]
+runner_compaction_policy_mode = "hybrid"
+""")
+        config = load_config(toml_file)
+        assert config.limits.runner.runner_compaction_policy_mode == "hybrid"
+
+    def test_load_runner_compaction_policy_mode_semantic(self, tmp_path: Path):
+        toml_file = tmp_path / "loom.toml"
+        toml_file.write_text("""\
+[limits.runner]
+runner_compaction_policy_mode = "semantic"
+""")
+        config = load_config(toml_file)
+        assert config.limits.runner.runner_compaction_policy_mode == "semantic"
+
     def test_invalid_runner_compaction_policy_mode_falls_back(self, tmp_path: Path):
         toml_file = tmp_path / "loom.toml"
         toml_file.write_text("""\
@@ -853,7 +889,7 @@ runner_compaction_policy_mode = "off"
 runner_compaction_policy_mode = "invalid-mode"
 """)
         config = load_config(toml_file)
-        assert config.limits.runner.runner_compaction_policy_mode == "off"
+        assert config.limits.runner.runner_compaction_policy_mode == "hybrid"
 
     def test_can_disable_artifact_telemetry_events(self, tmp_path: Path):
         toml_file = tmp_path / "loom.toml"

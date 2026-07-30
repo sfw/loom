@@ -46,7 +46,7 @@ class Scheduler:
 
     @staticmethod
     def _deps_met(plan: Plan, subtask: Subtask) -> bool:
-        """Check if all dependencies are completed."""
+        """Check if all dependencies produced usable output."""
         if not subtask.depends_on:
             deps_satisfied = True
         else:
@@ -57,7 +57,10 @@ class Scheduler:
                     if s.id == dep_id:
                         dep = s
                         break
-                if dep is None or dep.status != SubtaskStatus.COMPLETED:
+                if dep is None or dep.status not in {
+                    SubtaskStatus.COMPLETED,
+                    SubtaskStatus.PARTIAL,
+                }:
                     deps_satisfied = False
                     break
 
@@ -71,7 +74,10 @@ class Scheduler:
             for candidate in plan.subtasks:
                 if candidate.id == subtask.id or candidate.is_synthesis:
                     continue
-                if candidate.status != SubtaskStatus.COMPLETED:
+                if candidate.status not in {
+                    SubtaskStatus.COMPLETED,
+                    SubtaskStatus.PARTIAL,
+                }:
                     return False
 
         return True

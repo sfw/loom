@@ -1041,6 +1041,8 @@ def _augment_retry_context_for_outputs(
             )
     if (
         strategy in {
+            RetryStrategy.CONTRACT_REPAIR,
+            RetryStrategy.OUTPUT_REROUTE,
             RetryStrategy.RATE_LIMIT,
             RetryStrategy.EVIDENCE_GAP,
             RetryStrategy.UNCONFIRMED_DATA,
@@ -1065,6 +1067,15 @@ def _apply_finalization_outcome(self, task: Task) -> None:
     """Apply final task status, telemetry, and event emissions before persistence."""
     completed, total = task.progress
     run_validity_summary = self._refresh_run_validity_scorecard(task)
+    correction_states = getattr(self, "_task_correction_cycle_states", {}).get(
+        task.id,
+        {},
+    )
+    open_correction_cycles = sorted(
+        cycle_id
+        for cycle_id, state in correction_states.items()
+        if str(state or "").strip().lower() not in {"resolved", "terminal"}
+    )
     blocking_remediation_failures: list[str] = []
     blocked_subtasks: list[dict[str, object]] = []
     raw_blocked_subtasks = task.metadata.get("blocked_subtasks")
@@ -1111,11 +1122,12 @@ def _apply_finalization_outcome(self, task: Task) -> None:
                     label,
                 )
 
-    all_done = (
-        completed == total
-        and total > 0
-        and not blocking_remediation_failures
-    )
+    catastrophic = bool(task.metadata.get("catastrophic_failure"))
+    noncatastrophic_outcome = str(
+        getattr(self._config.execution, "noncatastrophic_outcome", "degraded")
+    ).strip().lower()
+    if noncatastrophic_outcome not in {"degraded", "paused"}:
+        noncatastrophic_outcome = "degraded"
 
     if task.status == TaskStatus.CANCELLED:
         for s in task.plan.subtasks:
@@ -1130,46 +1142,158 @@ def _apply_finalization_outcome(self, task: Task) -> None:
             "reason": cancel_reason or "cancel_requested",
             "outcome": "cancelled",
         })
-    elif all_done:
-        task.status = TaskStatus.COMPLETED
-        task.completed_at = datetime.now().isoformat()
-        self._emit(TASK_COMPLETED, task.id, {
-            "completed": completed,
-            "total": total,
-            "reason": "all_subtasks_completed",
-            "outcome": "completed",
-            "validity_summary": run_validity_summary,
-        })
-    else:
+    elif catastrophic:
         task.status = TaskStatus.FAILED
         failed = [s for s in task.plan.subtasks if s.status == SubtaskStatus.FAILED]
-        failure_reason = "subtask_failure"
-        if blocking_remediation_failures:
-            task.add_error(
-                "remediation",
-                "Blocking remediation unresolved for: "
-                + ", ".join(blocking_remediation_failures),
-            )
-            failure_reason = "blocking_remediation_unresolved"
-        if blocked_subtasks:
-            labels = ", ".join(
-                entry["subtask_id"] for entry in blocked_subtasks
-                if isinstance(entry, dict) and entry.get("subtask_id")
-            )
-            task.add_error(
-                "scheduler",
-                "Execution stalled with blocked pending subtasks: "
-                + (labels or "unknown"),
-            )
-            failure_reason = "blocked_pending_subtasks"
+        task.metadata["completion_grade"] = "catastrophic_failure"
         self._emit(TASK_FAILED, task.id, {
             "completed": completed,
             "total": total,
             "failed_subtasks": [s.id for s in failed],
-            "reason": failure_reason,
+            "reason": "catastrophic_blocker",
             "outcome": "failed",
+            "catastrophic_failure": task.metadata.get("catastrophic_failure"),
+            "validity_summary": run_validity_summary,
+        })
+    elif (
+        task.status == TaskStatus.PAUSED
+        or (
+            noncatastrophic_outcome == "paused"
+            and (
+                any(
+                    subtask.status != SubtaskStatus.COMPLETED
+                    for subtask in task.plan.subtasks
+                )
+                or blocking_remediation_failures
+                or blocked_subtasks
+            )
+        )
+    ):
+        task.status = TaskStatus.PAUSED
+        task.metadata["completion_grade"] = "paused_recoverable"
+        task.metadata["recovery_required"] = True
+        task.metadata["recovery_context"] = {
             "blocking_remediation_failures": blocking_remediation_failures,
             "blocked_subtasks": blocked_subtasks,
+        }
+    else:
+        degraded_reasons: list[str] = []
+        partial_ids: list[str] = [
+            subtask.id
+            for subtask in task.plan.subtasks
+            if subtask.status == SubtaskStatus.PARTIAL
+        ]
+        skipped_ids: list[str] = [
+            subtask.id
+            for subtask in task.plan.subtasks
+            if subtask.status == SubtaskStatus.SKIPPED
+        ]
+
+        for subtask in task.plan.subtasks:
+            if subtask.status in {
+                SubtaskStatus.FAILED,
+                SubtaskStatus.BLOCKED,
+                SubtaskStatus.RUNNING,
+            }:
+                subtask.status = SubtaskStatus.PARTIAL
+                if not subtask.summary:
+                    subtask.summary = (
+                        "Usable checkpoint preserved; remaining verification "
+                        "or recovery work is recorded in run metadata."
+                    )
+                partial_ids.append(subtask.id)
+            elif subtask.status == SubtaskStatus.PENDING:
+                subtask.status = SubtaskStatus.SKIPPED
+                if not subtask.summary:
+                    subtask.summary = (
+                        "Not executed because an upstream recoverable gap "
+                        "exhausted this run's bounded recovery budget."
+                    )
+                skipped_ids.append(subtask.id)
+
+        if partial_ids:
+            degraded_reasons.append("partial_subtasks")
+        if skipped_ids:
+            degraded_reasons.append("skipped_subtasks")
+        if total == 0:
+            degraded_reasons.append("empty_plan")
+        if blocking_remediation_failures:
+            degraded_reasons.append("open_remediation")
+        if blocked_subtasks:
+            degraded_reasons.append("blocked_dependencies")
+        validity_reason_codes = {
+            str(item or "").strip().lower()
+            for item in list(run_validity_summary.get("reason_codes", []))
+            if str(item or "").strip()
+        }
+        if "no_claims_extracted" in validity_reason_codes:
+            degraded_reasons.append("missing_required_claim_evidence")
+        if open_correction_cycles:
+            degraded_reasons.append("open_correction_cycles")
+
+        completed, total = task.progress
+        task.status = TaskStatus.COMPLETED
+        task.completed_at = datetime.now().isoformat()
+        verification_outcome_counts = task.metadata.get(
+            "verification_outcome_counts",
+            {},
+        )
+        if not isinstance(verification_outcome_counts, dict):
+            verification_outcome_counts = {}
+        warning_outcomes = sum(
+            int(verification_outcome_counts.get(key, 0) or 0)
+            for key in ("pass_with_warnings", "partial_verified")
+        )
+        recovered_executor_failures = task.metadata.get(
+            "recovered_executor_failures",
+            [],
+        )
+        if not isinstance(recovered_executor_failures, list):
+            recovered_executor_failures = []
+        completion_grade = (
+            "degraded"
+            if degraded_reasons
+            else (
+                "verified_with_warnings"
+                if warning_outcomes > 0 or recovered_executor_failures
+                else "verified"
+            )
+        )
+        task.metadata["completion_grade"] = completion_grade
+        task.metadata["degraded_completion"] = {
+            "reasons": degraded_reasons,
+            "partial_subtasks": partial_ids,
+            "skipped_subtasks": skipped_ids,
+            "blocking_remediation_failures": blocking_remediation_failures,
+            "blocked_subtasks": blocked_subtasks,
+            "open_correction_cycles": open_correction_cycles,
+            "warning_outcomes": warning_outcomes,
+            "recovered_executor_failures": recovered_executor_failures,
+        }
+        self._emit(TASK_COMPLETED, task.id, {
+            "completed": completed,
+            "total": total,
+            "reason": (
+                "completed_with_recoverable_gaps"
+                if degraded_reasons
+                else (
+                    "completed_with_warnings"
+                    if completion_grade == "verified_with_warnings"
+                    else "all_subtasks_completed"
+                )
+            ),
+            "outcome": (
+                "completed_degraded"
+                if degraded_reasons
+                else (
+                    "completed_with_warnings"
+                    if completion_grade == "verified_with_warnings"
+                    else "completed"
+                )
+            ),
+            "completion_grade": completion_grade,
+            "partial_subtasks": partial_ids,
+            "skipped_subtasks": skipped_ids,
             "validity_summary": run_validity_summary,
         })
 

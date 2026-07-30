@@ -667,7 +667,9 @@ async def test_semantic_compactor_reduction_targets_requested_budget():
     )
 
     assert result == "z" * 150
-    assert model.target_chars[:2] == [164, 200]
+    # The first attempt reserves compliance headroom. The retry adapts from
+    # the observed overshoot instead of shaving a fixed percentage.
+    assert model.target_chars[:2] == [140, 100]
     assert model.hard_limits[:2] == [200, 200]
 
 
@@ -689,7 +691,7 @@ async def test_semantic_compactor_target_and_budget_link_to_hard_limit():
     )
 
     assert result == "ok"
-    assert model.target_chars[:1] == [750]
+    assert model.target_chars[:1] == [700]
     assert model.hard_limits[:1] == [1000]
     expected_budget = compactor._compactor_response_max_tokens(1000, model)
     assert model.max_tokens_seen[:1] == [expected_budget]

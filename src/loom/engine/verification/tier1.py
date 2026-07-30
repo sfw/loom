@@ -82,6 +82,20 @@ class DeterministicVerifier:
     """
 
     _ADVISORY_TOOL_FAILURES = frozenset({"web_fetch", "web_fetch_html", "web_search"})
+    _RESILIENT_EVIDENCE_TOOLS = frozenset({
+        "web_fetch",
+        "web_fetch_html",
+        "web_search",
+        "fact_checker",
+        "conversation_recall",
+        "read_file",
+        "read_artifact",
+        "search_files",
+        "list_directory",
+        "analyze_code",
+        "academic_search",
+        "archive_access",
+    })
     _TOOL_SUCCESS_POLICIES = frozenset({
         "all_tools_hard",
         "development_balanced",
@@ -414,6 +428,31 @@ class DeterministicVerifier:
             )
         if hard_failures and reason_code:
             metadata["hard_failure_reason_code"] = reason_code
+        if reason_code == "csv_schema_mismatch":
+            schema_diagnostics: list[dict[str, object]] = []
+            missing_targets: list[str] = []
+            for check in hard_failures:
+                if not check.name.startswith("syntax_"):
+                    continue
+                target = check.name.removeprefix("syntax_").strip()
+                match = re.search(
+                    r"CSV row\s+(?P<row>\d+)\s+has\s+(?P<actual>\d+)\s+columns?\s+"
+                    r"\(expected\s+(?P<expected>\d+)\)",
+                    str(check.detail or ""),
+                    flags=re.IGNORECASE,
+                )
+                diagnostic: dict[str, object] = {"target": target}
+                if match:
+                    diagnostic.update({
+                        "row_number": int(match.group("row")),
+                        "actual_columns": int(match.group("actual")),
+                        "expected_columns": int(match.group("expected")),
+                    })
+                schema_diagnostics.append(diagnostic)
+                if target and target not in missing_targets:
+                    missing_targets.append(target)
+            metadata["schema_diagnostics"] = schema_diagnostics
+            metadata["missing_targets"] = missing_targets
         if placeholder_findings:
             metadata["placeholder_findings"] = placeholder_findings
             metadata["placeholder_finding_count"] = len(placeholder_findings)
@@ -476,9 +515,20 @@ class DeterministicVerifier:
                 tool_result_data=tool_result_data,
                 error=detail,
             )
-            if method_disposition is not None and (
-                self._tool_success_policy == "method_resilient"
-                or tool_name not in self._ADVISORY_TOOL_FAILURES
+            if (
+                method_disposition is not None
+                and self._tool_success_policy == "method_resilient"
+                and tool_name in self._RESILIENT_EVIDENCE_TOOLS
+            ):
+                return ToolFailureDisposition(
+                    advisory=True,
+                    detail=method_disposition.detail,
+                    reason_code=method_disposition.reason_code,
+                    capability=method_disposition.capability,
+                )
+            if (
+                method_disposition is not None
+                and tool_name not in self._ADVISORY_TOOL_FAILURES
             ):
                 return method_disposition
         if self._is_advisory_tool_failure(tool_name, detail):

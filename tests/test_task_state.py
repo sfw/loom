@@ -109,6 +109,15 @@ class TestTask:
         assert completed == 1
         assert total == 3
 
+    def test_partial_checkpoint_counts_as_usable_progress(self):
+        task = _make_task_with_plan()
+        task.update_subtask("step-2", status=SubtaskStatus.PARTIAL)
+
+        completed, total = task.progress
+
+        assert completed == 2
+        assert total == 3
+
 
 class TestTaskStateManager:
     """Test state file persistence."""

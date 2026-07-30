@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -270,6 +272,62 @@ class TestFactCheckerTool:
         assert len(verdicts) == 1
         assert verdicts[0].get("verdict") in {"supported", "partially_supported"}
 
+    async def test_fact_checker_bounds_and_parallelizes_semantic_claims(
+        self,
+        ctx: ToolContext,
+        workspace: Path,
+        monkeypatch,
+    ):
+        source = workspace / "source.txt"
+        source.write_text(
+            "The source contains enough shared evidence for every bounded claim.",
+            encoding="utf-8",
+        )
+        active = 0
+        max_active = 0
+        calls = 0
+
+        async def _fake_classify(**_kwargs):
+            nonlocal active, max_active, calls
+            calls += 1
+            active += 1
+            max_active = max(max_active, active)
+            await asyncio.sleep(0)
+            active -= 1
+            return {
+                "verdict": "supported",
+                "confidence": 0.9,
+                "rationale": "Supported by the supplied source.",
+                "reason_code": "llm_supported",
+                "evidence_ids": ["S1"],
+            }
+
+        monkeypatch.setattr(
+            "loom.tools.fact_checker._classify_with_llm",
+            _fake_classify,
+        )
+        tool = FactCheckerTool()
+        tool._router = MagicMock()
+        verifier_model = MagicMock()
+        verifier_model.name = "bounded-verifier"
+        tool._router.select.return_value = verifier_model
+
+        claims = [f"Bounded claim {index}" for index in range(10)]
+        result = await tool.execute(
+            {
+                "claims": claims,
+                "sources": ["source.txt"],
+                "semantic_verification": "auto",
+            },
+            ctx,
+        )
+
+        assert result.success
+        assert len(result.data["verdicts"]) == len(claims)
+        assert calls == 6
+        assert 1 < max_active <= 4
+        assert result.data["semantic_claims_scheduled"] == 6
+
 
 class TestPeerReviewSimulatorTool:
     async def test_peer_review_outputs(self, ctx: ToolContext, workspace: Path):
@@ -359,6 +417,21 @@ class TestTimelineVisualizerTool:
 
 
 class TestEconomicDataApiTool:
+    def test_schema_constrains_provider_names(self):
+        tool = EconomicDataApiTool()
+        properties = tool.parameters["properties"]
+
+        assert "statcan" not in properties["provider"]["enum"]
+        assert "statcan" not in properties["providers"]["items"]["enum"]
+        assert set(properties["provider"]["enum"]) == {
+            "world_bank",
+            "oecd",
+            "eurostat",
+            "dbnomics",
+            "bls",
+            "fred",
+        }
+
     async def test_search_with_mock_provider(self, monkeypatch, ctx: ToolContext):
         tool = EconomicDataApiTool()
 

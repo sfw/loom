@@ -91,7 +91,9 @@ def test_validate_sealed_artifact_mutation_policy_allow_and_deny_paths() -> None
     )
 
     assert denied is not None
+    assert "reason_code=artifact_confirmation_required" in denied
     assert "Sealed artifact mutation blocked" in denied
+    assert "report.md" in denied
 
     allowed = runner_policy.validate_sealed_artifact_mutation_policy(
         task=task,  # type: ignore[arg-type]

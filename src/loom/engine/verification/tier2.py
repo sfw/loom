@@ -593,17 +593,18 @@ class LLMVerifier:
                 continue
             if not content:
                 continue
-            excerpt = await self._compact_text(
-                content,
-                max_chars=self._max_artifact_file_excerpt_chars,
-                label=f"verification artifact excerpt ({path.name})",
-            )
             lines.append(f"- {rel}:")
-            lines.append(self._indent_text_block(excerpt, prefix="    "))
+            lines.append(self._indent_text_block(content, prefix="    "))
 
         if len(lines) <= 2:
             return ""
-        return self._hard_cap_text("\n".join(lines), max_chars=max_chars)
+        # Compact the artifact snapshot as one semantic unit. Per-file compaction
+        # multiplied model calls and repeatedly re-summarized the same evidence.
+        return await self._compact_text(
+            "\n".join(lines),
+            max_chars=max_chars,
+            label="verification artifact snapshot batch",
+        )
 
     def _is_advisory_tool_failure(
         self,

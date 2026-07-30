@@ -189,8 +189,22 @@ def next_validation_retry(
                 "Repair the draft below into valid JSON and finish the object."
             )
     elif reason == "output_exceeds_target":
-        target_floor = min(min_compact_target_chars, hard_limit)
-        reduced_target = int(round(next_target_chars * 0.9))
+        target_floor = min(
+            min_compact_target_chars,
+            max(1, int(round(hard_limit * 0.5))),
+        )
+        received_chars = len(parsed or raw)
+        compliance_ratio = (
+            float(hard_limit) / float(received_chars)
+            if received_chars > 0
+            else 0.75
+        )
+        # Use the observed overshoot to leave enough room on the retry instead
+        # of applying a fixed 10% reduction that repeatedly misses by the same
+        # margin.
+        reduced_target = int(
+            round(next_target_chars * min(0.9, compliance_ratio * 0.85)),
+        )
         next_target_chars = max(1, min(hard_limit, max(target_floor, reduced_target)))
         retry_hint = (
             "Previous draft exceeded the hard character limit. Re-compress the "
@@ -258,7 +272,14 @@ async def compact_once(
 ) -> tuple[str, int]:
     requested_max_chars = max(1, int(max_chars))
     hard_limit = compactor_hard_limit_chars(requested_max_chars, model)
-    target_chars = compactor_target_chars(hard_limit)
+    configured_target_chars = compactor_target_chars(hard_limit)
+    # Empirically, targets close to the hard limit cause a validation/retry
+    # loop even when the prompt states the limit clearly. Preserve a 30%
+    # compliance margin; the configured ratio remains an upper bound.
+    target_chars = max(
+        1,
+        min(configured_target_chars, int(round(hard_limit * 0.7))),
+    )
     max_tokens = compactor_response_max_tokens(hard_limit, model)
     system = (
         "You are a semantic context compactor for LLM pipelines. "

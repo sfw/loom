@@ -107,6 +107,22 @@ class TestSubtaskRunnerContextBudget:
         return runner
 
     @staticmethod
+    def _make_runner_for_deterministic_compaction(*, context_budget: int = 2500):
+        runner = TestSubtaskRunnerContextBudget._make_runner_for_tiered_compaction(
+            context_budget=context_budget,
+        )
+        runner._runner_compaction_policy_mode = "deterministic"
+        return runner
+
+    @staticmethod
+    def _make_runner_for_hybrid_compaction(*, context_budget: int = 2500):
+        runner = TestSubtaskRunnerContextBudget._make_runner_for_tiered_compaction(
+            context_budget=context_budget,
+        )
+        runner._runner_compaction_policy_mode = "hybrid"
+        return runner
+
+    @staticmethod
     def _make_runner_for_telemetry():
         from loom.engine.runner import SubtaskRunner
 
@@ -375,14 +391,255 @@ class TestSubtaskRunnerContextBudget:
         assert runner._last_compaction_diagnostics["compaction_skipped_reason"] == "no_pressure"
 
     @pytest.mark.asyncio
+    async def test_deterministic_mode_preserves_exact_salient_and_tail_context(self):
+        runner = self._make_runner_for_deterministic_compaction(context_budget=800)
+        text = "\n".join([
+            "Opening assignment: investigate the release history.",
+            "Background " + ("context " * 120),
+            "Required source: https://example.com/releases/2026-07-10",
+            "Deliverable path: reports/release-audit.md",
+            "More background " + ("detail " * 120),
+            "FINAL CONSTRAINT: do not publish unsupported version claims.",
+        ])
+
+        compacted = await runner._compact_text(
+            text,
+            max_chars=520,
+            label="historical execution context",
+        )
+
+        assert len(compacted) <= 520
+        assert compacted.startswith("Opening assignment:")
+        assert "https://example.com/releases/2026-07-10" in compacted
+        assert "reports/release-audit.md" in compacted
+        assert compacted.endswith(
+            "FINAL CONSTRAINT: do not publish unsupported version claims.",
+        )
+        assert runner._compactor.calls == []
+
+    @pytest.mark.asyncio
+    async def test_deterministic_mode_compacts_near_timeout_without_model_calls(self):
+        runner = self._make_runner_for_deterministic_compaction(context_budget=700)
+        messages = [
+            {"role": "user", "content": "Goal: finish verified report."},
+        ]
+        for index in range(6):
+            messages.extend([
+                {
+                    "role": "assistant",
+                    "content": f"Old context {index} " + ("x " * 1200),
+                },
+                {
+                    "role": "user",
+                    "content": f"Older steering {index} " + ("y " * 900),
+                },
+            ])
+        messages.extend([
+            {"role": "assistant", "content": "LATEST: preserve citations exactly."},
+            {"role": "user", "content": "FINAL: write reports/final.md"},
+        ])
+
+        compacted = await runner._compact_messages_for_model(
+            messages,
+            remaining_seconds=1,
+        )
+
+        assert compacted != messages
+        assert runner._compactor.calls == []
+        assert runner._last_compaction_diagnostics["compaction_compactor_calls"] == 0
+        assert runner._last_compaction_diagnostics["compaction_strategy"] == (
+            "deterministic"
+        )
+        assert runner._last_compaction_diagnostics["compaction_wall_time_ms"] >= 0
+        assert runner._last_compaction_diagnostics["compaction_skipped_reason"] != (
+            "timeout_guard"
+        )
+
+    @pytest.mark.asyncio
+    async def test_semantic_mode_remains_explicit_model_assisted_opt_in(self):
+        runner = self._make_runner_for_tiered_compaction(context_budget=900)
+        runner._runner_compaction_policy_mode = "semantic"
+        messages = [{"role": "user", "content": "Goal: summarize research."}]
+        for index in range(6):
+            messages.extend([
+                {
+                    "role": "assistant",
+                    "content": f"Historical analysis {index} " + ("detail " * 700),
+                },
+                {
+                    "role": "user",
+                    "content": f"Historical steering {index} " + ("context " * 500),
+                },
+            ])
+        messages.append({"role": "user", "content": "LATEST: preserve source IDs."})
+
+        await runner._compact_messages_for_model(messages, remaining_seconds=240)
+
+        assert runner._compactor.calls
+        assert runner._last_compaction_diagnostics["compaction_strategy"] == (
+            "model_assisted"
+        )
+
+    @pytest.mark.asyncio
+    async def test_hybrid_checkpoint_is_single_call_cached_and_anchor_validated(self):
+        runner = self._make_runner_for_hybrid_compaction(context_budget=1200)
+        messages = [{"role": "user", "content": "Goal: prepare the final dossier."}]
+        messages.extend([
+            {
+                "role": "assistant",
+                "content": (
+                    "Primary source https://example.com/report/2026 should support "
+                    "the 47.5% finding and evidence_record-17. " + ("analysis " * 180)
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "Required deliverable reports/final-dossier.md due 2026-07-15. "
+                    + ("context " * 160)
+                ),
+            },
+        ])
+        for index in range(5):
+            messages.extend([
+                {
+                    "role": "assistant",
+                    "content": f"Historical analysis {index} " + ("detail " * 140),
+                },
+                {
+                    "role": "user",
+                    "content": f"Historical steering {index} " + ("background " * 100),
+                },
+            ])
+        messages.extend([
+            {"role": "assistant", "content": "LATEST: preserve verified evidence."},
+            {"role": "user", "content": "FINAL: do not invent missing facts."},
+        ])
+
+        first = await runner._compact_messages_for_model(messages, remaining_seconds=240)
+        second = await runner._compact_messages_for_model(messages, remaining_seconds=240)
+
+        checkpoints = [
+            message["content"]
+            for message in first
+            if isinstance(message, dict)
+            and str(message.get("content", "")).startswith(
+                "Prior semantic context checkpoint",
+            )
+        ]
+        assert len(checkpoints) == 1
+        checkpoint = checkpoints[0]
+        assert "https://example.com/report/2026" in checkpoint
+        assert "47.5%" in checkpoint
+        assert "evidence_record-17" in checkpoint
+        assert "reports/final-dossier.md" in checkpoint
+        assert "2026-07-15" in checkpoint
+        assert len(runner._compactor.calls) == 1
+        assert second == first
+        report = runner._last_compaction_diagnostics["compaction_checkpoint"]
+        assert report["checkpoint_validation_passed"] is True
+        assert report["checkpoint_anchor_missing_after_repair"] == 0
+        assert report["checkpoint_cache_hit"] is True
+        assert report["checkpoint_model_calls"] == 0
+        assert report["checkpoint_source_chars"] <= report["checkpoint_source_limit_chars"]
+
+    @pytest.mark.asyncio
+    async def test_hybrid_rejects_checkpoint_when_exact_anchors_cannot_fit(self):
+        runner = self._make_runner_for_hybrid_compaction(context_budget=900)
+
+        class _AnchorDroppingCompactor:
+            _max_chunk_chars = 8000
+
+            def __init__(self):
+                self.calls = 0
+
+            async def compact(
+                self,
+                text: str,
+                *,
+                max_chars: int,
+                label: str = "",
+            ) -> str:
+                del text, label
+                self.calls += 1
+                # Deliberately violate the requested bound so there is no room
+                # to repair omitted exact anchors.
+                return "x" * (max_chars + 10_000)
+
+        dropping = _AnchorDroppingCompactor()
+        runner._compactor = dropping
+        messages = [{"role": "user", "content": "Goal: retain exact evidence."}]
+        for index in range(8):
+            messages.extend([
+                {
+                    "role": "assistant",
+                    "content": (
+                        f"Source https://example.com/source/{index} reports "
+                        f"{index + 10}.5% for evidence_record-{index}. "
+                        + ("analysis " * 100)
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": f"Keep reports/output-{index}.md " + ("context " * 80),
+                },
+            ])
+        messages.append({"role": "user", "content": "LATEST: preserve every anchor."})
+
+        compacted = await runner._compact_messages_for_model(
+            messages,
+            remaining_seconds=240,
+        )
+
+        assert dropping.calls == 1
+        assert not any(
+            str(message.get("content", "")).startswith(
+                "Prior semantic context checkpoint",
+            )
+            for message in compacted
+            if isinstance(message, dict)
+        )
+        report = runner._last_compaction_diagnostics["compaction_checkpoint"]
+        assert report["checkpoint_validation_passed"] is False
+        assert report["checkpoint_skipped_reason"] == "anchor_validation_failed"
+
+    @pytest.mark.asyncio
+    async def test_tiered_compaction_handles_oversized_short_history_prompt(self):
+        runner = self._make_runner_for_tiered_compaction(context_budget=600)
+        messages = [
+            {
+                "role": "user",
+                "content": "Oversized initial process context. " + ("detail " * 5000),
+            },
+        ]
+
+        compacted = await runner._compact_messages_for_model(
+            messages,
+            remaining_seconds=120,
+        )
+
+        assert len(compacted[0]["content"]) < len(messages[0]["content"])
+        assert "EMERGENCY CONTEXT COMPACTION APPLIED" in compacted[0]["content"]
+        assert runner._last_compaction_diagnostics["compaction_stage"] == (
+            "stage_5_initial_prompt"
+        )
+        assert (
+            "stage_5_initial_prompt"
+            in runner._last_compaction_diagnostics["compaction_applied_stages"]
+        )
+        assert runner._last_compaction_diagnostics["compaction_terminal_state"] != "unfit"
+
+    @pytest.mark.asyncio
     async def test_tool_schemas_count_toward_request_budget_pressure(self):
         runner = self._make_runner_for_tiered_compaction(context_budget=1500)
+        runner._runner_compaction_policy_mode = "hybrid"
+        runner._preserve_recent_critical_messages = 2
         messages = [
             {"role": "user", "content": "Goal: inspect workspace state."},
-            {"role": "assistant", "content": "Historical notes A " + ("x " * 180)},
-            {"role": "user", "content": "Historical notes B " + ("y " * 170)},
-            {"role": "assistant", "content": "Historical notes C " + ("z " * 160)},
-            {"role": "user", "content": "Historical notes D " + ("q " * 150)},
+            {"role": "assistant", "content": "Historical notes A " + ("x " * 350)},
+            {"role": "user", "content": "Historical notes B " + ("y " * 340)},
+            {"role": "assistant", "content": "Historical notes C " + ("z " * 330)},
+            {"role": "user", "content": "Historical notes D " + ("q " * 320)},
             {"role": "assistant", "content": "Latest assistant note: preserve behavior."},
             {"role": "user", "content": "Latest instruction: keep the output concise."},
         ]
@@ -398,6 +655,8 @@ class TestSubtaskRunnerContextBudget:
         }]
 
         control_runner = self._make_runner_for_tiered_compaction(context_budget=1500)
+        control_runner._runner_compaction_policy_mode = "hybrid"
+        control_runner._preserve_recent_critical_messages = 2
         control = await control_runner._compact_messages_for_model(
             messages,
             remaining_seconds=240,
@@ -419,6 +678,9 @@ class TestSubtaskRunnerContextBudget:
             "pressure",
             "critical",
         }
+        assert runner._last_compaction_diagnostics["compaction_applied_stages"][0] == (
+            "stage_4_semantic_checkpoint"
+        )
 
     @pytest.mark.asyncio
     async def test_microcompact_reduces_tool_output_without_semantic_compactor_call(self):
@@ -753,9 +1015,92 @@ class TestSubtaskRunnerContextBudget:
             for msg in compacted
             if isinstance(msg, dict) and isinstance(msg.get("content"), str)
         ]
-        assert any(content.startswith("Prior compacted context:\n") for content in contents)
+        assert any(
+            content.startswith("Prior semantic context checkpoint")
+            for content in contents
+        )
         assert latest_instruction in contents
         assert runner._last_compaction_diagnostics["compaction_pressure_tier"] == "critical"
+
+    @pytest.mark.asyncio
+    async def test_critical_merge_keeps_tool_exchange_atomic_at_boundary(self):
+        from loom.engine.runner.execution import _validate_model_message_contract
+
+        runner = self._make_runner_for_tiered_compaction(context_budget=600)
+        large = "context " * 2500
+        messages = [
+            {"role": "user", "content": "Goal: research and verify."},
+            {"role": "user", "content": "Old context 1 " + large},
+            {"role": "assistant", "content": "Old context 2 " + large},
+            {"role": "user", "content": "Old context 3 " + large},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_boundary",
+                    "type": "function",
+                    "function": {"name": "web_fetch", "arguments": "{}"},
+                }],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_boundary",
+                "content": json.dumps({"success": True, "output": large}),
+            },
+            {"role": "user", "content": "Later narrative " + large},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_latest",
+                    "type": "function",
+                    "function": {"name": "web_fetch", "arguments": "{}"},
+                }],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_latest",
+                "content": '{"success": true, "output": "latest"}',
+            },
+            {"role": "user", "content": "LATEST: finish with citations."},
+        ]
+
+        compacted = await runner._compact_messages_for_model(
+            messages,
+            remaining_seconds=240,
+        )
+
+        _validate_model_message_contract(
+            compacted,
+            request_payload={},
+            invocation_attempt=1,
+            max_attempts=1,
+            operation="complete",
+            iteration=1,
+            model_name="test-model",
+            compaction_diagnostics=runner._last_compaction_diagnostics,
+        )
+        compacted_text = "\n".join(
+            str(message.get("content", ""))
+            for message in compacted
+            if isinstance(message, dict)
+        )
+        assert "Prior semantic context checkpoint" in compacted_text
+        boundary_call_present = any(
+            any(
+                tool_call.get("id") == "call_boundary"
+                for tool_call in message.get("tool_calls", [])
+                if isinstance(tool_call, dict)
+            )
+            for message in compacted
+            if isinstance(message, dict)
+        )
+        boundary_result_present = any(
+            message.get("tool_call_id") == "call_boundary"
+            for message in compacted
+            if isinstance(message, dict)
+        )
+        assert boundary_call_present is boundary_result_present
 
     @pytest.mark.asyncio
     async def test_memory_extractor_compacts_large_tool_args(self):
@@ -1226,7 +1571,7 @@ class TestSubtaskRunnerContextBudget:
         assert len(overflow_events) == 1
         assert runner._active_subtask_telemetry_counters["overflow_fallback_count"] == 1
 
-    def test_tool_iteration_budget_uses_global_limit(self):
+    def test_tool_iteration_budget_scales_with_work_and_recovery_context(self):
         from loom.engine.runner import SubtaskRunner
 
         research_subtask = Subtask(
@@ -1270,11 +1615,19 @@ class TestSubtaskRunnerContextBudget:
             base_budget=37,
         )
 
-        assert research_budget == SubtaskRunner.MAX_TOOL_ITERATIONS
+        assert research_budget > SubtaskRunner.MAX_TOOL_ITERATIONS
         assert verify_budget == SubtaskRunner.MAX_TOOL_ITERATIONS
         assert final_budget == SubtaskRunner.MAX_TOOL_ITERATIONS
-        assert remediation_budget == SubtaskRunner.MAX_TOOL_ITERATIONS
-        assert custom_budget == 37
+        assert 4 <= remediation_budget <= 8
+        assert remediation_budget < research_budget
+        contract_repair_budget = SubtaskRunner._tool_iteration_budget(
+            subtask=research_subtask,
+            retry_strategy="contract_repair",
+            has_expected_deliverables=True,
+        )
+        assert 3 <= contract_repair_budget <= 6
+        assert custom_budget > 37
+        assert custom_budget <= 74
 
     def test_deliverable_policy_blocks_variant_and_noncanonical_retry_paths(self, tmp_path):
         from loom.engine.runner import SubtaskRunner

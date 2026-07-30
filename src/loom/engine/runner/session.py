@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from loom.models.base import ModelResponse
+from loom.tools.registry import ToolResult
 
 from .types import ToolCallRecord
 
@@ -23,6 +24,8 @@ class RunnerSession:
     completed_normally: bool = False
     interruption_reason: str | None = None
     budget_exhaustion_note: str | None = None
+    exhausted_web_targets: dict[str, str] = field(default_factory=dict)
+    read_only_result_cache: dict[str, ToolResult] = field(default_factory=dict)
     ask_user_questions_asked: int = 0
     last_ask_user_requested_at: float = 0.0
 

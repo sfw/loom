@@ -102,7 +102,7 @@ class SubtaskRunner:
     MINIMAL_TEXT_OUTPUT_CHARS = 180
     TOOL_CALL_ARGUMENT_CONTEXT_CHARS = 700
     COMPACT_TOOL_CALL_ARGUMENT_CHARS = 1_600
-    RUNNER_COMPACTION_POLICY_MODE = "off"
+    RUNNER_COMPACTION_POLICY_MODE = "hybrid"
     PRESERVE_RECENT_CRITICAL_MESSAGES = 6
     COMPACTION_PRESSURE_RATIO_SOFT = 0.86
     COMPACTION_PRESSURE_RATIO_HARD = 1.02
@@ -213,6 +213,17 @@ class SubtaskRunner:
         self._task_snapshot_writer = task_snapshot_writer
         settings = RunnerSettings.from_config(config, runner_defaults=self)
         self._max_tool_iterations = settings.max_tool_iterations
+        self._runner_checkpoint_reserve_iterations = max(
+            1,
+            int(
+                getattr(
+                    config.execution,
+                    "runner_checkpoint_reserve_iterations",
+                    2,
+                )
+                or 2
+            ),
+        )
         self._max_subtask_wall_clock_seconds = settings.max_subtask_wall_clock_seconds
         self._max_model_context_tokens = settings.max_model_context_tokens
         self._max_state_summary_chars = settings.max_state_summary_chars
@@ -284,6 +295,7 @@ class SubtaskRunner:
         self._runner_compaction_cache: dict[tuple[str, int, str], str] = {}
         self._runner_compaction_no_gain: dict[tuple[str, int, str], int] = {}
         self._runner_compaction_overshoot: set[tuple[str, int, str]] = set()
+        self._exhausted_web_targets_by_task: dict[str, dict[str, str]] = {}
         self._compaction_compactor_call_max_per_turn = (
             settings.compaction_compactor_call_max_per_turn
         )
@@ -650,7 +662,14 @@ class SubtaskRunner:
         ).strip().lower()
         return (
             mode
-            if mode in {"legacy", "tiered", "off"}
+            if mode in {
+                "hybrid",
+                "deterministic",
+                "semantic",
+                "legacy",
+                "tiered",
+                "off",
+            }
             else self.RUNNER_COMPACTION_POLICY_MODE
         )
 
@@ -1324,9 +1343,43 @@ class SubtaskRunner:
         has_expected_deliverables: bool,
         base_budget: int | None = None,
     ) -> int:
-        del subtask, retry_strategy, has_expected_deliverables  # configured globally
-        budget = int(base_budget) if isinstance(base_budget, int) else cls.MAX_TOOL_ITERATIONS
-        return max(1, min(200, budget))
+        base = int(base_budget) if isinstance(base_budget, int) else cls.MAX_TOOL_ITERATIONS
+        base = max(1, min(200, base))
+        budget = base
+        strategy = str(getattr(retry_strategy, "value", retry_strategy) or "").lower()
+        task_text = " ".join([
+            str(subtask.description or ""),
+            str(subtask.acceptance_criteria or ""),
+        ]).lower()
+
+        # Correction passes operate on a machine-identified gap and must not
+        # inherit the broad research budget.
+        if strategy in {
+            "schema_repair",
+            "contract_repair",
+            "output_reroute",
+            "verifier_parse",
+        }:
+            return max(3, min(6, base))
+        if strategy in {
+            "checkpoint_continue",
+            "evidence_gap",
+            "unconfirmed_data",
+        }:
+            return max(4, min(8, base))
+
+        # Research and artifact production routinely need more than the global
+        # baseline on the initial pass.
+        if any(
+            token in task_text
+            for token in ("research", "evidence", "analyze", "investigate", "compare")
+        ):
+            budget += max(2, base // 4)
+        if has_expected_deliverables:
+            budget += max(2, base // 4)
+        # A contextual pass may use up to twice the configured baseline. Global
+        # task budgets remain the outer guardrail across retries and subtasks.
+        return max(1, min(200, base * 2, budget))
 
     @staticmethod
     def _normalize_path_for_policy(path_text: str, workspace: Path | None) -> str:
@@ -2004,6 +2057,7 @@ class SubtaskRunner:
         tools: list[dict] | None = None,
         remaining_seconds: float | None = None,
     ) -> list[dict]:
+        started_at = time.monotonic()
         mode = self._runner_compaction_mode()
         if mode == "off":
             context_budget = int(
@@ -2039,15 +2093,38 @@ class SubtaskRunner:
                     overflow_fallback_applied=False,
                 ),
                 "compaction_compactor_calls": 0,
+                "compaction_strategy": "disabled",
+                "compaction_wall_time_ms": round(
+                    (time.monotonic() - started_at) * 1000,
+                    3,
+                ),
             })
             return messages
-        if mode == "tiered":
-            return await self._compact_messages_for_model_tiered(
+        if mode in {"hybrid", "deterministic", "semantic", "tiered"}:
+            compacted = await self._compact_messages_for_model_tiered(
                 messages,
                 tools=tools,
                 remaining_seconds=remaining_seconds,
             )
-        return await self._compact_messages_for_model_legacy(messages, tools=tools)
+        else:
+            compacted = await self._compact_messages_for_model_legacy(
+                messages,
+                tools=tools,
+            )
+        diagnostics = dict(getattr(self, "_last_compaction_diagnostics", {}))
+        diagnostics.update({
+            "compaction_strategy": (
+                mode
+                if mode in {"hybrid", "deterministic"}
+                else "model_assisted"
+            ),
+            "compaction_wall_time_ms": round(
+                (time.monotonic() - started_at) * 1000,
+                3,
+            ),
+        })
+        self._set_compaction_diagnostics(diagnostics)
+        return compacted
 
     async def _compact_messages_for_model_tiered(
         self,

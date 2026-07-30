@@ -126,6 +126,26 @@ And supporting audit events, including:
 - `rule_failure_by_type`
 - `claim_verification_summary`
 
+## Correction Lifecycle Telemetry
+
+Self-correction is auditable through:
+
+- `correction_detected`
+- `correction_planned`
+- `correction_progress`
+- `correction_action_applied`
+- `correction_resolved`
+- `correction_terminal`
+
+Payloads include the stable cycle ID, subtask, state, repairability, selected handler,
+typed blockers, structured progress vector, and no-progress count. These events
+describe policy decisions; the existing retry, remediation, and iteration events
+describe the adapter that executed the decision.
+
+Run-detail failure analysis reads the newest persisted event window and reconstructs
+it chronologically. Long runs therefore report the terminal blocker instead of an
+unrelated early tool failure that the run already recovered from.
+
 ## Webhook Delivery Telemetry
 
 Webhook delivery is auditable via:

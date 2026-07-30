@@ -210,6 +210,7 @@ class TestRetryManager:
         assert markets == []
 
     @pytest.mark.parametrize("reason_code", [
+        "artifact_confirmation_required",
         "tool_method_failed",
         "tool_transient_failure",
         "tool_upstream_unavailable",
@@ -235,7 +236,6 @@ class TestRetryManager:
         "insufficient_evidence",
         "recommendation_unconfirmed",
         "missing_precedent_transactions",
-        "csv_schema_mismatch",
     ])
     def test_classify_failure_routes_semantic_reason_codes_to_unconfirmed_data(
         self,
@@ -249,6 +249,36 @@ class TestRetryManager:
         assert strategy == RetryStrategy.UNCONFIRMED_DATA
         assert markets == []
 
+    def test_classify_failure_routes_csv_mismatch_to_schema_repair(self):
+        strategy, targets = RetryManager.classify_failure(
+            verification_feedback="CSV row 8 has 13 columns (expected 11).",
+            execution_error="",
+            verification={
+                "reason_code": "csv_schema_mismatch",
+                "metadata": {"missing_targets": ["comparison-matrix.csv"]},
+            },
+        )
+
+        assert strategy == RetryStrategy.SCHEMA_REPAIR
+        assert targets == ["comparison-matrix.csv"]
+
+    def test_retry_context_constrains_schema_repair_to_in_place_edits(self):
+        context = RetryManager().build_retry_context([
+            AttemptRecord(
+                attempt=1,
+                tier=2,
+                feedback="CSV row 8 has 13 columns (expected 11).",
+                retry_strategy=RetryStrategy.SCHEMA_REPAIR,
+                missing_targets=["comparison-matrix.csv"],
+                resolution_plan="Inspect row 8 and correct its quoting.",
+            ),
+        ])
+
+        assert "TARGETED SCHEMA REPAIR" in context
+        assert "comparison-matrix.csv" in context
+        assert "Do not repeat research" in context
+        assert "checking every non-empty row" in context
+
     def test_classify_failure_keeps_hard_invariant_on_strict_path(self):
         strategy, markets = RetryManager.classify_failure(
             verification_feedback="hard invariant failed",
@@ -258,14 +288,42 @@ class TestRetryManager:
         assert strategy == RetryStrategy.GENERIC
         assert markets == []
 
-    def test_classify_failure_forbidden_output_path_reason_code_is_generic(self):
+    def test_classify_failure_forbidden_output_path_reason_code_is_output_reroute(self):
         strategy, markets = RetryManager.classify_failure(
             verification_feedback="output policy violation",
             execution_error="",
             verification={"reason_code": "forbidden_output_path"},
         )
-        assert strategy == RetryStrategy.GENERIC
+        assert strategy == RetryStrategy.OUTPUT_REROUTE
         assert markets == []
+
+    def test_classify_failure_routes_missing_structured_fields_to_contract_repair(self):
+        strategy, targets = RetryManager.classify_failure(
+            verification_feedback="Structured leading indicators are missing.",
+            execution_error="",
+            verification={
+                "reason_code": "missing_structured_leading_indicators",
+                "metadata": {"missing_targets": ["risk-register.csv:leading_indicator"]},
+            },
+        )
+
+        assert strategy == RetryStrategy.CONTRACT_REPAIR
+        assert targets == ["risk-register.csv:leading_indicator"]
+
+    def test_output_reroute_context_names_allowed_targets_and_forbids_variants(self):
+        context = RetryManager().build_retry_context([
+            AttemptRecord(
+                attempt=1,
+                tier=2,
+                feedback="Output path policy violation.",
+                retry_strategy=RetryStrategy.OUTPUT_REROUTE,
+                missing_targets=["canonical-report.md"],
+            ),
+        ])
+
+        assert "TARGETED OUTPUT REROUTE" in context
+        assert "canonical-report.md" in context
+        assert "Do not create versioned" in context
 
     def test_classify_failure_dev_verifier_timeout_is_verifier_parse(self):
         strategy, markets = RetryManager.classify_failure(

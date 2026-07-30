@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 import uuid
@@ -9,13 +10,15 @@ from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 
+from loom.engine.correction import CorrectionHandler, CorrectionState, Repairability
 from loom.engine.iteration_gates import IterationEvaluation
 from loom.engine.runner import SubtaskResult, SubtaskResultStatus, ToolCallRecord
-from loom.engine.verification import VerificationResult
+from loom.engine.verification import Check, VerificationResult
 from loom.engine.verification.development import optional_failure_capability_for_reason
 from loom.engine.verification.policy import normalize_profile, resolve_policy_decision
 from loom.events.types import (
     ARTIFACT_SEAL_VALIDATION,
+    CORRECTION_ACTION_APPLIED,
     ITERATION_COMPLETED,
     ITERATION_GATE_FAILED,
     ITERATION_RETRYING,
@@ -23,7 +26,6 @@ from loom.events.types import (
     ITERATION_STATE_RECONCILED,
     ITERATION_TERMINAL,
     SUBTASK_COMPLETED,
-    SUBTASK_FAILED,
     SUBTASK_POLICY_RECONCILED,
     SUBTASK_RETRYING,
     SUBTASK_STARTED,
@@ -34,6 +36,7 @@ from loom.recovery.approval import ApprovalDecision, ApprovalRequest
 from loom.recovery.retry import AttemptRecord, RetryStrategy
 from loom.state.evidence import merge_evidence_records
 from loom.state.task_state import Subtask, SubtaskStatus, Task, TaskStatus
+from loom.tools.registry import ToolResult
 
 logger = logging.getLogger(__name__)
 
@@ -436,19 +439,61 @@ async def dispatch_subtask(
                     status = str(item.get("status", "") or "").strip().lower()
                     if status in {"contradicted", "stale"}:
                         unresolved_hard_total += 1
+        validity_contract = orchestrator._validity_contract_for_subtask(subtask)
+        requires_fact_checked_claims = bool(
+            isinstance(validity_contract, dict)
+            and validity_contract.get("require_fact_checker_for_synthesis", False)
+        )
+        final_gate_contract = (
+            validity_contract.get("final_gate", {})
+            if isinstance(validity_contract, dict)
+            else {}
+        )
+        enforces_verified_context = bool(
+            isinstance(final_gate_contract, dict)
+            and final_gate_contract.get("enforce_verified_context_only", True)
+        )
+        missing_required_claims = (
+            requires_fact_checked_claims
+            and enforces_verified_context
+            and supported_total <= 0
+        )
+        evidence_preflight_required = (
+            missing_required_claims and unresolved_total <= 0
+        )
+        if evidence_preflight_required:
+            # Do not deadlock synthesis before it can invoke the required fact
+            # checker. Admit a constrained evidence-preflight pass; post-run
+            # verification still blocks completion unless supported claims are
+            # produced.
+            gate_passed = True
+            gate_error = (
+                "Synthesis evidence preflight required: no supported claims are "
+                "available yet. Invoke the required fact checker against existing "
+                "source artifacts before writing final deliverables. Do not state "
+                "unsupported material claims."
+            )
         gate_decision = resolve_policy_decision(
             severity_class="semantic",
             reason_code=(
                 "claim_contradicted"
                 if unresolved_hard_total > 0
-                else "coverage_below_threshold"
+                else (
+                    "claim_insufficient_evidence"
+                    if missing_required_claims
+                    else "coverage_below_threshold"
+                )
             ),
             profile=effective_profile,
             mode=policy_mode,
             contradiction_detected=bool(unresolved_hard_total > 0),
             profile_confidence=profile_resolution.confidence,
         )
-        if not gate_passed and gate_decision.action == "pass_with_warnings":
+        if (
+            not gate_passed
+            and not missing_required_claims
+            and gate_decision.action == "pass_with_warnings"
+        ):
             gate_passed = True
             gate_error = (
                 "Synthesis gate warning: proceeding under profile-aware policy "
@@ -461,6 +506,9 @@ async def dispatch_subtask(
             "supported_claim_count": int(supported_total),
             "unresolved_claim_count": int(unresolved_total),
             "unresolved_hard_count": int(unresolved_hard_total),
+            "requires_fact_checked_claims": requires_fact_checked_claims,
+            "missing_required_claims": missing_required_claims,
+            "evidence_preflight_required": evidence_preflight_required,
             "verification_profile": effective_profile,
             "verification_profile_confidence": float(profile_resolution.confidence),
             "policy_action": gate_decision.action,
@@ -487,7 +535,11 @@ async def dispatch_subtask(
                 confidence=0.0,
                 feedback=gate_error,
                 outcome="fail",
-                reason_code="coverage_below_threshold",
+                reason_code=(
+                    "claim_insufficient_evidence"
+                    if missing_required_claims
+                    else "coverage_below_threshold"
+                ),
                 severity_class="semantic",
                 metadata={
                     "synthesis_input_gate_blocked": True,
@@ -513,8 +565,9 @@ async def dispatch_subtask(
             retry_context = (
                 f"{retry_context}\n\n"
                 f"{gate_error}\n"
-                "If claims remain uncertain, keep uncertainty explicit and avoid "
-                "stating unverified assertions as facts."
+                "If claims remain uncertain, keep uncertainty explicit, prune "
+                "unsupported assertions, and avoid writing the final deliverable "
+                "until evidence preflight is complete."
             ).strip()
 
     changelog = orchestrator._get_changelog(task)
@@ -781,6 +834,87 @@ async def handle_failure(
         policy_mode=policy_mode,
         profile_confidence=profile_confidence,
     )
+    correction_decision = None
+    try:
+        correction_decision = await orchestrator._correction.record_failure(
+            task_id=task.id,
+            run_id=str(getattr(orchestrator, "_active_run_id", "") or ""),
+            subtask_id=subtask.id,
+            result=result,
+            verification=verification,
+        )
+    except Exception:
+        # Correction telemetry must never obscure the original failure. Production
+        # databases are migration-gated; this guard primarily protects test doubles
+        # and rolling upgrades where a worker was already in flight.
+        logger.exception(
+            "Failed to persist correction cycle for %s/%s",
+            task.id,
+            subtask.id,
+        )
+    if correction_decision is not None:
+        if correction_decision.handler == CorrectionHandler.RETRY_VERIFICATION:
+            strategy = RetryStrategy.VERIFIER_PARSE
+        elif correction_decision.handler == CorrectionHandler.SCHEMA_REPAIR:
+            strategy = RetryStrategy.SCHEMA_REPAIR
+            missing_targets = sorted({
+                target
+                for blocker in correction_decision.blockers
+                for target in blocker.targets
+            })
+        elif correction_decision.handler == CorrectionHandler.CONTRACT_REPAIR:
+            strategy = RetryStrategy.CONTRACT_REPAIR
+            missing_targets = sorted({
+                target
+                for blocker in correction_decision.blockers
+                for target in blocker.targets
+            })
+        elif correction_decision.handler == CorrectionHandler.OUTPUT_REROUTE:
+            strategy = RetryStrategy.OUTPUT_REROUTE
+            missing_targets = sorted({
+                target
+                for blocker in correction_decision.blockers
+                for target in blocker.targets
+            })
+        elif correction_decision.handler in {
+            CorrectionHandler.SOURCE_FALLBACK,
+            CorrectionHandler.CONFIRM_OR_PRUNE,
+            CorrectionHandler.PLACEHOLDER_PREPASS,
+        }:
+            strategy = RetryStrategy.UNCONFIRMED_DATA
+        elif correction_decision.handler == CorrectionHandler.CONTEXT_REFRESH:
+            strategy = RetryStrategy.EVIDENCE_GAP
+            missing_targets = sorted({
+                target
+                for blocker in correction_decision.blockers
+                for target in blocker.targets
+            })
+        elif correction_decision.handler == CorrectionHandler.CHECKPOINT_CONTINUE:
+            strategy = RetryStrategy.CHECKPOINT_CONTINUE
+        verification_metadata["correction"] = {
+            "cycle_id": correction_decision.cycle_id,
+            "state": correction_decision.state.value,
+            "repairability": correction_decision.repairability.value,
+            "handler": correction_decision.handler.value,
+            "no_progress_count": correction_decision.no_progress_count,
+            "total_attempt_count": correction_decision.total_attempt_count,
+            "stop_for_attempt_budget": correction_decision.stop_for_attempt_budget,
+        }
+        verification.metadata = verification_metadata
+    correction_requires_inline_repair = bool(
+        correction_decision is not None
+        and correction_decision.handler
+        in {
+            CorrectionHandler.CONTEXT_REFRESH,
+            CorrectionHandler.CHECKPOINT_CONTINUE,
+            CorrectionHandler.PLACEHOLDER_PREPASS,
+            CorrectionHandler.OUTPUT_REROUTE,
+            CorrectionHandler.RETRY_VERIFICATION,
+            CorrectionHandler.SCHEMA_REPAIR,
+            CorrectionHandler.CONTRACT_REPAIR,
+            CorrectionHandler.SOURCE_FALLBACK,
+        }
+    )
     combined_error = " | ".join(
         part for part in [verification.feedback, result.summary] if part
     )
@@ -822,11 +956,74 @@ async def handle_failure(
         verification=verification,
     )
 
+    if (
+        correction_decision is not None
+        and correction_decision.handler == CorrectionHandler.SCHEMA_REPAIR
+        and not correction_decision.stop_for_no_progress
+        and not correction_decision.stop_for_attempt_budget
+    ):
+        execution_result = await asyncio.to_thread(
+            orchestrator._correction_executor.execute,
+            workspace=Path(task.workspace) if task.workspace else None,
+            decision=correction_decision,
+        )
+        if execution_result.applied:
+            synthetic_call = ToolCallRecord(
+                tool="correction_schema_repair",
+                args={"targets": list(execution_result.changed_targets)},
+                result=ToolResult.ok(
+                    "Applied deterministic schema repair.",
+                    files_changed=list(execution_result.changed_targets),
+                    data={
+                        "correction_cycle_id": correction_decision.cycle_id,
+                        "repair_reason": execution_result.reason,
+                    },
+                ),
+                call_id=f"{correction_decision.cycle_id}:deterministic",
+            )
+            result.tool_calls.append(synthetic_call)
+            orchestrator._emit(CORRECTION_ACTION_APPLIED, task.id, {
+                "subtask_id": subtask.id,
+                "cycle_id": correction_decision.cycle_id,
+                "handler": correction_decision.handler.value,
+                "targets": list(execution_result.changed_targets),
+                "reason": execution_result.reason,
+            })
+            verification_retry = await orchestrator._retry_verification_only(
+                task=task,
+                subtask=subtask,
+                result=result,
+                attempts=attempt_list,
+            )
+            if verification_retry.passed:
+                await orchestrator._handle_success(
+                    task,
+                    subtask,
+                    result,
+                    verification_retry,
+                )
+                return None
+            return await handle_failure(
+                orchestrator,
+                task,
+                subtask,
+                result,
+                verification_retry,
+                attempts_by_subtask,
+            )
+
     # Parse failures in verifier output should retry verification only
     # instead of re-running full subtask execution.
     if (
         strategy == RetryStrategy.VERIFIER_PARSE
         and subtask.retry_count < subtask.max_retries
+        and not (
+            correction_decision is not None
+            and (
+                correction_decision.stop_for_no_progress
+                or correction_decision.stop_for_attempt_budget
+            )
+        )
     ):
         verification_retry = await orchestrator._retry_verification_only(
             task=task,
@@ -837,23 +1034,74 @@ async def handle_failure(
         if verification_retry.passed:
             await orchestrator._handle_success(task, subtask, result, verification_retry)
             return None
-        verification = verification_retry
-        attempt_record.feedback = verification_retry.feedback or attempt_record.feedback
-        if verification_retry.feedback:
-            attempt_record.error = " | ".join(
-                part for part in [attempt_record.error, verification_retry.feedback]
-                if part
-            )
+        # A failed verifier-only retry must be classified as a new failure.
+        # Falling through here schedules an ordinary executor retry using the
+        # stale VERIFIER_PARSE strategy, which can turn an infrastructure-only
+        # verifier problem into a broad research/synthesis rerun.
+        return await handle_failure(
+            orchestrator,
+            task,
+            subtask,
+            result,
+            verification_retry,
+            attempts_by_subtask,
+        )
 
-    resolution_plan = await orchestrator._plan_failure_resolution(
-        task=task,
-        subtask=subtask,
-        result=result,
-        verification=verification,
-        strategy=strategy,
-        missing_targets=missing_targets,
-        prior_attempts=attempt_list[:-1],
-    )
+    if (
+        correction_decision is not None
+        and correction_decision.handler == CorrectionHandler.RETRY_VERIFICATION
+        and (
+            correction_decision.stop_for_no_progress
+            or correction_decision.stop_for_attempt_budget
+        )
+    ):
+        note = (
+            "Verification infrastructure could not produce a stronger verdict "
+            "within its isolated retry budget. Preserving the usable deliverable "
+            "and completing with explicit verification caveats."
+        )
+        verification = _apply_warning_success(
+            result=result,
+            verification=verification,
+            note=note,
+        )
+        metadata = (
+            dict(verification.metadata)
+            if isinstance(verification.metadata, dict)
+            else {}
+        )
+        metadata["verifier_retry_exhausted"] = True
+        metadata["completion_disposition"] = "completed_with_caveats"
+        verification.metadata = metadata
+        await orchestrator._handle_success(task, subtask, result, verification)
+        return None
+
+    resolution_plan = ""
+    if (
+        correction_decision is not None
+        and correction_decision.handler
+        not in {
+            CorrectionHandler.RETRY_EXECUTION,
+            CorrectionHandler.SCHEMA_REPAIR,
+        }
+    ):
+        action = correction_decision.actions[0]
+        resolution_plan = (
+            f"Deterministic correction handler: {action.handler.value}. "
+            f"Action: {action.action_type}. "
+            f"Targets: {', '.join(action.arguments.get('targets', [])) or 'current blocker'}. "
+            f"Guardrails: {'; '.join(action.arguments.get('guardrails', [])) or 'none'}."
+        )
+    else:
+        resolution_plan = await orchestrator._plan_failure_resolution(
+            task=task,
+            subtask=subtask,
+            result=result,
+            verification=verification,
+            strategy=strategy,
+            missing_targets=missing_targets,
+            prior_attempts=attempt_list[:-1],
+        )
     if resolution_plan:
         attempt_record.resolution_plan = resolution_plan
 
@@ -881,6 +1129,7 @@ async def handle_failure(
     if (
         strategy == RetryStrategy.UNCONFIRMED_DATA
         and not hard_invariant_failure
+        and not correction_requires_inline_repair
         and (
             not subtask.is_critical_path
             or critical_path_behavior == "queue_follow_up"
@@ -922,23 +1171,16 @@ async def handle_failure(
             subtask=subtask,
             verification=verification,
         )
-        subtask.status = SubtaskStatus.FAILED
-        subtask.summary = verification.feedback or "Verification failed"
+        # Verification gaps remain recoverable until the outcome arbiter proves
+        # otherwise; do not flash a misleading terminal failure state.
+        subtask.status = SubtaskStatus.RUNNING
+        subtask.active_issue = verification.feedback or "Verification gap detected"
         task.update_subtask(
             subtask.id,
-            status=SubtaskStatus.FAILED,
-            summary=subtask.summary,
+            status=SubtaskStatus.RUNNING,
+            active_issue=subtask.active_issue,
         )
-        task.add_error(subtask.id, f"Verification failed (tier {verification.tier})")
         await orchestrator._save_task_state(task)
-
-    orchestrator._emit(SUBTASK_FAILED, task.id, {
-        "subtask_id": subtask.id,
-        "verification_tier": verification.tier,
-        "feedback": verification.feedback,
-        "verification_outcome": verification.outcome,
-        "reason_code": verification.reason_code,
-    })
 
     if (
         strategy == RetryStrategy.UNCONFIRMED_DATA
@@ -971,16 +1213,38 @@ async def handle_failure(
             metadata["deterministic_placeholder_prepass"] = deterministic_details
             verification.metadata = metadata
 
-    no_progress_exhausted = orchestrator._retry.should_stop_for_no_progress(
-        attempt_list,
-        max_stalled_attempts=int(
-            getattr(
-                orchestrator._config.verification,
-                "resilience_no_progress_attempts",
-                2,
-            ) or 2,
-        ),
-    )
+    if correction_decision is not None:
+        if correction_decision.repairability == Repairability.TERMINAL:
+            metadata = task.metadata if isinstance(task.metadata, dict) else {}
+            metadata["catastrophic_failure"] = {
+                "subtask_id": subtask.id,
+                "cycle_id": correction_decision.cycle_id,
+                "reason_codes": sorted({
+                    blocker.code for blocker in correction_decision.blockers
+                }),
+                "blocker_classes": sorted({
+                    blocker.blocker_class.value
+                    for blocker in correction_decision.blockers
+                }),
+            }
+            task.metadata = metadata
+        no_progress_exhausted = (
+            correction_decision.stop_for_no_progress
+            or correction_decision.stop_for_attempt_budget
+            or correction_decision.state
+            in {CorrectionState.TERMINAL, CorrectionState.HUMAN_REQUIRED}
+        )
+    else:
+        no_progress_exhausted = orchestrator._retry.should_stop_for_no_progress(
+            attempt_list,
+            max_stalled_attempts=int(
+                getattr(
+                    orchestrator._config.verification,
+                    "resilience_no_progress_attempts",
+                    2,
+                ) or 2,
+            ),
+        )
     if no_progress_exhausted:
         no_progress_note = (
             "Retry policy stopped additional attempts due to no-progress "
@@ -1009,11 +1273,42 @@ async def handle_failure(
             runtime=runtime,
         )
 
+    progress_extension_limit = int(subtask.max_retries)
+    correction_retry_reserve = max(
+        0,
+        int(
+            getattr(
+                orchestrator._config.execution,
+                "max_correction_retries",
+                3,
+            )
+            or 0
+        ),
+    )
+    if (
+        correction_decision is not None
+        and correction_decision.repairability
+        in {Repairability.AUTOMATIC, Repairability.CONDITIONAL}
+        and correction_decision.handler
+        in {
+            CorrectionHandler.CHECKPOINT_CONTINUE,
+            CorrectionHandler.OUTPUT_REROUTE,
+            CorrectionHandler.PLACEHOLDER_PREPASS,
+            CorrectionHandler.RETRY_VERIFICATION,
+            CorrectionHandler.SCHEMA_REPAIR,
+            CorrectionHandler.CONTRACT_REPAIR,
+            CorrectionHandler.SOURCE_FALLBACK,
+        }
+    ):
+        # Correction is an independently budgeted recovery lane. Earlier broad
+        # execution retries must not consume the attempts reserved for precise,
+        # verifier-targeted repair actions.
+        progress_extension_limit += correction_retry_reserve
     if (
         not no_progress_exhausted
         and not runner_cap_exhausted
         and not iteration_budget_reason
-        and subtask.retry_count < subtask.max_retries
+        and subtask.retry_count < progress_extension_limit
     ):
         subtask.retry_count += 1
         async with orchestrator._state_lock:
@@ -1034,7 +1329,20 @@ async def handle_failure(
             "feedback": verification.feedback if verification else None,
             "retry_strategy": strategy.value,
             "resolution_plan_generated": bool(resolution_plan),
+            "correction_cycle_id": (
+                correction_decision.cycle_id if correction_decision else ""
+            ),
+            "correction_handler": (
+                correction_decision.handler.value if correction_decision else ""
+            ),
+            "progress_extension": progress_extension_limit > int(subtask.max_retries),
         })
+        if correction_decision is not None:
+            await orchestrator._correction.mark_routed(
+                decision=correction_decision,
+                state=CorrectionState.RETRYING,
+                outcome="retry_scheduled",
+            )
     else:
         if runner_cap_exhausted:
             extra = (
@@ -1211,6 +1519,20 @@ async def handle_failure(
                 f"{resolution_plan}"
             )
             verification_feedback = details.strip()
+        async with orchestrator._state_lock:
+            subtask.status = SubtaskStatus.FAILED
+            subtask.summary = verification.feedback or "Verification failed"
+            task.update_subtask(
+                subtask.id,
+                status=SubtaskStatus.FAILED,
+                summary=subtask.summary,
+                active_issue=subtask.active_issue,
+            )
+            task.add_error(
+                subtask.id,
+                verification.feedback or "Verification retries exhausted",
+            )
+            await orchestrator._save_task_state(task)
         return {
             "reason": orchestrator._build_replan_reason(subtask, verification),
             "failed_subtask_id": subtask.id,
@@ -1227,6 +1549,7 @@ async def handle_success(
     verification: VerificationResult,
 ) -> None:
     """Process a successful subtask: update state, check approval."""
+    executor_status_before_verification = str(result.status)
     await orchestrator._persist_subtask_evidence_async(
         task.id,
         subtask.id,
@@ -1234,6 +1557,17 @@ async def handle_success(
         tool_calls=result.tool_calls,
         workspace=task.workspace,
     )
+    try:
+        await orchestrator._correction.resolve_subtask(
+            task_id=task.id,
+            subtask_id=subtask.id,
+        )
+    except Exception:
+        logger.exception(
+            "Failed resolving correction cycles for %s/%s",
+            task.id,
+            subtask.id,
+        )
     try:
         orchestrator._record_fan_in_worker_artifacts(
             task=task,
@@ -1261,6 +1595,24 @@ async def handle_success(
             subtask=subtask,
             verification=verification,
         )
+        outcome = str(getattr(verification, "outcome", "") or "").strip().lower()
+        outcome_counts = task.metadata.setdefault("verification_outcome_counts", {})
+        if isinstance(outcome_counts, dict) and outcome:
+            outcome_counts[outcome] = int(outcome_counts.get(outcome, 0) or 0) + 1
+        if result.status != SubtaskResultStatus.SUCCESS:
+            recovered = task.metadata.setdefault("recovered_executor_failures", [])
+            if isinstance(recovered, list) and not any(
+                isinstance(item, dict) and item.get("subtask_id") == subtask.id
+                for item in recovered
+            ):
+                recovered.append({
+                    "subtask_id": subtask.id,
+                    "executor_status": executor_status_before_verification,
+                    "verification_outcome": outcome,
+                    "reason_code": str(
+                        getattr(verification, "reason_code", "") or "",
+                    ).strip().lower(),
+                })
         if subtask.is_synthesis:
             summary = orchestrator._append_synthesis_provenance_footer(
                 task=task,
@@ -1311,7 +1663,11 @@ async def handle_success(
 
     orchestrator._emit(SUBTASK_COMPLETED, task.id, {
         "subtask_id": subtask.id,
-        "status": result.status,
+        "status": "completed",
+        "executor_status_before_verification": executor_status_before_verification,
+        "executor_recovered_by_verification": (
+            result.status != SubtaskResultStatus.SUCCESS
+        ),
         "summary": summary,
         "duration": result.duration_seconds,
         "verification_outcome": verification.outcome if verification else "",
@@ -1486,6 +1842,54 @@ async def handle_iteration_after_success(
     elif attempts_exhausted:
         terminal_reason = "max_attempts_exhausted"
 
+    correction_decision = None
+    correction_reason = terminal_reason or "iteration_gate_failed"
+    try:
+        correction_decision = await orchestrator._correction.record_failure(
+            task_id=task.id,
+            run_id=str(getattr(orchestrator, "_active_run_id", "") or ""),
+            subtask_id=subtask.id,
+            result=result,
+            verification=VerificationResult(
+                tier=max(1, int(verification.tier or 1)),
+                passed=False,
+                confidence=float(
+                    evaluation.score_hint
+                    if evaluation is not None and evaluation.score_hint is not None
+                    else verification.confidence or 0.0
+                ),
+                outcome="fail",
+                reason_code=correction_reason,
+                severity_class="semantic",
+                feedback=gate_summary,
+                checks=[
+                    Check(
+                        name=f"iteration:{item.gate_id}",
+                        passed=False,
+                        detail=item.detail or item.reason_code or gate_summary,
+                    )
+                    for item in blocking_failures
+                ],
+                metadata={
+                    "iteration_attempt": attempt_index,
+                    "phase_id": subtask.phase_id,
+                    "loop_run_id": subtask.iteration_loop_run_id,
+                },
+            ),
+        )
+    except Exception:
+        logger.exception(
+            "Failed to persist iteration correction cycle for %s/%s",
+            task.id,
+            subtask.id,
+        )
+    if (
+        correction_decision is not None
+        and correction_decision.stop_for_no_progress
+        and not terminal_reason
+    ):
+        terminal_reason = "correction_no_progress"
+
     orchestrator._emit(ITERATION_GATE_FAILED, task.id, {
         "subtask_id": subtask.id,
         "phase_id": subtask.phase_id,
@@ -1530,7 +1934,16 @@ async def handle_iteration_after_success(
             "next_attempt": attempt_index + 1,
             "max_attempts": int(policy.max_attempts),
             "gate_summary": gate_summary,
+            "correction_cycle_id": (
+                correction_decision.cycle_id if correction_decision else ""
+            ),
         })
+        if correction_decision is not None:
+            await orchestrator._correction.mark_routed(
+                decision=correction_decision,
+                state=CorrectionState.RETRYING,
+                outcome="iteration_retry_scheduled",
+            )
         return None
 
     subtask.iteration_terminal_reason = terminal_reason
@@ -1567,6 +1980,20 @@ async def handle_iteration_after_success(
         terminal_reason=terminal_reason,
         gate_summary=gate_summary,
     )
+    if correction_decision is not None:
+        await orchestrator._correction.mark_routed(
+            decision=correction_decision,
+            state=(
+                CorrectionState.REPLANNING
+                if replan_request is not None
+                else CorrectionState.TERMINAL
+            ),
+            outcome=(
+                "iteration_replan_requested"
+                if replan_request is not None
+                else "iteration_terminal"
+            ),
+        )
     if replan_request is not None:
         async with orchestrator._state_lock:
             subtask.status = SubtaskStatus.FAILED

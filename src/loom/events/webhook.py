@@ -78,17 +78,8 @@ class WebhookDelivery:
 
         url = self._callback_urls.get(event.task_id)
         if not url:
-            self._emit_delivery_event(
-                event.task_id,
-                WEBHOOK_DELIVERY_DROPPED,
-                {
-                    "delivery_target_host": "",
-                    "delivery_target_hash": "",
-                    "reason": "unregistered",
-                    "terminal_event_type": event.event_type,
-                    "source_component": "webhook",
-                },
-            )
+            # No callback registration is normal for local runs, not a dropped
+            # delivery. Emitting an empty host also violates the event contract.
             return
 
         await self.deliver(url, event)

@@ -245,9 +245,96 @@ class TestDeterministicVerifier:
             result=ToolResult.fail("HTTP 404: https://example.com/missing"),
         )
         result = await v.verify(_make_subtask(), "output", [tc], None)
+        assert result.passed
+        assert result.outcome == "pass_with_warnings"
+        assert any(
+            c.name == "tool_web_fetch_advisory"
+            and "reason_code=tool_upstream_unavailable" in str(c.detail)
+            for c in result.checks
+        )
+
+    @pytest.mark.asyncio
+    async def test_method_resilient_policy_treats_fact_checker_timeout_as_advisory(self):
+        process = _make_process(
+            static_checks={"tool_success_policy": "method_resilient"},
+        )
+        v = DeterministicVerifier(process=process)
+        tc = MockToolCallRecord(
+            tool="fact_checker",
+            args={"claims": ["A claim"], "sources": ["source.md"]},
+            result=ToolResult.fail("Tool 'fact_checker' timed out after 45s"),
+        )
+        result = await v.verify(_make_subtask(), "output", [tc], None)
+        assert result.passed
+        assert result.outcome == "pass_with_warnings"
+        assert any(
+            c.name == "tool_fact_checker_advisory"
+            and "reason_code=tool_runtime_retryable" in str(c.detail)
+            for c in result.checks
+        )
+
+    @pytest.mark.asyncio
+    async def test_method_resilient_policy_treats_unavailable_recall_as_advisory(self):
+        process = _make_process(
+            static_checks={"tool_success_policy": "method_resilient"},
+        )
+        v = DeterministicVerifier(process=process)
+        tc = MockToolCallRecord(
+            tool="conversation_recall",
+            args={"query": "prior context"},
+            result=ToolResult.fail(
+                "Conversation recall is not available (no active session).",
+            ),
+        )
+        result = await v.verify(_make_subtask(), "output", [tc], None)
+
+        assert result.passed
+        assert result.outcome == "pass_with_warnings"
+        assert any(
+            c.name == "tool_conversation_recall_advisory"
+            and "reason_code=tool_method_failed" in str(c.detail)
+            for c in result.checks
+        )
+
+    @pytest.mark.asyncio
+    async def test_method_resilient_policy_treats_missing_optional_read_as_advisory(self):
+        process = _make_process(
+            static_checks={"tool_success_policy": "method_resilient"},
+        )
+        v = DeterministicVerifier(process=process)
+        tc = MockToolCallRecord(
+            tool="read_file",
+            args={"path": "optional-context.md"},
+            result=ToolResult.fail("File not found: optional-context.md"),
+        )
+        result = await v.verify(_make_subtask(), "output", [tc], None)
+
+        assert result.passed
+        assert result.outcome == "pass_with_warnings"
+        assert any(
+            c.name == "tool_read_file_advisory"
+            and "reason_code=tool_method_failed" in str(c.detail)
+            for c in result.checks
+        )
+
+    @pytest.mark.asyncio
+    async def test_method_resilient_policy_keeps_read_safety_violation_hard(self):
+        process = _make_process(
+            static_checks={"tool_success_policy": "method_resilient"},
+        )
+        v = DeterministicVerifier(process=process)
+        tc = MockToolCallRecord(
+            tool="read_file",
+            args={"path": "../../secret"},
+            result=ToolResult.fail("Safety violation: path escapes workspace"),
+        )
+        result = await v.verify(_make_subtask(), "output", [tc], None)
+
         assert not result.passed
-        assert result.reason_code == "tool_upstream_unavailable"
-        assert result.severity_class == "infra"
+        assert any(
+            c.name == "tool_read_file_success" and not c.passed
+            for c in result.checks
+        )
 
     @pytest.mark.asyncio
     async def test_adhoc_process_honors_explicit_all_tools_hard_policy(self):
@@ -790,6 +877,13 @@ class TestDeterministicVerifier:
         result = await v.verify(_make_subtask(), "output", [tc], tmp_path)
         assert not result.passed
         assert result.reason_code == "csv_schema_mismatch"
+        assert result.metadata["missing_targets"] == ["bad.csv"]
+        assert result.metadata["schema_diagnostics"] == [{
+            "target": "bad.csv",
+            "row_number": 3,
+            "actual_columns": 2,
+            "expected_columns": 3,
+        }]
         assert any(
             (c.detail or "").find("reason_code=csv_schema_mismatch") >= 0
             for c in result.checks
@@ -1804,6 +1898,7 @@ class TestVerificationGates:
         assert passed.passed
         event_types = [event.event_type for event in events]
         assert VERIFICATION_STARTED in event_types
+        assert "verification_contradiction_detected" not in event_types
         assert VERIFICATION_PASSED in event_types
 
         events.clear()

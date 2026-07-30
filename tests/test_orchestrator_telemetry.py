@@ -146,6 +146,20 @@ def test_emit_telemetry_run_summary_includes_reliability_metrics() -> None:
     orchestrator = SimpleNamespace(
         _emitted_telemetry_summary_runs=set(),
         _telemetry_rollup=orchestrator_telemetry.new_telemetry_rollup(),
+        _semantic_compactor_rollup={
+            "model_calls": 7,
+            "model_call_duration_ms": 1250,
+            "validation_attempts": 9,
+            "validation_failures": 2,
+            "retry_attempts": 2,
+            "warning_outputs": 1,
+        },
+        _task_correction_cycle_states={
+            "t-run": {
+                "corr-resolved": "resolved",
+                "corr-open": "retrying",
+            },
+        },
         _events=bus,
         _task_run_id=lambda task: "run-1",
         _new_telemetry_rollup=orchestrator_telemetry.new_telemetry_rollup,
@@ -232,3 +246,7 @@ def test_emit_telemetry_run_summary_includes_reliability_metrics() -> None:
         == 1
     )
     assert summary["development_verification_health"]["verifier_infra_reasons"] == 2
+    assert summary["semantic_compactor"]["model_calls"] == 7
+    assert summary["semantic_compactor"]["validation_failures"] == 2
+    assert summary["correction_lifecycle_counts"]["unique_cycles"] == 2
+    assert summary["correction_lifecycle_counts"]["open"] == 1

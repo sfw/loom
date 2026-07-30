@@ -39,6 +39,9 @@ class TestDatabase:
         assert "events" in table_names
         assert "learned_patterns" in table_names
         assert "search_provider_state" in table_names
+        assert "correction_cycles" in table_names
+        assert "correction_attempts" in table_names
+        assert "correction_actions" in table_names
 
     async def test_initialize_idempotent(self, db: Database):
         # Calling initialize again should not error
@@ -455,6 +458,41 @@ class TestDatabase:
         assert "provider" in search_columns
         assert "next_allowed_at" in search_columns
         assert "lease_expires_at" in search_columns
+
+    async def test_initialize_upgrades_pre_correction_lifecycle_database(
+        self,
+        tmp_path: Path,
+    ):
+        db_path = tmp_path / "pre-correction-lifecycle.db"
+        legacy = Database(db_path)
+        await legacy.initialize()
+        await legacy.execute("DROP TABLE correction_actions")
+        await legacy.execute("DROP TABLE correction_attempts")
+        await legacy.execute("DROP TABLE correction_cycles")
+        await legacy.execute(
+            "DELETE FROM schema_migrations WHERE id=?",
+            ("20260728_008_correction_lifecycle_v1",),
+        )
+        await legacy.close()
+
+        upgraded = Database(db_path)
+        await upgraded.initialize()
+
+        tables = await upgraded.query(
+            """SELECT name FROM sqlite_master
+               WHERE type='table' AND name LIKE 'correction_%'
+               ORDER BY name"""
+        )
+        assert [row["name"] for row in tables] == [
+            "correction_actions",
+            "correction_attempts",
+            "correction_cycles",
+        ]
+        migrations = await upgraded.query(
+            "SELECT id FROM schema_migrations WHERE id=?",
+            ("20260728_008_correction_lifecycle_v1",),
+        )
+        assert len(migrations) == 1
 
     async def test_initialize_rolls_back_on_failed_migration(self, tmp_path: Path, monkeypatch):
         db_path = tmp_path / "rollback.db"
