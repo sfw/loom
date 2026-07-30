@@ -600,7 +600,9 @@ class TestVerificationFailureRetry:
         events = event_collector["events"]
         event_types = [e.event_type for e in events]
 
-        assert SUBTASK_FAILED in event_types
+        # A recoverable verification gap must not publish a terminal failure
+        # event while the harness is actively retrying it.
+        assert SUBTASK_FAILED not in event_types
         assert SUBTASK_RETRYING in event_types
         assert SUBTASK_COMPLETED in event_types
 
@@ -609,8 +611,9 @@ class TestVerificationFailureRetry:
         complete_idx = event_types.index(SUBTASK_COMPLETED)
         assert retry_idx < complete_idx
 
-        # Error was recorded on the task
-        assert len(result.errors_encountered) >= 1
+        # A healed verification gap does not pollute the completed task's
+        # terminal error summary.
+        assert result.errors_encountered == []
 
         # Learning captured the retry pattern
         patterns = await LearningManager(db).query_patterns(

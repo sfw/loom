@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -11,6 +12,7 @@ import loom.engine.runner as runner_module
 from loom.auth.runtime import AuthResolutionError
 from loom.config import Config, ExecutionConfig, LimitsConfig, RunnerLimitsConfig
 from loom.engine.runner import SubtaskResultStatus, SubtaskRunner
+from loom.engine.runner import execution as runner_execution
 from loom.engine.verification import VerificationResult
 from loom.models.base import ModelResponse, StreamChunk, TokenUsage, ToolCall
 from loom.state.task_state import Subtask, Task
@@ -82,6 +84,105 @@ def _make_runner(
     )
     runner._spawn_memory_extraction = MagicMock()
     return runner
+
+
+def test_process_scoped_tool_schemas_keep_declared_and_compact_discovery() -> None:
+    schemas = [
+        {"name": "web_search", "description": "Search"},
+        {"name": "write_file", "description": "Write"},
+        {"name": "list_tools", "description": "Discover"},
+        {"name": "run_tool", "description": "Delegate"},
+        {"name": "large_unrelated_tool", "description": "x" * 20_000},
+    ]
+    runner = SimpleNamespace(
+        _tools=SimpleNamespace(all_schemas=lambda **_kwargs: schemas),
+        _prompts=SimpleNamespace(
+            process=SimpleNamespace(
+                tools=SimpleNamespace(required=["web_search", "write_file"]),
+            ),
+        ),
+    )
+
+    scoped, report = runner_execution._process_scoped_tool_schemas(
+        runner,
+        auth_context=None,
+        execution_surface="process",
+    )
+
+    assert [item["name"] for item in scoped] == [
+        "web_search",
+        "write_file",
+        "list_tools",
+        "run_tool",
+    ]
+    assert report["applied"] is True
+    assert report["tool_count_before"] == 5
+    assert report["tool_count_after"] == 4
+
+
+@pytest.mark.asyncio
+async def test_run_reuses_identical_read_until_a_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        runner_module,
+        "build_run_auth_context",
+        lambda **kwargs: {},
+    )
+    model_complete = AsyncMock(side_effect=[
+        ModelResponse(
+            text="",
+            tool_calls=[
+                ToolCall(
+                    id="read-1",
+                    name="read_file",
+                    arguments={"path": "notes.md"},
+                ),
+            ],
+            usage=TokenUsage(total_tokens=8),
+        ),
+        ModelResponse(
+            text="",
+            tool_calls=[
+                ToolCall(
+                    id="read-2",
+                    name="read_file",
+                    arguments={"path": "notes.md"},
+                ),
+            ],
+            usage=TokenUsage(total_tokens=8),
+        ),
+        ModelResponse(
+            text="Completed.",
+            tool_calls=None,
+            usage=TokenUsage(total_tokens=4),
+        ),
+    ])
+    runner = _make_runner(
+        memory_query=AsyncMock(return_value=[]),
+        model_complete=model_complete,
+        config=Config(execution=ExecutionConfig(enable_streaming=False)),
+    )
+    runner._tools.all_schemas = MagicMock(return_value=[
+        {
+            "name": "read_file",
+            "parameters": {"type": "object", "required": ["path"]},
+        },
+    ])
+    tool_obj = MagicMock()
+    tool_obj.is_mutating = False
+    tool_obj.mutation_target_arg_keys = ()
+    runner._tools.get = MagicMock(return_value=tool_obj)
+    runner._tools.execute = AsyncMock(return_value=ToolResult.ok("cached content"))
+    task, subtask = _make_task(tmp_path)
+
+    result, verification = await runner.run(task, subtask)
+
+    assert result.status == SubtaskResultStatus.SUCCESS
+    assert verification.passed is True
+    assert runner._tools.execute.await_count == 1
+    assert result.telemetry_counters["read_cache_hits"] == 1
 
 
 @pytest.mark.asyncio

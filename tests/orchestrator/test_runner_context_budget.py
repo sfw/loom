@@ -632,12 +632,14 @@ class TestSubtaskRunnerContextBudget:
     @pytest.mark.asyncio
     async def test_tool_schemas_count_toward_request_budget_pressure(self):
         runner = self._make_runner_for_tiered_compaction(context_budget=1500)
+        runner._runner_compaction_policy_mode = "hybrid"
+        runner._preserve_recent_critical_messages = 2
         messages = [
             {"role": "user", "content": "Goal: inspect workspace state."},
-            {"role": "assistant", "content": "Historical notes A " + ("x " * 180)},
-            {"role": "user", "content": "Historical notes B " + ("y " * 170)},
-            {"role": "assistant", "content": "Historical notes C " + ("z " * 160)},
-            {"role": "user", "content": "Historical notes D " + ("q " * 150)},
+            {"role": "assistant", "content": "Historical notes A " + ("x " * 350)},
+            {"role": "user", "content": "Historical notes B " + ("y " * 340)},
+            {"role": "assistant", "content": "Historical notes C " + ("z " * 330)},
+            {"role": "user", "content": "Historical notes D " + ("q " * 320)},
             {"role": "assistant", "content": "Latest assistant note: preserve behavior."},
             {"role": "user", "content": "Latest instruction: keep the output concise."},
         ]
@@ -653,6 +655,8 @@ class TestSubtaskRunnerContextBudget:
         }]
 
         control_runner = self._make_runner_for_tiered_compaction(context_budget=1500)
+        control_runner._runner_compaction_policy_mode = "hybrid"
+        control_runner._preserve_recent_critical_messages = 2
         control = await control_runner._compact_messages_for_model(
             messages,
             remaining_seconds=240,
@@ -674,6 +678,9 @@ class TestSubtaskRunnerContextBudget:
             "pressure",
             "critical",
         }
+        assert runner._last_compaction_diagnostics["compaction_applied_stages"][0] == (
+            "stage_4_semantic_checkpoint"
+        )
 
     @pytest.mark.asyncio
     async def test_microcompact_reduces_tool_output_without_semantic_compactor_call(self):
@@ -1611,7 +1618,14 @@ class TestSubtaskRunnerContextBudget:
         assert research_budget > SubtaskRunner.MAX_TOOL_ITERATIONS
         assert verify_budget == SubtaskRunner.MAX_TOOL_ITERATIONS
         assert final_budget == SubtaskRunner.MAX_TOOL_ITERATIONS
-        assert remediation_budget > research_budget
+        assert 4 <= remediation_budget <= 8
+        assert remediation_budget < research_budget
+        contract_repair_budget = SubtaskRunner._tool_iteration_budget(
+            subtask=research_subtask,
+            retry_strategy="contract_repair",
+            has_expected_deliverables=True,
+        )
+        assert 3 <= contract_repair_budget <= 6
         assert custom_budget > 37
         assert custom_budget <= 74
 

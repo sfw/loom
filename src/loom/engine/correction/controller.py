@@ -78,18 +78,18 @@ class CorrectionController:
             task_id=task_id,
             subtask_id=subtask_id,
         )
-        recent_same_lane = next(
+        recent_active_cycle = next(
             (
                 item
                 for item in reversed(existing_cycles)
                 if isinstance(item, dict)
                 and str(item.get("id", "") or "") != cycle_id
-                and str(item.get("handler", "") or "") == handler.value
                 and str(item.get("state", "") or "") not in {"resolved"}
             ),
             None,
         )
-        comparison_cycle = previous or recent_same_lane
+        # Changing repair handlers as a gap narrows is not itself progress.
+        comparison_cycle = previous or recent_active_cycle
         previous_progress = ProgressVector.from_dict(
             comparison_cycle.get("latest_progress") if comparison_cycle else None
         )

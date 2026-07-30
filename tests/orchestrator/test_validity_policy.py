@@ -341,6 +341,64 @@ class TestOrchestratorValidityPolicy:
         assert gate_events[-1].data.get("passed") is True
 
     @pytest.mark.asyncio
+    async def test_synthesis_gate_never_warns_through_required_fact_checked_claims(
+        self,
+        tmp_path,
+    ):
+        bus = _make_event_bus()
+        events = []
+        bus.subscribe_all(lambda event: events.append(event))
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text='{"subtasks": []}'),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=_make_state_manager(tmp_path),
+            event_bus=bus,
+            config=_make_config(),
+        )
+        task = _make_task(goal="Synthesize an evidence-backed report")
+        task.metadata["claim_graph"] = {
+            "supported_by_subtask": {},
+            "unresolved_by_subtask": {},
+        }
+        subtask = Subtask(
+            id="synth",
+            description="Synthesize evidence-backed report",
+            is_synthesis=True,
+            verification_tier=2,
+            validity_contract_snapshot={
+                "enabled": True,
+                "claim_extraction": {"enabled": True},
+                "require_fact_checker_for_synthesis": True,
+                "final_gate": {
+                    "enforce_verified_context_only": True,
+                    "synthesis_min_verification_tier": 2,
+                    "critical_claim_support_ratio": 1.0,
+                },
+            },
+        )
+        task.plan = Plan(subtasks=[subtask])
+        orch._runner.run = AsyncMock(return_value=(
+            SubtaskResult(status="success", summary="unexpected"),
+            VerificationResult(tier=2, passed=True, outcome="pass"),
+        ))
+
+        _, result, verification = await orch._dispatch_subtask(task, subtask, {})
+
+        assert result.status == SubtaskResultStatus.FAILED
+        assert verification.passed is False
+        assert verification.reason_code == "required_verifier_missing"
+        orch._runner.run.assert_awaited_once()
+        gate_events = [
+            event for event in events
+            if event.event_type == SYNTHESIS_INPUT_GATE_DECISION
+        ]
+        assert gate_events[-1].data.get("missing_required_claims") is True
+        assert gate_events[-1].data.get("evidence_preflight_required") is True
+        assert gate_events[-1].data.get("passed") is True
+
+    @pytest.mark.asyncio
     async def test_synthesis_input_gate_shadow_mode_does_not_enforce_new_policy(
         self,
         tmp_path,

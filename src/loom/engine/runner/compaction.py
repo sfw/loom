@@ -1764,24 +1764,26 @@ async def compact_messages_for_model_tiered(
             applied_stages.append(stage_name)
         return changed
 
-    await _run_stage("stage_1_tool_args", _compact_stage_1)
     if mode == "hybrid":
-        if pressure_after > soft_ratio:
-            await _run_stage("stage_2_tool_outputs", _compact_stage_2)
         if pressure_after > soft_ratio:
             if timeout_guard_active:
                 runner._record_compaction_skip("timeout_guard")
             else:
                 await _run_stage("stage_4_semantic_checkpoint", _compact_stage_4)
+        if pressure_after > soft_ratio:
+            await _run_stage("stage_1_tool_args", _compact_stage_1)
+        if pressure_after > soft_ratio:
+            await _run_stage("stage_2_tool_outputs", _compact_stage_2)
         if pressure_after > 1.0:
             await _run_stage(
                 "stage_5_initial_prompt",
                 _compact_stage_5_initial_prompt,
             )
-    elif pressure_after <= soft_ratio:
-        pass
     else:
-        if timeout_guard_active:
+        await _run_stage("stage_1_tool_args", _compact_stage_1)
+        if pressure_after <= soft_ratio:
+            pass
+        elif timeout_guard_active:
             runner._record_compaction_skip("timeout_guard")
         else:
             await _run_stage("stage_2_tool_outputs", _compact_stage_2)

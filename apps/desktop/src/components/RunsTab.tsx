@@ -1506,6 +1506,8 @@ function RunDetailView({
   const hasRecoverableGaps = runStatus === "completed" && (
     runDetail.completion_grade === "degraded" || recoverableGapNodes.length > 0
   );
+  const hasVerificationWarnings = runStatus === "completed"
+    && runDetail.completion_grade === "verified_with_warnings";
 
   // --- Activity category filters ---
   type ActivityCategory = "tool" | "subtask" | "verify" | "model" | "task" | "other";
@@ -1641,6 +1643,11 @@ function RunDetailView({
                 completed with gaps
               </span>
             )}
+            {hasVerificationWarnings && (
+              <span className="rounded-full border border-amber-400/20 bg-amber-500/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-amber-200">
+                verified with warnings
+              </span>
+            )}
           </div>
         </div>
 
@@ -1748,6 +1755,25 @@ function RunDetailView({
                     ))}
                   </ul>
                 )}
+              </div>
+            </div>
+          </section>
+        )}
+        {hasVerificationWarnings && (
+          <section className="rounded-2xl border border-amber-500/20 bg-amber-500/[0.06] p-4">
+            <div className="flex items-start gap-3">
+              <div className="mt-0.5 rounded-xl bg-amber-500/10 p-2 text-amber-300">
+                <AlertTriangle size={16} />
+              </div>
+              <div>
+                <h3 className="text-sm font-semibold text-amber-100">
+                  Verified with warnings
+                </h3>
+                <p className="mt-2 text-xs leading-5 text-zinc-300">
+                  Deliverables passed verification, but the run retained partial
+                  evidence, verifier warnings, or an explicitly recovered executor
+                  failure. Review the validity scorecard before relying on material claims.
+                </p>
               </div>
             </div>
           </section>

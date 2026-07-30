@@ -13,6 +13,7 @@ from loom.events.types import (
     ASK_USER_CANCELLED,
     ASK_USER_REQUESTED,
     ASK_USER_TIMEOUT,
+    CORRECTION_DETECTED,
     FORBIDDEN_CANONICAL_WRITE_BLOCKED,
     REMEDIATION_ATTEMPT,
     REMEDIATION_EXPIRED,
@@ -52,11 +53,14 @@ def new_telemetry_rollup() -> dict[str, int]:
     return {
         "model_invocations": 0,
         "tool_calls": 0,
+        "tool_failures": 0,
+        "read_cache_hits": 0,
         "mutating_tool_calls": 0,
         "artifact_ingests": 0,
         "artifact_reads": 0,
         "artifact_retention_deletes": 0,
         "compaction_policy_decisions": 0,
+        "degraded_fit_count": 0,
         "overflow_fallback_count": 0,
         "compactor_warning_count": 0,
         "sealed_policy_preflight_blocked": 0,
@@ -77,11 +81,14 @@ def accumulate_subtask_telemetry(orchestrator, result: SubtaskResult) -> None:
     for key in (
         "model_invocations",
         "tool_calls",
+        "tool_failures",
+        "read_cache_hits",
         "mutating_tool_calls",
         "artifact_ingests",
         "artifact_reads",
         "artifact_retention_deletes",
         "compaction_policy_decisions",
+        "degraded_fit_count",
         "overflow_fallback_count",
         "compactor_warning_count",
         "sealed_policy_preflight_blocked",
@@ -236,6 +243,15 @@ def _emit_telemetry_run_summary(self, task: Task) -> None:
     verification_severity_counts_map = verification_severity_counts(
         verification_reason_counts,
     )
+    correction_states = getattr(self, "_task_correction_cycle_states", {}).get(
+        task.id,
+        {},
+    )
+    if not isinstance(correction_states, dict):
+        correction_states = {}
+    semantic_compactor = dict(
+        getattr(self, "_semantic_compactor_rollup", {}) or {},
+    )
     verification_lifecycle_counts = {
         "started": int(event_counts.get(VERIFICATION_STARTED, 0)),
         "passed": int(event_counts.get(VERIFICATION_PASSED, 0)),
@@ -337,13 +353,24 @@ def _emit_telemetry_run_summary(self, task: Task) -> None:
     }
     self._emit(TELEMETRY_RUN_SUMMARY, task.id, {
         "run_id": self._task_run_id(task),
+        "runner_compaction_policy_mode_effective": str(
+            getattr(
+                getattr(self, "_runner", None),
+                "_runner_compaction_policy_mode",
+                "",
+            )
+            or "",
+        ).strip().lower(),
         "model_invocations": int(rollup.get("model_invocations", 0)),
         "tool_calls": int(rollup.get("tool_calls", 0)),
+        "tool_failures": int(rollup.get("tool_failures", 0)),
+        "read_cache_hits": int(rollup.get("read_cache_hits", 0)),
         "mutating_tool_calls": int(rollup.get("mutating_tool_calls", 0)),
         "artifact_ingests": int(rollup.get("artifact_ingests", 0)),
         "artifact_reads": int(rollup.get("artifact_reads", 0)),
         "artifact_retention_deletes": int(rollup.get("artifact_retention_deletes", 0)),
         "compaction_policy_decisions": int(rollup.get("compaction_policy_decisions", 0)),
+        "degraded_fit_count": int(rollup.get("degraded_fit_count", 0)),
         "overflow_fallback_count": int(rollup.get("overflow_fallback_count", 0)),
         "compactor_warning_count": int(rollup.get("compactor_warning_count", 0)),
         "sealed_policy_preflight_blocked": int(
@@ -363,7 +390,44 @@ def _emit_telemetry_run_summary(self, task: Task) -> None:
         "control_plane_counts": control_plane_counts,
         "output_conflict_counts": output_conflict_counts,
         "blocked_indicator": bool(event_counts.get(SUBTASK_BLOCKED, 0) > 0),
-        "degraded_indicator": bool(event_counts.get(TASK_PLAN_DEGRADED, 0) > 0),
+        "degraded_indicator": bool(
+            event_counts.get(TASK_PLAN_DEGRADED, 0) > 0
+            or int(rollup.get("degraded_fit_count", 0)) > 0
+            or str(task.metadata.get("completion_grade", "") or "") == "degraded"
+        ),
+        "correction_lifecycle_counts": {
+            "detected_events": int(event_counts.get(CORRECTION_DETECTED, 0)),
+            "unique_cycles": len(correction_states),
+            "resolved": sum(
+                1 for state in correction_states.values() if state == "resolved"
+            ),
+            "terminal": sum(
+                1 for state in correction_states.values() if state == "terminal"
+            ),
+            "open": sum(
+                1
+                for state in correction_states.values()
+                if state not in {"resolved", "terminal"}
+            ),
+        },
+        "semantic_compactor": {
+            "model_calls": int(semantic_compactor.get("model_calls", 0)),
+            "model_call_duration_ms": int(
+                semantic_compactor.get("model_call_duration_ms", 0),
+            ),
+            "validation_attempts": int(
+                semantic_compactor.get("validation_attempts", 0),
+            ),
+            "validation_failures": int(
+                semantic_compactor.get("validation_failures", 0),
+            ),
+            "retry_attempts": int(
+                semantic_compactor.get("retry_attempts", 0),
+            ),
+            "warning_outputs": int(
+                semantic_compactor.get("warning_outputs", 0),
+            ),
+        },
         "replanned_count": int(event_counts.get(TASK_REPLANNING, 0)),
         "stalled_count": int(event_counts.get(TASK_STALLED, 0)),
         "reliability_metrics": reliability_metrics,

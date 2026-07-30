@@ -62,7 +62,10 @@ _TERMINAL_WEB_SOURCE_MARKERS = (
     "access denied",
     "login required",
     "authentication required",
+    "cannot find root object",
+    "invalid object in /pages",
 )
+_PROCESS_TOOL_DISCOVERY_NAMES = frozenset({"list_tools", "run_tool"})
 
 # Backwards-compatible name used by runner internals.
 _COMPACTOR_EVENT_CONTEXT = compactor_event_context
@@ -99,6 +102,57 @@ def _exhausted_web_target_result(*, url: str, prior_error: str) -> ToolResult:
         "Use web_search to discover alternate public sources, fetch a different URL, "
         "or proceed with other evidence."
     )
+
+
+def _process_scoped_tool_schemas(
+    runner: Any,
+    *,
+    auth_context: Any,
+    execution_surface: str,
+) -> tuple[list[dict], dict[str, Any]]:
+    """Expose declared process tools plus compact long-tail discovery."""
+    schemas = runner._tools.all_schemas(
+        auth_context=auth_context,
+        execution_surface=execution_surface,
+        runnable_only=True,
+    )
+    process = getattr(getattr(runner, "_prompts", None), "process", None)
+    requirements = getattr(process, "tools", None)
+    required = {
+        str(name or "").strip()
+        for name in list(getattr(requirements, "required", []) or [])
+        if str(name or "").strip()
+    }
+    if process is None or not required:
+        return schemas, {
+            "applied": False,
+            "reason": "no_process_requirements",
+            "tool_count_before": len(schemas),
+            "tool_count_after": len(schemas),
+            "direct_tools": [],
+            "discovery_tools": [],
+        }
+
+    allowed = required | _PROCESS_TOOL_DISCOVERY_NAMES
+    scoped = [
+        schema
+        for schema in schemas
+        if str(schema.get("name", "") or "").strip() in allowed
+    ]
+    available_names = {
+        str(schema.get("name", "") or "").strip()
+        for schema in scoped
+    }
+    return scoped, {
+        "applied": len(scoped) < len(schemas),
+        "reason": "process_required_tools",
+        "tool_count_before": len(schemas),
+        "tool_count_after": len(scoped),
+        "direct_tools": sorted(required & available_names),
+        "discovery_tools": sorted(
+            _PROCESS_TOOL_DISCOVERY_NAMES & available_names,
+        ),
+    }
 
 
 def _response_raw_dict(response: ModelResponse) -> dict[str, Any]:
@@ -742,16 +796,19 @@ async def run_subtask(
             max_entries=10,
         )
         execution_surface = runner._execution_surface_for_task(task)
+        process_tool_schemas, process_tool_scope_report = (
+            _process_scoped_tool_schemas(
+                runner,
+                auth_context=auth_context,
+                execution_surface=execution_surface,
+            )
+        )
         prompt = runner._prompts.build_executor_prompt(
             task=task,
             subtask=subtask,
             state_manager=runner._state,
             memory_entries=memory_entries,
-            available_tools=runner._tools.all_schemas(
-                auth_context=auth_context,
-                execution_surface=execution_surface,
-                runnable_only=True,
-            ),
+            available_tools=process_tool_schemas,
             evidence_ledger_summary=evidence_summary,
         )
         if retry_context:
@@ -767,6 +824,15 @@ async def run_subtask(
             prior_successful_tool_calls=prior_successful_tool_calls,
             prior_evidence_records=prior_evidence_records,
         )
+        if len(runner._exhausted_web_targets_by_task) > 128:
+            oldest_task_id = next(iter(runner._exhausted_web_targets_by_task))
+            if oldest_task_id != task.id:
+                runner._exhausted_web_targets_by_task.pop(oldest_task_id, None)
+        task_exhausted_targets = runner._exhausted_web_targets_by_task.setdefault(
+            task.id,
+            {},
+        )
+        session.exhausted_web_targets.update(task_exhausted_targets)
         messages = session.messages
         tool_calls_record = session.tool_calls_record
         evidence_records_current = session.evidence_records_current
@@ -790,6 +856,19 @@ async def run_subtask(
             bool(canonical_deliverables)
             and not normalized_allowed_output_prefixes
         )
+        normalized_retry_strategy = str(
+            getattr(retry_strategy, "value", retry_strategy) or "",
+        ).strip().lower()
+        completion_lock_enabled = bool(canonical_deliverables) and (
+            one_shot_direct_deliverable_mode
+            or normalized_retry_strategy
+            in {
+                "schema_repair",
+                "contract_repair",
+                "output_reroute",
+                "checkpoint_continue",
+            }
+        )
         touched_canonical_deliverables: set[str] = set()
         completion_only_after_deliverables = False
         completion_only_instruction_sent = False
@@ -802,6 +881,7 @@ async def run_subtask(
         last_model_failure_metadata: dict[str, Any] = {}
         last_model_failure_reason_code = ""
         checkpoint_instruction_sent = False
+        emergency_degraded_fit_count = 0
 
         for iteration in range(iteration_budget):
             if not await runner._wait_for_task_control_window(task):
@@ -861,16 +941,19 @@ async def run_subtask(
             if completion_only_after_deliverables:
                 tool_schemas = []
             else:
-                tool_schemas = runner._tools.all_schemas(
-                    auth_context=auth_context,
-                    execution_surface=execution_surface,
-                    runnable_only=True,
-                )
+                tool_schemas = list(process_tool_schemas)
             session.messages = await runner._compact_messages_for_model(
                 session.messages,
                 tools=tool_schemas,
                 remaining_seconds=remaining_seconds,
             )
+            compaction_diagnostics = dict(
+                getattr(runner, "_last_compaction_diagnostics", {}),
+            )
+            compaction_diagnostics["process_tool_scope"] = dict(
+                process_tool_scope_report,
+            )
+            runner._last_compaction_diagnostics = compaction_diagnostics
             if tool_schemas and runner._runner_compaction_mode() != "off":
                 tool_schemas, tool_schema_prune_report = (
                     runner._prune_tool_schemas_for_request_fit(
@@ -923,6 +1006,30 @@ async def run_subtask(
                 task_id=task.id,
                 subtask_id=subtask.id,
             )
+            terminal_state = _context_terminal_state(
+                dict(getattr(runner, "_last_compaction_diagnostics", {})),
+            )
+            if (
+                terminal_state == "degraded_fit"
+                and bool(process_tool_scope_report.get("applied", False))
+            ):
+                emergency_degraded_fit_count += 1
+            if emergency_degraded_fit_count >= 2:
+                last_model_failure_reason_code = "runner_repeated_degraded_fit"
+                last_model_failure_metadata = {
+                    "checkpoint_required": True,
+                    "degraded_fit_count": emergency_degraded_fit_count,
+                    "compaction_policy_mode": _context_policy_mode(
+                        dict(getattr(runner, "_last_compaction_diagnostics", {})),
+                    ),
+                    "recovery_action": "checkpoint_continue_with_fresh_context",
+                }
+                session.interruption_reason = (
+                    "Context entered emergency degraded-fit more than once. "
+                    "Preserve the current artifacts and evidence, then continue the "
+                    "smallest unfinished work from a fresh semantic checkpoint."
+                )
+                break
             operation = "stream" if streaming else "complete"
             session.response = None
             policy = ModelRetryPolicy.from_execution_config(runner._config.execution)
@@ -1680,6 +1787,32 @@ async def run_subtask(
                                             answer=answer,
                                         )
                         elif not deduped:
+                            read_cache_key = ""
+                            if resolved_tool_name == "read_file":
+                                read_cache_key = (
+                                    f"{resolved_tool_name}:"
+                                    f"{runner._stable_json_digest(resolved_tool_args)}"
+                                )
+                                cached_read = session.read_only_result_cache.get(
+                                    read_cache_key,
+                                )
+                                if cached_read is not None:
+                                    tool_result = ToolResult.from_json(
+                                        cached_read.to_json(),
+                                    )
+                                    deduped = True
+                                    runner._increment_subtask_counter("read_cache_hits")
+                                    runner._emit_telemetry_event(
+                                        event_type=TOOL_CALL_DEDUPLICATED,
+                                        task_id=task.id,
+                                        data={
+                                            "subtask_id": subtask.id,
+                                            "tool": resolved_tool_name,
+                                            "tool_call_id": tool_call_id,
+                                            "cache_kind": "read_only_result",
+                                            "run_id": runner._normalize_run_id(task),
+                                        },
+                                    )
                             web_target_key = ""
                             if resolved_tool_name in {"web_fetch", "web_fetch_html"}:
                                 web_target_key = _web_target_key(resolved_tool_args)
@@ -1718,13 +1851,25 @@ async def run_subtask(
                                     execution_surface=execution_surface,
                                 )
                                 if (
+                                    read_cache_key
+                                    and resolved_tool_name == "read_file"
+                                    and tool_result.success
+                                ):
+                                    session.read_only_result_cache[read_cache_key] = (
+                                        ToolResult.from_json(tool_result.to_json())
+                                    )
+                                if (
                                     web_target_key
                                     and not tool_result.success
                                     and _is_terminal_web_source_failure(tool_result.error)
                                 ):
-                                    session.exhausted_web_targets[web_target_key] = str(
-                                        tool_result.error or "access denied"
+                                    terminal_error = str(
+                                        tool_result.error or "access denied",
                                     )
+                                    session.exhausted_web_targets[web_target_key] = (
+                                        terminal_error
+                                    )
+                                    task_exhausted_targets[web_target_key] = terminal_error
                         if route_metadata:
                             route_data = (
                                 dict(tool_result.data)
@@ -1738,6 +1883,7 @@ async def run_subtask(
                             and not deduped
                             and tool_result.success
                         ):
+                            session.read_only_result_cache.clear()
                             unexpected_paths: list[str] = []
                             if guard_mode != "off":
                                 unexpected_paths = runner._unexpected_sealed_mutation_paths(
@@ -1871,11 +2017,7 @@ async def run_subtask(
                             tool_result.data = data
                         else:
                             tool_result.data = data
-                    if (
-                        one_shot_direct_deliverable_mode
-                        and is_mutating_tool
-                        and tool_result.success
-                    ):
+                    if completion_lock_enabled and is_mutating_tool and tool_result.success:
                         touched_paths = [
                             path
                             for path in attempted_paths
@@ -1887,6 +2029,8 @@ async def run_subtask(
                                 touched_canonical_deliverables,
                             ):
                                 completion_only_after_deliverables = True
+                    if not tool_result.success:
+                        runner._increment_subtask_counter("tool_failures")
                     runner._emit_tool_event(
                         TOOL_CALL_COMPLETED, task.id, subtask.id,
                         resolved_tool_name, resolved_tool_args,

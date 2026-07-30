@@ -295,6 +295,7 @@ class SubtaskRunner:
         self._runner_compaction_cache: dict[tuple[str, int, str], str] = {}
         self._runner_compaction_no_gain: dict[tuple[str, int, str], int] = {}
         self._runner_compaction_overshoot: set[tuple[str, int, str]] = set()
+        self._exhausted_web_targets_by_task: dict[str, dict[str, str]] = {}
         self._compaction_compactor_call_max_per_turn = (
             settings.compaction_compactor_call_max_per_turn
         )
@@ -1351,8 +1352,24 @@ class SubtaskRunner:
             str(subtask.acceptance_criteria or ""),
         ]).lower()
 
+        # Correction passes operate on a machine-identified gap and must not
+        # inherit the broad research budget.
+        if strategy in {
+            "schema_repair",
+            "contract_repair",
+            "output_reroute",
+            "verifier_parse",
+        }:
+            return max(3, min(6, base))
+        if strategy in {
+            "checkpoint_continue",
+            "evidence_gap",
+            "unconfirmed_data",
+        }:
+            return max(4, min(8, base))
+
         # Research and artifact production routinely need more than the global
-        # baseline, while precise repair actions should remain bounded.
+        # baseline on the initial pass.
         if any(
             token in task_text
             for token in ("research", "evidence", "analyze", "investigate", "compare")
@@ -1360,13 +1377,6 @@ class SubtaskRunner:
             budget += max(2, base // 4)
         if has_expected_deliverables:
             budget += max(2, base // 4)
-        if strategy in {
-            "checkpoint_continue",
-            "evidence_gap",
-            "unconfirmed_data",
-        }:
-            budget += max(2, base // 2)
-
         # A contextual pass may use up to twice the configured baseline. Global
         # task budgets remain the outer guardrail across retries and subtasks.
         return max(1, min(200, base * 2, budget))

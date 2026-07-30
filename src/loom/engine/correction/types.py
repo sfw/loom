@@ -150,16 +150,10 @@ class ProgressVector:
         )
         if lower_is_better < previous_lower:
             return True
-        higher_is_better = (
-            self.supported_claim_count,
-            self.deliverable_count,
-            round(self.confidence, 4),
-        )
-        previous_higher = (
-            previous.supported_claim_count,
-            previous.deliverable_count,
-            round(previous.confidence, 4),
-        )
+        # Deliverable counts are attempt-local and confidence is not comparable
+        # after a verifier/handler change; neither may reset convergence.
+        higher_is_better = (self.supported_claim_count,)
+        previous_higher = (previous.supported_claim_count,)
         return lower_is_better == previous_lower and higher_is_better > previous_higher
 
 

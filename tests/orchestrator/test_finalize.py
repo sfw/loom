@@ -53,6 +53,104 @@ class TestOrchestratorFinalize:
         assert result.status == TaskStatus.COMPLETED
         assert result.completed_at != ""
 
+    def test_finalize_degrades_when_required_claim_extraction_is_empty(self, tmp_path):
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text='{"subtasks": []}'),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=_make_state_manager(tmp_path),
+            event_bus=_make_event_bus(),
+            config=_make_config(),
+        )
+        task = _make_task()
+        task.plan = Plan(subtasks=[
+            Subtask(
+                id="synth",
+                description="Synthesize",
+                is_synthesis=True,
+                status=SubtaskStatus.COMPLETED,
+            ),
+        ])
+        task.metadata["validity_scorecard"] = {
+            "subtask_metrics": {
+                "synth": {
+                    "is_synthesis": True,
+                    "claim_extraction_expected": True,
+                    "counts": {
+                        "extracted": 0,
+                        "supported": 0,
+                        "contradicted": 0,
+                        "insufficient_evidence": 0,
+                        "stale": 0,
+                        "pruned": 0,
+                        "unresolved": 0,
+                        "critical_total": 0,
+                        "critical_supported": 0,
+                        "critical_contradicted": 0,
+                    },
+                },
+            },
+        }
+
+        result = orch._finalize_task(task)
+
+        assert result.metadata["completion_grade"] == "degraded"
+        assert "missing_required_claim_evidence" in (
+            result.metadata["degraded_completion"]["reasons"]
+        )
+
+    def test_finalize_distinguishes_verified_with_warnings(self, tmp_path):
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text='{"subtasks": []}'),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=_make_state_manager(tmp_path),
+            event_bus=_make_event_bus(),
+            config=_make_config(),
+        )
+        task = _make_task()
+        task.plan = Plan(subtasks=[
+            Subtask(
+                id="done",
+                description="Done",
+                status=SubtaskStatus.COMPLETED,
+            ),
+        ])
+        task.metadata["verification_outcome_counts"] = {"pass_with_warnings": 1}
+
+        result = orch._finalize_task(task)
+
+        assert result.metadata["completion_grade"] == "verified_with_warnings"
+
+    def test_finalize_degrades_with_open_correction_cycle(self, tmp_path):
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text='{"subtasks": []}'),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=_make_state_manager(tmp_path),
+            event_bus=_make_event_bus(),
+            config=_make_config(),
+        )
+        task = _make_task()
+        task.plan = Plan(subtasks=[
+            Subtask(
+                id="done",
+                description="Done",
+                status=SubtaskStatus.COMPLETED,
+            ),
+        ])
+        orch._task_correction_cycle_states[task.id] = {"corr-1": "retrying"}
+
+        result = orch._finalize_task(task)
+
+        assert result.metadata["completion_grade"] == "degraded"
+        assert result.metadata["degraded_completion"]["open_correction_cycles"] == [
+            "corr-1",
+        ]
+
     @pytest.mark.asyncio
     async def test_wrap_up_exports_evidence_ledger_csv_to_workspace(self, tmp_path):
         plan_json = json.dumps({

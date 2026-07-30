@@ -64,6 +64,7 @@ _CONTRACT_CODES = frozenset({
 _REASON_CODE_ALIASES = {
     "budget_exhausted_incomplete": "runner_tool_budget_exhausted",
     "iteration_budget_exceeded": "runner_tool_budget_exhausted",
+    "runner_repeated_degraded_fit": "runner_tool_budget_exhausted",
     "tool_budget_exceeded": "runner_tool_budget_exhausted",
     "tool_budget_exhausted": "runner_tool_budget_exhausted",
 }

@@ -28,8 +28,14 @@ from loom.engine.scheduler import Scheduler
 from loom.engine.verification import VerificationGates, VerificationResult
 from loom.events.bus import EventBus
 from loom.events.types import (
+    CORRECTION_DETECTED,
+    CORRECTION_PLANNED,
+    CORRECTION_PROGRESS,
+    CORRECTION_RESOLVED,
+    CORRECTION_TERMINAL,
     SUBTASK_BLOCKED,
     SUBTASK_COMPLETED,
+    SUBTASK_FAILED,
     SUBTASK_OUTCOME_STALE,
     SUBTASK_OUTPUT_CONFLICT_DEFERRED,
     SUBTASK_OUTPUT_CONFLICT_STARVATION_WARNING,
@@ -194,6 +200,113 @@ class Orchestrator:
         self._prompts = prompt_assembler
         self._state = state_manager
         self._events = event_bus
+        self._task_event_rollup: dict[str, dict[str, int]] = {}
+        self._task_verification_reason_rollup: dict[str, dict[str, int]] = {}
+        self._task_correction_cycle_states: dict[str, dict[str, str]] = {}
+        self._semantic_compactor_rollup: dict[str, int] = {}
+
+        def _accumulate_runtime_event(event) -> None:
+            task_id = str(getattr(event, "task_id", "") or "").strip()
+            event_type = str(getattr(event, "event_type", "") or "").strip()
+            if not task_id or not event_type:
+                return
+            counts = self._task_event_rollup.setdefault(task_id, {})
+            counts[event_type] = int(counts.get(event_type, 0)) + 1
+            if event_type == VERIFICATION_OUTCOME:
+                data = getattr(event, "data", {})
+                if not isinstance(data, dict):
+                    data = {}
+                reason = str(data.get("reason_code", "") or "").strip().lower()
+                reason = reason or "unspecified"
+                reasons = self._task_verification_reason_rollup.setdefault(task_id, {})
+                reasons[reason] = int(reasons.get(reason, 0)) + 1
+            data = getattr(event, "data", {})
+            if not isinstance(data, dict):
+                data = {}
+            if event_type in {
+                CORRECTION_DETECTED,
+                CORRECTION_PLANNED,
+                CORRECTION_PROGRESS,
+                CORRECTION_RESOLVED,
+                CORRECTION_TERMINAL,
+            }:
+                cycle_id = str(data.get("cycle_id", "") or "").strip()
+                if cycle_id:
+                    cycle_states = self._task_correction_cycle_states.setdefault(
+                        task_id,
+                        {},
+                    )
+                    if event_type == CORRECTION_RESOLVED:
+                        cycle_states[cycle_id] = "resolved"
+                    elif event_type == CORRECTION_TERMINAL:
+                        cycle_states[cycle_id] = "terminal"
+                    else:
+                        cycle_states[cycle_id] = (
+                            str(data.get("state", "") or "").strip().lower()
+                            or "active"
+                        )
+            if (
+                event_type == "model_invocation"
+                and str(data.get("origin", "") or "") == "semantic_compactor.complete"
+            ):
+                phase = str(data.get("phase", "") or "").strip().lower()
+                if phase == "done":
+                    self._semantic_compactor_rollup["model_calls"] = (
+                        int(self._semantic_compactor_rollup.get("model_calls", 0)) + 1
+                    )
+                    duration = float(data.get("duration_seconds", 0.0) or 0.0)
+                    elapsed_ms = max(0, int(round(duration * 1000)))
+                    self._semantic_compactor_rollup["model_call_duration_ms"] = (
+                        int(
+                            self._semantic_compactor_rollup.get(
+                                "model_call_duration_ms",
+                                0,
+                            ),
+                        )
+                        + elapsed_ms
+                    )
+                elif phase == "validation":
+                    self._semantic_compactor_rollup["validation_attempts"] = (
+                        int(
+                            self._semantic_compactor_rollup.get(
+                                "validation_attempts",
+                                0,
+                            ),
+                        )
+                        + 1
+                    )
+                    if not bool(data.get("compactor_output_valid", False)):
+                        self._semantic_compactor_rollup["validation_failures"] = (
+                            int(
+                                self._semantic_compactor_rollup.get(
+                                    "validation_failures",
+                                    0,
+                                ),
+                            )
+                            + 1
+                        )
+                    if int(data.get("compactor_retry_count", 0) or 0) > 0:
+                        self._semantic_compactor_rollup["retry_attempts"] = (
+                            int(
+                                self._semantic_compactor_rollup.get(
+                                    "retry_attempts",
+                                    0,
+                                ),
+                            )
+                            + 1
+                        )
+                    if bool(data.get("compactor_warning", False)):
+                        self._semantic_compactor_rollup["warning_outputs"] = (
+                            int(
+                                self._semantic_compactor_rollup.get(
+                                    "warning_outputs",
+                                    0,
+                                ),
+                            )
+                            + 1
+                        )
+
+        event_bus.subscribe_all(_accumulate_runtime_event)
         self._config = config
         self._learning = learning_manager
         self._process = process
@@ -343,6 +456,10 @@ class Orchestrator:
         """Main entry point. Drives the full task lifecycle."""
         try:
             self._telemetry_rollup = self._new_telemetry_rollup()
+            self._task_event_rollup[task.id] = {}
+            self._task_verification_reason_rollup[task.id] = {}
+            self._task_correction_cycle_states[task.id] = {}
+            self._semantic_compactor_rollup = {}
             self._run_budget = _RunBudget(self._config)
             run_id = await self._initialize_task_run_id_async(task)
             self._emit(TASK_RUN_ACQUIRED, task.id, {
@@ -1235,6 +1352,14 @@ class Orchestrator:
             f"Skipped: blocked by critical-path failure in {subtask.id}"
         )
         async with self._state_lock:
+            subtask.status = SubtaskStatus.FAILED
+            subtask.summary = verification.feedback or "Catastrophic verification failure"
+            task.update_subtask(
+                subtask.id,
+                status=SubtaskStatus.FAILED,
+                summary=subtask.summary,
+                active_issue=subtask.summary,
+            )
             for candidate in task.plan.subtasks:
                 if candidate.status == SubtaskStatus.PENDING:
                     candidate.status = SubtaskStatus.SKIPPED
@@ -1254,6 +1379,14 @@ class Orchestrator:
                 ),
             )
             await self._save_task_state(task)
+        self._emit(SUBTASK_FAILED, task.id, {
+            "subtask_id": subtask.id,
+            "verification_tier": verification.tier,
+            "feedback": verification.feedback,
+            "verification_outcome": verification.outcome,
+            "reason_code": verification.reason_code,
+            "catastrophic": True,
+        })
 
     def _phase_mode(self) -> str:
         return orchestrator_planning.phase_mode(self)
@@ -2867,9 +3000,15 @@ class Orchestrator:
         orchestrator_telemetry.accumulate_subtask_telemetry(self, result)
 
     def _task_event_counts(self, task_id: str) -> dict[str, int]:
+        counts = self._task_event_rollup.get(task_id)
+        if isinstance(counts, dict):
+            return dict(counts)
         return orchestrator_telemetry.task_event_counts(self._events, task_id)
 
     def _verification_reason_counts(self, task_id: str) -> dict[str, int]:
+        reasons = self._task_verification_reason_rollup.get(task_id)
+        if isinstance(reasons, dict):
+            return dict(reasons)
         return orchestrator_telemetry.verification_reason_counts(
             event_bus=self._events,
             task_id=task_id,

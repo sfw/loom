@@ -1898,6 +1898,7 @@ class TestVerificationGates:
         assert passed.passed
         event_types = [event.event_type for event in events]
         assert VERIFICATION_STARTED in event_types
+        assert "verification_contradiction_detected" not in event_types
         assert VERIFICATION_PASSED in event_types
 
         events.clear()

@@ -26,7 +26,6 @@ from loom.events.types import (
     ITERATION_STATE_RECONCILED,
     ITERATION_TERMINAL,
     SUBTASK_COMPLETED,
-    SUBTASK_FAILED,
     SUBTASK_POLICY_RECONCILED,
     SUBTASK_RETRYING,
     SUBTASK_STARTED,
@@ -440,19 +439,61 @@ async def dispatch_subtask(
                     status = str(item.get("status", "") or "").strip().lower()
                     if status in {"contradicted", "stale"}:
                         unresolved_hard_total += 1
+        validity_contract = orchestrator._validity_contract_for_subtask(subtask)
+        requires_fact_checked_claims = bool(
+            isinstance(validity_contract, dict)
+            and validity_contract.get("require_fact_checker_for_synthesis", False)
+        )
+        final_gate_contract = (
+            validity_contract.get("final_gate", {})
+            if isinstance(validity_contract, dict)
+            else {}
+        )
+        enforces_verified_context = bool(
+            isinstance(final_gate_contract, dict)
+            and final_gate_contract.get("enforce_verified_context_only", True)
+        )
+        missing_required_claims = (
+            requires_fact_checked_claims
+            and enforces_verified_context
+            and supported_total <= 0
+        )
+        evidence_preflight_required = (
+            missing_required_claims and unresolved_total <= 0
+        )
+        if evidence_preflight_required:
+            # Do not deadlock synthesis before it can invoke the required fact
+            # checker. Admit a constrained evidence-preflight pass; post-run
+            # verification still blocks completion unless supported claims are
+            # produced.
+            gate_passed = True
+            gate_error = (
+                "Synthesis evidence preflight required: no supported claims are "
+                "available yet. Invoke the required fact checker against existing "
+                "source artifacts before writing final deliverables. Do not state "
+                "unsupported material claims."
+            )
         gate_decision = resolve_policy_decision(
             severity_class="semantic",
             reason_code=(
                 "claim_contradicted"
                 if unresolved_hard_total > 0
-                else "coverage_below_threshold"
+                else (
+                    "claim_insufficient_evidence"
+                    if missing_required_claims
+                    else "coverage_below_threshold"
+                )
             ),
             profile=effective_profile,
             mode=policy_mode,
             contradiction_detected=bool(unresolved_hard_total > 0),
             profile_confidence=profile_resolution.confidence,
         )
-        if not gate_passed and gate_decision.action == "pass_with_warnings":
+        if (
+            not gate_passed
+            and not missing_required_claims
+            and gate_decision.action == "pass_with_warnings"
+        ):
             gate_passed = True
             gate_error = (
                 "Synthesis gate warning: proceeding under profile-aware policy "
@@ -465,6 +506,9 @@ async def dispatch_subtask(
             "supported_claim_count": int(supported_total),
             "unresolved_claim_count": int(unresolved_total),
             "unresolved_hard_count": int(unresolved_hard_total),
+            "requires_fact_checked_claims": requires_fact_checked_claims,
+            "missing_required_claims": missing_required_claims,
+            "evidence_preflight_required": evidence_preflight_required,
             "verification_profile": effective_profile,
             "verification_profile_confidence": float(profile_resolution.confidence),
             "policy_action": gate_decision.action,
@@ -491,7 +535,11 @@ async def dispatch_subtask(
                 confidence=0.0,
                 feedback=gate_error,
                 outcome="fail",
-                reason_code="coverage_below_threshold",
+                reason_code=(
+                    "claim_insufficient_evidence"
+                    if missing_required_claims
+                    else "coverage_below_threshold"
+                ),
                 severity_class="semantic",
                 metadata={
                     "synthesis_input_gate_blocked": True,
@@ -517,8 +565,9 @@ async def dispatch_subtask(
             retry_context = (
                 f"{retry_context}\n\n"
                 f"{gate_error}\n"
-                "If claims remain uncertain, keep uncertainty explicit and avoid "
-                "stating unverified assertions as facts."
+                "If claims remain uncertain, keep uncertainty explicit, prune "
+                "unsupported assertions, and avoid writing the final deliverable "
+                "until evidence preflight is complete."
             ).strip()
 
     changelog = orchestrator._get_changelog(task)
@@ -1122,23 +1171,16 @@ async def handle_failure(
             subtask=subtask,
             verification=verification,
         )
-        subtask.status = SubtaskStatus.FAILED
-        subtask.summary = verification.feedback or "Verification failed"
+        # Verification gaps remain recoverable until the outcome arbiter proves
+        # otherwise; do not flash a misleading terminal failure state.
+        subtask.status = SubtaskStatus.RUNNING
+        subtask.active_issue = verification.feedback or "Verification gap detected"
         task.update_subtask(
             subtask.id,
-            status=SubtaskStatus.FAILED,
-            summary=subtask.summary,
+            status=SubtaskStatus.RUNNING,
+            active_issue=subtask.active_issue,
         )
-        task.add_error(subtask.id, f"Verification failed (tier {verification.tier})")
         await orchestrator._save_task_state(task)
-
-    orchestrator._emit(SUBTASK_FAILED, task.id, {
-        "subtask_id": subtask.id,
-        "verification_tier": verification.tier,
-        "feedback": verification.feedback,
-        "verification_outcome": verification.outcome,
-        "reason_code": verification.reason_code,
-    })
 
     if (
         strategy == RetryStrategy.UNCONFIRMED_DATA
@@ -1477,6 +1519,20 @@ async def handle_failure(
                 f"{resolution_plan}"
             )
             verification_feedback = details.strip()
+        async with orchestrator._state_lock:
+            subtask.status = SubtaskStatus.FAILED
+            subtask.summary = verification.feedback or "Verification failed"
+            task.update_subtask(
+                subtask.id,
+                status=SubtaskStatus.FAILED,
+                summary=subtask.summary,
+                active_issue=subtask.active_issue,
+            )
+            task.add_error(
+                subtask.id,
+                verification.feedback or "Verification retries exhausted",
+            )
+            await orchestrator._save_task_state(task)
         return {
             "reason": orchestrator._build_replan_reason(subtask, verification),
             "failed_subtask_id": subtask.id,
@@ -1493,6 +1549,7 @@ async def handle_success(
     verification: VerificationResult,
 ) -> None:
     """Process a successful subtask: update state, check approval."""
+    executor_status_before_verification = str(result.status)
     await orchestrator._persist_subtask_evidence_async(
         task.id,
         subtask.id,
@@ -1538,6 +1595,24 @@ async def handle_success(
             subtask=subtask,
             verification=verification,
         )
+        outcome = str(getattr(verification, "outcome", "") or "").strip().lower()
+        outcome_counts = task.metadata.setdefault("verification_outcome_counts", {})
+        if isinstance(outcome_counts, dict) and outcome:
+            outcome_counts[outcome] = int(outcome_counts.get(outcome, 0) or 0) + 1
+        if result.status != SubtaskResultStatus.SUCCESS:
+            recovered = task.metadata.setdefault("recovered_executor_failures", [])
+            if isinstance(recovered, list) and not any(
+                isinstance(item, dict) and item.get("subtask_id") == subtask.id
+                for item in recovered
+            ):
+                recovered.append({
+                    "subtask_id": subtask.id,
+                    "executor_status": executor_status_before_verification,
+                    "verification_outcome": outcome,
+                    "reason_code": str(
+                        getattr(verification, "reason_code", "") or "",
+                    ).strip().lower(),
+                })
         if subtask.is_synthesis:
             summary = orchestrator._append_synthesis_provenance_footer(
                 task=task,
@@ -1588,7 +1663,11 @@ async def handle_success(
 
     orchestrator._emit(SUBTASK_COMPLETED, task.id, {
         "subtask_id": subtask.id,
-        "status": result.status,
+        "status": "completed",
+        "executor_status_before_verification": executor_status_before_verification,
+        "executor_recovered_by_verification": (
+            result.status != SubtaskResultStatus.SUCCESS
+        ),
         "summary": summary,
         "duration": result.duration_seconds,
         "verification_outcome": verification.outcome if verification else "",

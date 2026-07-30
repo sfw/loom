@@ -12,6 +12,7 @@ from loom.engine.correction import (
     CorrectionState,
     Repairability,
 )
+from loom.engine.correction.types import ProgressVector
 from loom.engine.verification import Check, VerificationResult
 from loom.state.memory import Database, MemoryManager
 
@@ -36,6 +37,13 @@ async def correction_runtime(tmp_path):
 
 def _result():
     return SimpleNamespace(tool_calls=[], evidence_records=[], summary="failed")
+
+
+def test_attempt_local_artifact_counts_and_confidence_do_not_fake_progress() -> None:
+    previous = ProgressVector(1, 1, 1, 0, 0, 0, 0.2)
+    current = ProgressVector(1, 1, 1, 0, 0, 3, 1.0)
+
+    assert current.improved_from(previous) is False
 
 
 class TestHistoricalFailureReplay:

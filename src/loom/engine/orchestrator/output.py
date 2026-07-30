@@ -1067,6 +1067,15 @@ def _apply_finalization_outcome(self, task: Task) -> None:
     """Apply final task status, telemetry, and event emissions before persistence."""
     completed, total = task.progress
     run_validity_summary = self._refresh_run_validity_scorecard(task)
+    correction_states = getattr(self, "_task_correction_cycle_states", {}).get(
+        task.id,
+        {},
+    )
+    open_correction_cycles = sorted(
+        cycle_id
+        for cycle_id, state in correction_states.items()
+        if str(state or "").strip().lower() not in {"resolved", "terminal"}
+    )
     blocking_remediation_failures: list[str] = []
     blocked_subtasks: list[dict[str, object]] = []
     raw_blocked_subtasks = task.metadata.get("blocked_subtasks")
@@ -1212,11 +1221,44 @@ def _apply_finalization_outcome(self, task: Task) -> None:
             degraded_reasons.append("open_remediation")
         if blocked_subtasks:
             degraded_reasons.append("blocked_dependencies")
+        validity_reason_codes = {
+            str(item or "").strip().lower()
+            for item in list(run_validity_summary.get("reason_codes", []))
+            if str(item or "").strip()
+        }
+        if "no_claims_extracted" in validity_reason_codes:
+            degraded_reasons.append("missing_required_claim_evidence")
+        if open_correction_cycles:
+            degraded_reasons.append("open_correction_cycles")
 
         completed, total = task.progress
         task.status = TaskStatus.COMPLETED
         task.completed_at = datetime.now().isoformat()
-        completion_grade = "degraded" if degraded_reasons else "verified"
+        verification_outcome_counts = task.metadata.get(
+            "verification_outcome_counts",
+            {},
+        )
+        if not isinstance(verification_outcome_counts, dict):
+            verification_outcome_counts = {}
+        warning_outcomes = sum(
+            int(verification_outcome_counts.get(key, 0) or 0)
+            for key in ("pass_with_warnings", "partial_verified")
+        )
+        recovered_executor_failures = task.metadata.get(
+            "recovered_executor_failures",
+            [],
+        )
+        if not isinstance(recovered_executor_failures, list):
+            recovered_executor_failures = []
+        completion_grade = (
+            "degraded"
+            if degraded_reasons
+            else (
+                "verified_with_warnings"
+                if warning_outcomes > 0 or recovered_executor_failures
+                else "verified"
+            )
+        )
         task.metadata["completion_grade"] = completion_grade
         task.metadata["degraded_completion"] = {
             "reasons": degraded_reasons,
@@ -1224,6 +1266,9 @@ def _apply_finalization_outcome(self, task: Task) -> None:
             "skipped_subtasks": skipped_ids,
             "blocking_remediation_failures": blocking_remediation_failures,
             "blocked_subtasks": blocked_subtasks,
+            "open_correction_cycles": open_correction_cycles,
+            "warning_outcomes": warning_outcomes,
+            "recovered_executor_failures": recovered_executor_failures,
         }
         self._emit(TASK_COMPLETED, task.id, {
             "completed": completed,
@@ -1231,12 +1276,20 @@ def _apply_finalization_outcome(self, task: Task) -> None:
             "reason": (
                 "completed_with_recoverable_gaps"
                 if degraded_reasons
-                else "all_subtasks_completed"
+                else (
+                    "completed_with_warnings"
+                    if completion_grade == "verified_with_warnings"
+                    else "all_subtasks_completed"
+                )
             ),
             "outcome": (
                 "completed_degraded"
                 if degraded_reasons
-                else "completed"
+                else (
+                    "completed_with_warnings"
+                    if completion_grade == "verified_with_warnings"
+                    else "completed"
+                )
             ),
             "completion_grade": completion_grade,
             "partial_subtasks": partial_ids,
