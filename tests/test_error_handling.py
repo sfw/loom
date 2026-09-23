@@ -715,6 +715,61 @@ class TestOllamaProviderErrors:
         finally:
             asyncio.run(provider._client.aclose())
 
+    def test_build_messages_normalizes_native_tool_call_history(self):
+        provider = self._make_provider()
+        try:
+            messages = [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call_0",
+                        "type": "function",
+                        "function": {
+                            "name": "glob_find",
+                            "arguments": '{"pattern": "*.csv"}',
+                        },
+                    }],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_0",
+                    "content": "data.csv",
+                },
+            ]
+
+            normalized = provider._build_ollama_messages(messages)
+
+            assert normalized[0]["tool_calls"][0]["function"]["arguments"] == {
+                "pattern": "*.csv",
+            }
+            assert normalized[1]["tool_name"] == "glob_find"
+            assert normalized[1]["tool_call_id"] == "call_0"
+        finally:
+            asyncio.run(provider._client.aclose())
+
+    def test_build_messages_preserves_object_tool_arguments(self):
+        provider = self._make_provider()
+        try:
+            messages = [{
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "function": {
+                        "name": "list_directory",
+                        "arguments": {"path": "src"},
+                    },
+                }],
+            }]
+
+            normalized = provider._build_ollama_messages(messages)
+
+            assert normalized[0]["tool_calls"][0]["function"]["arguments"] == {
+                "path": "src",
+            }
+        finally:
+            asyncio.run(provider._client.aclose())
+
     @pytest.mark.asyncio
     async def test_complete_connect_error(self):
         provider = self._make_provider()
