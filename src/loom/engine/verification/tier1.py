@@ -82,6 +82,20 @@ class DeterministicVerifier:
     """
 
     _ADVISORY_TOOL_FAILURES = frozenset({"web_fetch", "web_fetch_html", "web_search"})
+    _RESILIENT_EVIDENCE_TOOLS = frozenset({
+        "web_fetch",
+        "web_fetch_html",
+        "web_search",
+        "fact_checker",
+        "conversation_recall",
+        "read_file",
+        "read_artifact",
+        "search_files",
+        "list_directory",
+        "analyze_code",
+        "academic_search",
+        "archive_access",
+    })
     _TOOL_SUCCESS_POLICIES = frozenset({
         "all_tools_hard",
         "development_balanced",
@@ -129,7 +143,12 @@ class DeterministicVerifier:
         process: ProcessDefinition | None,
     ) -> str:
         if process is None:
-            return "all_tools_hard"
+            # Ad-hoc work has no process policy to override this default. Treat
+            # failures from read-only evidence methods as advisory so one
+            # inaccessible source does not invalidate successful alternate
+            # research. Safety, integrity, mutation, and capability failures
+            # remain hard in ``_tool_failure_disposition``.
+            return "method_resilient"
         resolver = getattr(process, "verifier_tool_success_policy", None)
         if callable(resolver):
             raw = str(
@@ -173,7 +192,7 @@ class DeterministicVerifier:
         syntax_enforcement_paths = retry_writable_paths or expected_deliverable_paths
 
         # 1. Did tool calls succeed?
-        for tc in tool_calls:
+        for call_index, tc in enumerate(tool_calls):
             if not tc.result.success:
                 disposition = self._classify_tool_failure(
                     subtask=subtask,
@@ -182,6 +201,24 @@ class DeterministicVerifier:
                     tool_result_data=getattr(tc.result, "data", None),
                     error=tc.result.error,
                 )
+                if self._is_recovered_command_policy_rejection(
+                    tool_calls=tool_calls,
+                    call_index=call_index,
+                    tool_result_data=getattr(tc.result, "data", None),
+                    workspace=workspace,
+                    expected_deliverables=expected_deliverables,
+                ):
+                    checks.append(Check(
+                        name=f"tool_{tc.tool}_advisory",
+                        passed=True,
+                        detail=(
+                            "Advisory tool failure (recovered): the command was rejected "
+                            "before execution, a later safe command succeeded, and the "
+                            "expected deliverable exists. "
+                            f"{tc.result.error or 'Command policy rejection.'}"
+                        ),
+                    ))
+                    continue
                 if disposition.advisory:
                     checks.append(Check(
                         name=f"tool_{tc.tool}_advisory",
@@ -414,6 +451,31 @@ class DeterministicVerifier:
             )
         if hard_failures and reason_code:
             metadata["hard_failure_reason_code"] = reason_code
+        if reason_code == "csv_schema_mismatch":
+            schema_diagnostics: list[dict[str, object]] = []
+            missing_targets: list[str] = []
+            for check in hard_failures:
+                if not check.name.startswith("syntax_"):
+                    continue
+                target = check.name.removeprefix("syntax_").strip()
+                match = re.search(
+                    r"CSV row\s+(?P<row>\d+)\s+has\s+(?P<actual>\d+)\s+columns?\s+"
+                    r"\(expected\s+(?P<expected>\d+)\)",
+                    str(check.detail or ""),
+                    flags=re.IGNORECASE,
+                )
+                diagnostic: dict[str, object] = {"target": target}
+                if match:
+                    diagnostic.update({
+                        "row_number": int(match.group("row")),
+                        "actual_columns": int(match.group("actual")),
+                        "expected_columns": int(match.group("expected")),
+                    })
+                schema_diagnostics.append(diagnostic)
+                if target and target not in missing_targets:
+                    missing_targets.append(target)
+            metadata["schema_diagnostics"] = schema_diagnostics
+            metadata["missing_targets"] = missing_targets
         if placeholder_findings:
             metadata["placeholder_findings"] = placeholder_findings
             metadata["placeholder_finding_count"] = len(placeholder_findings)
@@ -446,6 +508,18 @@ class DeterministicVerifier:
         error: str | None,
     ) -> ToolFailureDisposition:
         detail = str(error or "").strip()
+        data = tool_result_data if isinstance(tool_result_data, dict) else {}
+        structured_tool_reason = str(data.get("reason_code", "") or "").strip().lower()
+        if structured_tool_reason == "command_policy_rejected":
+            return ToolFailureDisposition(
+                advisory=False,
+                detail=(
+                    "reason_code=tool_method_failed; command was rejected before "
+                    f"execution and requires a policy-compliant fallback. {detail}"
+                ),
+                reason_code="tool_method_failed",
+                capability=f"tool:{tool_name}",
+            )
         if self._tool_success_policy == "development_balanced":
             disposition = self._classify_development_tool_failure(
                 subtask=subtask,
@@ -476,14 +550,51 @@ class DeterministicVerifier:
                 tool_result_data=tool_result_data,
                 error=detail,
             )
-            if method_disposition is not None and (
-                self._tool_success_policy == "method_resilient"
-                or tool_name not in self._ADVISORY_TOOL_FAILURES
+            if (
+                method_disposition is not None
+                and self._tool_success_policy == "method_resilient"
+                and tool_name in self._RESILIENT_EVIDENCE_TOOLS
+            ):
+                return ToolFailureDisposition(
+                    advisory=True,
+                    detail=method_disposition.detail,
+                    reason_code=method_disposition.reason_code,
+                    capability=method_disposition.capability,
+                )
+            if (
+                method_disposition is not None
+                and tool_name not in self._ADVISORY_TOOL_FAILURES
             ):
                 return method_disposition
         if self._is_advisory_tool_failure(tool_name, detail):
             return ToolFailureDisposition(advisory=True, detail=detail)
         return ToolFailureDisposition(advisory=False, detail=detail)
+
+    @staticmethod
+    def _is_recovered_command_policy_rejection(
+        *,
+        tool_calls: list,
+        call_index: int,
+        tool_result_data: object,
+        workspace: Path | None,
+        expected_deliverables: list[str],
+    ) -> bool:
+        """Recognize a rejected command that execution already repaired safely."""
+        data = tool_result_data if isinstance(tool_result_data, dict) else {}
+        if str(data.get("reason_code", "") or "").strip().lower() != (
+            "command_policy_rejected"
+        ):
+            return False
+        if bool(data.get("executed", True)):
+            return False
+        later_safe_shell_succeeded = any(
+            str(getattr(call, "tool", "") or "") == "shell_execute"
+            and bool(getattr(getattr(call, "result", None), "success", False))
+            for call in tool_calls[call_index + 1:]
+        )
+        if not later_safe_shell_succeeded or workspace is None or not expected_deliverables:
+            return False
+        return all((workspace / relpath).is_file() for relpath in expected_deliverables)
 
     def _classify_development_tool_failure(
         self,

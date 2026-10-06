@@ -13,6 +13,7 @@ from loom.events.types import (
     ASK_USER_CANCELLED,
     ASK_USER_REQUESTED,
     ASK_USER_TIMEOUT,
+    CORRECTION_DETECTED,
     FORBIDDEN_CANONICAL_WRITE_BLOCKED,
     REMEDIATION_ATTEMPT,
     REMEDIATION_EXPIRED,
@@ -52,11 +53,14 @@ def new_telemetry_rollup() -> dict[str, int]:
     return {
         "model_invocations": 0,
         "tool_calls": 0,
+        "tool_failures": 0,
+        "read_cache_hits": 0,
         "mutating_tool_calls": 0,
         "artifact_ingests": 0,
         "artifact_reads": 0,
         "artifact_retention_deletes": 0,
         "compaction_policy_decisions": 0,
+        "degraded_fit_count": 0,
         "overflow_fallback_count": 0,
         "compactor_warning_count": 0,
         "sealed_policy_preflight_blocked": 0,
@@ -65,23 +69,42 @@ def new_telemetry_rollup() -> dict[str, int]:
     }
 
 
-def accumulate_subtask_telemetry(orchestrator, result: SubtaskResult) -> None:
+def accumulate_subtask_telemetry(
+    orchestrator,
+    task_id: str | SubtaskResult,
+    result: SubtaskResult | None = None,
+) -> None:
     """Accumulate runner subtask telemetry into orchestrator run-level counters."""
+    if result is None:
+        result = task_id  # type: ignore[assignment]
+        task_id = "legacy"
     counters = getattr(result, "telemetry_counters", None)
     if not isinstance(counters, dict):
         return
-    rollup = getattr(orchestrator, "_telemetry_rollup", None)
-    if not isinstance(rollup, dict):
-        orchestrator._telemetry_rollup = new_telemetry_rollup()
-        rollup = orchestrator._telemetry_rollup
+    rollups = getattr(orchestrator, "_telemetry_rollups_by_task", None)
+    if not isinstance(rollups, dict):
+        orchestrator._telemetry_rollups_by_task = {}
+        rollups = orchestrator._telemetry_rollups_by_task
+        legacy = getattr(orchestrator, "_telemetry_rollup", None)
+        if isinstance(legacy, dict):
+            rollups[str(task_id)] = legacy
+        else:
+            orchestrator._telemetry_rollup = rollups.setdefault(
+                str(task_id),
+                new_telemetry_rollup(),
+            )
+    rollup = rollups.setdefault(str(task_id), new_telemetry_rollup())
     for key in (
         "model_invocations",
         "tool_calls",
+        "tool_failures",
+        "read_cache_hits",
         "mutating_tool_calls",
         "artifact_ingests",
         "artifact_reads",
         "artifact_retention_deletes",
         "compaction_policy_decisions",
+        "degraded_fit_count",
         "overflow_fallback_count",
         "compactor_warning_count",
         "sealed_policy_preflight_blocked",
@@ -162,13 +185,19 @@ def development_verification_summary_counts(
         if not isinstance(summary, dict):
             continue
         if bool(summary.get("has_optional_verifier_warnings", False)):
-            counts["optional_warning_outcomes"] = int(
-                counts["optional_warning_outcomes"],
-            ) + 1
+            counts["optional_warning_outcomes"] = (
+                int(
+                    counts["optional_warning_outcomes"],
+                )
+                + 1
+            )
         if bool(summary.get("has_report_mismatch_warning", False)):
-            counts["report_mismatch_warning_outcomes"] = int(
-                counts["report_mismatch_warning_outcomes"],
-            ) + 1
+            counts["report_mismatch_warning_outcomes"] = (
+                int(
+                    counts["report_mismatch_warning_outcomes"],
+                )
+                + 1
+            )
         for key in (
             "product_failure_count",
             "infra_failure_count",
@@ -211,13 +240,16 @@ def verification_severity_counts(
 
 # Extracted telemetry summary emitter
 
+
 def _emit_telemetry_run_summary(self, task: Task) -> None:
     run_key = self._task_run_id(task) or task.id
     if run_key in self._emitted_telemetry_summary_runs:
         return
-    rollup = getattr(self, "_telemetry_rollup", None)
+    rollups = getattr(self, "_telemetry_rollups_by_task", {})
+    rollup = rollups.get(task.id) if isinstance(rollups, dict) else None
     if not isinstance(rollup, dict):
-        rollup = self._new_telemetry_rollup()
+        legacy_rollup = getattr(self, "_telemetry_rollup", None)
+        rollup = legacy_rollup if isinstance(legacy_rollup, dict) else self._new_telemetry_rollup()
     validity_summary = {}
     metadata = task.metadata if isinstance(task.metadata, dict) else {}
     if isinstance(metadata, dict):
@@ -236,6 +268,20 @@ def _emit_telemetry_run_summary(self, task: Task) -> None:
     verification_severity_counts_map = verification_severity_counts(
         verification_reason_counts,
     )
+    correction_states = getattr(self, "_task_correction_cycle_states", {}).get(
+        task.id,
+        {},
+    )
+    if not isinstance(correction_states, dict):
+        correction_states = {}
+    semantic_rollups = getattr(self, "_semantic_compactor_rollups_by_task", {})
+    semantic_compactor = dict(
+        semantic_rollups.get(task.id, {}) if isinstance(semantic_rollups, dict) else {},
+    )
+    if not semantic_compactor:
+        legacy_semantic = getattr(self, "_semantic_compactor_rollup", None)
+        if isinstance(legacy_semantic, dict):
+            semantic_compactor = dict(legacy_semantic)
     verification_lifecycle_counts = {
         "started": int(event_counts.get(VERIFICATION_STARTED, 0)),
         "passed": int(event_counts.get(VERIFICATION_PASSED, 0)),
@@ -335,45 +381,96 @@ def _emit_telemetry_run_summary(self, task: Task) -> None:
             verification_reason_counts.get("dev_report_contract_violation", 0),
         ),
     }
-    self._emit(TELEMETRY_RUN_SUMMARY, task.id, {
-        "run_id": self._task_run_id(task),
-        "model_invocations": int(rollup.get("model_invocations", 0)),
-        "tool_calls": int(rollup.get("tool_calls", 0)),
-        "mutating_tool_calls": int(rollup.get("mutating_tool_calls", 0)),
-        "artifact_ingests": int(rollup.get("artifact_ingests", 0)),
-        "artifact_reads": int(rollup.get("artifact_reads", 0)),
-        "artifact_retention_deletes": int(rollup.get("artifact_retention_deletes", 0)),
-        "compaction_policy_decisions": int(rollup.get("compaction_policy_decisions", 0)),
-        "overflow_fallback_count": int(rollup.get("overflow_fallback_count", 0)),
-        "compactor_warning_count": int(rollup.get("compactor_warning_count", 0)),
-        "sealed_policy_preflight_blocked": int(
-            rollup.get("sealed_policy_preflight_blocked", 0),
-        ),
-        "sealed_reseal_applied": int(rollup.get("sealed_reseal_applied", 0)),
-        "sealed_unexpected_mutation_detected": int(
-            rollup.get("sealed_unexpected_mutation_detected", 0),
-        ),
-        "verification_lifecycle_counts": verification_lifecycle_counts,
-        "verification_reason_counts": verification_reason_counts,
-        "verification_severity_counts": verification_severity_counts_map,
-        "development_verification_summary_counts": development_summary_counts,
-        "development_verification_health": development_verification_health,
-        "remediation_lifecycle_counts": remediation_lifecycle_counts,
-        "human_loop_counts": human_loop_counts,
-        "control_plane_counts": control_plane_counts,
-        "output_conflict_counts": output_conflict_counts,
-        "blocked_indicator": bool(event_counts.get(SUBTASK_BLOCKED, 0) > 0),
-        "degraded_indicator": bool(event_counts.get(TASK_PLAN_DEGRADED, 0) > 0),
-        "replanned_count": int(event_counts.get(TASK_REPLANNING, 0)),
-        "stalled_count": int(event_counts.get(TASK_STALLED, 0)),
-        "reliability_metrics": reliability_metrics,
-        "budget_snapshot": self._run_budget.snapshot(),
-        "validity_summary": validity_summary,
-    })
+    self._emit(
+        TELEMETRY_RUN_SUMMARY,
+        task.id,
+        {
+            "run_id": self._task_run_id(task),
+            "runner_compaction_policy_mode_effective": str(
+                getattr(
+                    getattr(self, "_runner", None),
+                    "_runner_compaction_policy_mode",
+                    "",
+                )
+                or "",
+            )
+            .strip()
+            .lower(),
+            "model_invocations": int(rollup.get("model_invocations", 0)),
+            "tool_calls": int(rollup.get("tool_calls", 0)),
+            "tool_failures": int(rollup.get("tool_failures", 0)),
+            "read_cache_hits": int(rollup.get("read_cache_hits", 0)),
+            "mutating_tool_calls": int(rollup.get("mutating_tool_calls", 0)),
+            "artifact_ingests": int(rollup.get("artifact_ingests", 0)),
+            "artifact_reads": int(rollup.get("artifact_reads", 0)),
+            "artifact_retention_deletes": int(rollup.get("artifact_retention_deletes", 0)),
+            "compaction_policy_decisions": int(rollup.get("compaction_policy_decisions", 0)),
+            "degraded_fit_count": int(rollup.get("degraded_fit_count", 0)),
+            "overflow_fallback_count": int(rollup.get("overflow_fallback_count", 0)),
+            "compactor_warning_count": int(rollup.get("compactor_warning_count", 0)),
+            "sealed_policy_preflight_blocked": int(
+                rollup.get("sealed_policy_preflight_blocked", 0),
+            ),
+            "sealed_reseal_applied": int(rollup.get("sealed_reseal_applied", 0)),
+            "sealed_unexpected_mutation_detected": int(
+                rollup.get("sealed_unexpected_mutation_detected", 0),
+            ),
+            "verification_lifecycle_counts": verification_lifecycle_counts,
+            "verification_reason_counts": verification_reason_counts,
+            "verification_severity_counts": verification_severity_counts_map,
+            "development_verification_summary_counts": development_summary_counts,
+            "development_verification_health": development_verification_health,
+            "remediation_lifecycle_counts": remediation_lifecycle_counts,
+            "human_loop_counts": human_loop_counts,
+            "control_plane_counts": control_plane_counts,
+            "output_conflict_counts": output_conflict_counts,
+            "blocked_indicator": bool(event_counts.get(SUBTASK_BLOCKED, 0) > 0),
+            "degraded_indicator": bool(
+                event_counts.get(TASK_PLAN_DEGRADED, 0) > 0
+                or int(rollup.get("degraded_fit_count", 0)) > 0
+                or str(task.metadata.get("completion_grade", "") or "") == "degraded"
+            ),
+            "correction_lifecycle_counts": {
+                "detected_events": int(event_counts.get(CORRECTION_DETECTED, 0)),
+                "unique_cycles": len(correction_states),
+                "resolved": sum(1 for state in correction_states.values() if state == "resolved"),
+                "terminal": sum(1 for state in correction_states.values() if state == "terminal"),
+                "open": sum(
+                    1
+                    for state in correction_states.values()
+                    if state not in {"resolved", "terminal"}
+                ),
+            },
+            "semantic_compactor": {
+                "model_calls": int(semantic_compactor.get("model_calls", 0)),
+                "model_call_duration_ms": int(
+                    semantic_compactor.get("model_call_duration_ms", 0),
+                ),
+                "validation_attempts": int(
+                    semantic_compactor.get("validation_attempts", 0),
+                ),
+                "validation_failures": int(
+                    semantic_compactor.get("validation_failures", 0),
+                ),
+                "retry_attempts": int(
+                    semantic_compactor.get("retry_attempts", 0),
+                ),
+                "warning_outputs": int(
+                    semantic_compactor.get("warning_outputs", 0),
+                ),
+            },
+            "replanned_count": int(event_counts.get(TASK_REPLANNING, 0)),
+            "stalled_count": int(event_counts.get(TASK_STALLED, 0)),
+            "reliability_metrics": reliability_metrics,
+            "budget_snapshot": self._run_budget.snapshot(),
+            "validity_summary": validity_summary,
+        },
+    )
     self._emitted_telemetry_summary_runs.add(run_key)
 
 
 # Extracted run-id + learning helpers
+
 
 async def _learn_from_task(self, task: Task) -> None:
     """Run post-task learning extraction (best-effort)."""

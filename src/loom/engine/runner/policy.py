@@ -396,17 +396,19 @@ def validate_sealed_artifact_mutation_policy(
         path_preview = f"{path_preview}, ..."
     if latest_seal:
         return (
+            "reason_code=artifact_confirmation_required; "
             "Sealed artifact mutation blocked: target is sealed and verified "
             f"({path_preview}) but no confirmation evidence was recorded "
             f"after seal time {latest_seal}. "
-            "Gather evidence first (for example: read_file, spreadsheet read/summary, "
-            "web_search/web_fetch, or fact_checker), then retry."
+            f"Read the current target file(s) ({path_preview}) and gather any needed "
+            "external evidence, then edit the canonical file in place."
         )
     return (
+        "reason_code=artifact_confirmation_required; "
         "Sealed artifact mutation blocked: target is sealed and verified "
         f"({path_preview}) but no confirmation evidence is recorded in this subtask. "
-        "Gather evidence first (for example: read_file, spreadsheet read/summary, "
-        "web_search/web_fetch, or fact_checker), then retry."
+        f"Read the current target file(s) ({path_preview}) and gather any needed "
+        "external evidence, then edit the canonical file in place."
     )
 
 

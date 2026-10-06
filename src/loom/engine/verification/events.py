@@ -272,10 +272,16 @@ def emit_instrumentation_events(
         contradiction_detected_no_downgrade = bool(
             metadata.get("contradiction_detected_no_downgrade", False),
         )
-        event_bus.emit(Event(
-            event_type=VERIFICATION_CONTRADICTION_DETECTED,
-            task_id=task_id,
-            data={
+        contradiction_count = int(metadata.get("contradicted_count", 0) or 0)
+        if (
+            contradiction_downgraded
+            or contradiction_detected_no_downgrade
+            or contradiction_count > 0
+        ):
+            event_bus.emit(Event(
+                event_type=VERIFICATION_CONTRADICTION_DETECTED,
+                task_id=task_id,
+                data={
                 "subtask_id": subtask_id,
                 "tier": result.tier,
                 "reason_code": result.reason_code,
@@ -308,8 +314,8 @@ def emit_instrumentation_events(
                 "cap_exhaustion_count": (
                     1 if bool(scan_dict.get("cap_exhausted", False)) else 0
                 ),
-            },
-        ))
+                },
+            ))
 
     if result.reason_code == "parse_inconclusive":
         event_bus.emit(Event(

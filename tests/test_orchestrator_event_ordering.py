@@ -119,7 +119,7 @@ async def test_execute_task_success_event_sequence(
 
 
 @pytest.mark.asyncio
-async def test_execute_task_failure_emits_terminal_after_execution_started(
+async def test_execute_task_exception_emits_degraded_completion_after_execution_started(
     tmp_path: Path,
 ) -> None:
     events: list = []
@@ -136,5 +136,6 @@ async def test_execute_task_failure_emits_terminal_after_execution_started(
 
     event_types = [event.event_type for event in events]
     executing_ix = event_types.index(TASK_EXECUTING)
-    failed_ix = event_types.index(TASK_FAILED)
-    assert executing_ix < failed_ix
+    completed_ix = event_types.index(TASK_COMPLETED)
+    assert executing_ix < completed_ix
+    assert TASK_FAILED not in event_types

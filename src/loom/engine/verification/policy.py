@@ -30,6 +30,7 @@ _CONTRADICTION_REASON_CODES = frozenset({
     "contradiction_detected",
 })
 _TARGETED_RETRY_REASON_CODES = frozenset({
+    "artifact_confirmation_required",
     "csv_schema_mismatch",
     "dev_browser_check_failed",
     "dev_build_failed",

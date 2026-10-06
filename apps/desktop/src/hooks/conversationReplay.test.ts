@@ -137,11 +137,11 @@ describe("conversation replay helpers", () => {
   it("preserves readable paragraph breaks between distinct live feedback chunks", () => {
     expect(
       appendStreamingThinkingChunk(
-        "Let me search for blink49 and the Banff festival specifically:",
+        "Let me search for Example Studios and Summit Festival specifically:",
         "Let me try a broader search.",
       ),
     ).toBe(
-      "Let me search for blink49 and the Banff festival specifically:\n\nLet me try a broader search.",
+      "Let me search for Example Studios and Summit Festival specifically:\n\nLet me try a broader search.",
     );
     expect(
       appendStreamingThinkingChunk("step one", " and step two"),

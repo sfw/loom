@@ -99,6 +99,7 @@ instead of runtime code:
 - `verification.remediation` -- strategy metadata, retry budget, critical-path behavior.
 - `evidence` -- record schema, extraction mappings, and summarization controls.
 - `validity_contract` -- claim extraction, prune behavior, and final synthesis gates.
+- `quality_contract` -- output-quality dimensions, coverage floors, required components, and targeted revision gates.
 - `prompt_contracts` -- process-specific executor/verifier/remediation instructions and evidence-contract activation.
 
 Minimal v2 structure:
@@ -131,6 +132,19 @@ validity_contract:
     enforce_verified_context_only: true
     synthesis_min_verification_tier: 2
     critical_claim_support_ratio: 1.0
+
+quality_contract:
+  enabled: true
+  applies_to_phases: [analyze, synthesize]
+  dimensions: [completeness, evidence_traceability, analytical_depth, actionability]
+  minimum_overall_score: 0.78
+  minimum_dimension_score: 0.65
+  minimum_requirement_coverage: 0.8
+  phase_overrides:
+    synthesize:
+      minimum_overall_score: 0.82
+      minimum_traceability_ratio: 0.7
+      required_sections: [Executive Summary, Recommendations, Limitations]
 
 prompt_contracts:
   evidence_contract:
@@ -335,6 +349,10 @@ phases:
       max_unverified_ratio: 0.2
       final_gate:
         synthesis_min_verification_tier: 2
+    quality_contract:               # Optional per-phase output-quality override
+      minimum_overall_score: 0.85
+      minimum_traceability_ratio: 0.75
+      required_sections: [Executive Summary, Limitations]
     iteration:                      # Optional phase-level loop policy
       enabled: true
       max_attempts: 4
@@ -371,6 +389,7 @@ phases:
 | `acceptance_criteria` | No | Concrete criteria for phase completion. |
 | `deliverables` | No | List of expected output files with descriptions. |
 | `validity_contract` | No | Optional phase-level claim/evidence policy override (merged with process defaults). |
+| `quality_contract` | No | Optional phase-level output-quality override (merged with process defaults). |
 | `iteration` | No | Gate-driven loop policy for repeating the phase until gates pass or budgets exhaust. |
 
 Deliverables are enforced by exact filename at execution and verification time.
@@ -467,6 +486,42 @@ Operational behavior:
   explicit overrides (for example `max_contradicted_count > 0` is rejected).
 - Write-path artifacts (`write_file`, `document_write`, final synthesis output)
   are captured with provenance metadata and included in run-level validity events.
+
+### Quality contract (completeness and decision usefulness)
+
+`quality_contract` is an optional process-level contract with phase overrides.
+For enabled phases, Loom gives the executor the transitive upstream artifact
+inventory, audits every expected phase artifact, and requires the tier-2 verifier
+to return structured quality scores. A missed floor routes to bounded in-place
+revision; exhausted quality repair preserves usable work. Set
+`verification.quality_policy_mode` in `loom.toml` to stage rollout safely:
+
+- `observe` records scorecards without triggering repair or changing completion.
+- `assist` triggers targeted repair and reports unresolved gaps without grading the
+  whole run as degraded.
+- `enforce` triggers targeted repair and grades unresolved floors as a completed,
+  recoverable gap. It still does not discard usable work or turn an ordinary
+  quality miss into a catastrophic run failure.
+
+Supported fields:
+
+- `enabled`: master toggle.
+- `applies_to_phases`: phase IDs or `"*"`.
+- `dimensions`: score names the verifier must return under `metadata.quality`.
+- `minimum_overall_score`: minimum aggregate score from 0 to 1.
+- `minimum_dimension_score`: minimum score for every required dimension.
+- `minimum_requirement_coverage`: minimum acceptance-criteria coverage from 0 to 1.
+- `minimum_traceability_ratio`: minimum ratio of referenced evidence IDs or normalized source URLs present in `source-index.csv`.
+- `minimum_upstream_evidence_reuse_ratio`: minimum share of upstream evidence IDs or source URLs carried into the current synthesis.
+- `require_source_index_urls`: require every indexed evidence ID to retain a source URL or citation.
+- `required_sections`: headings that must appear across expected Markdown artifacts.
+- `phase_overrides`: per-phase replacements for stricter synthesis or QA floors.
+
+Quality scores complement deterministic artifact, schema, and evidence checks;
+they do not replace them. Document length is diagnostic only and is never used
+as a passing quality proxy. Runtime metadata retains a bounded, privacy-safe
+quality observation and repair ledger containing only aggregate scores, counts,
+and deltas—never artifact paths, query text, or source content.
 
 ### Phase iteration loops (optional)
 
@@ -915,6 +970,16 @@ tests:
       verification:
         forbidden_patterns:
           - "deliverable_.* not found"
+      quality:
+        allowed_completion_grades: [verified, verified_with_warnings]
+        artifact_minimum_characters:
+          company-overview.md: 1200
+        artifact_required_patterns:
+          company-overview.md:
+            - "(?im)^#{1,6}\\s+Executive Summary\\s*$"
+            - "(?im)^#{1,6}\\s+Limitations\\s*$"
+        csv_minimum_rows:
+          evidence-register.csv: 8
 ```
 
 `mode: deterministic` runs with a scripted model backend for reproducible CI checks.  
@@ -933,6 +998,13 @@ Validation rules:
 - `mode` must be `deterministic` or `live`.
 - `goal` is required.
 - `timeout_seconds` must be greater than zero.
+- `quality.allowed_completion_grades` may contain `verified`,
+  `verified_with_warnings`, or `degraded`.
+- `quality.artifact_minimum_characters` detects implausibly thin files without
+  treating length alone as semantic quality.
+- `quality.artifact_required_patterns` requires concrete sections or other
+  artifact-local contracts.
+- `quality.csv_minimum_rows` rejects header-only or materially incomplete tables.
 
 ## Bundled tools
 

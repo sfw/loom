@@ -28,6 +28,9 @@ Current desktop/workspace-first tables added through migrations include:
 - `workspace_settings`
 - `conversation_run_links`
 - `search_provider_state`
+- `correction_cycles`
+- `correction_attempts`
+- `correction_actions`
 
 Recent authority/freshness metadata added through migrations includes:
 
@@ -36,6 +39,12 @@ Recent authority/freshness metadata added through migrations includes:
 - `cowork_sessions.chat_journal_through_turn` / `chat_journal_through_seq` for transcript coverage
 - `conversation_turns.metadata` for durable user attachment/context payloads
 - `search_provider_state.next_allowed_at` / `cooldown_until` / `lease_expires_at` for auth-free web search pacing authority
+- correction blocker snapshots, progress vectors, typed plans, attempts, and
+  idempotent actions for restart-safe self-correction
+
+Migration `20260728_008_correction_lifecycle_v1` adds the correction tables. Existing
+retry/remediation history remains intact; new runs write the unified lifecycle without
+requiring a database reset.
 
 `schema_migrations` stores:
 - `id`

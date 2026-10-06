@@ -149,7 +149,9 @@ class TestPlannerPrompt:
         sample_task: Task,
     ):
         prompt = assembler.build_planner_prompt(sample_task)
-        assert "Do NOT assume non-obvious tool capabilities will be available" in prompt
+        assert "Do NOT assume other non-obvious tool capabilities" in prompt
+        assert "read_file` natively reads text, PDF, DOC/DOCX, and PPT/PPTX" in prompt
+        assert "Do NOT create capability-probe subtasks" in prompt
 
 class TestExecutorPrompt:
     """Test executor prompt assembly."""
@@ -194,6 +196,7 @@ class TestExecutorPrompt:
 
         assert "python -c / perl -e / ruby -e" in prompt
         assert "jq -e . file.json" in prompt
+        assert "Use read_file directly for text, PDF, DOC/DOCX, and PPT/PPTX" in prompt
         assert "Default deliverable location is the workspace root" in prompt
 
     def test_executor_requires_ask_user_for_critical_unknowns(

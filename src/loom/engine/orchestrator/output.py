@@ -171,17 +171,21 @@ def select_conflict_safe_batch(
         paths = set(deliverables_by_subtask.get(subtask_id, []))
         overlap = sorted(path for path in paths if path in selected_paths)
         if overlap:
-            conflicting_with = sorted({
-                str(owner_by_path.get(path, "")).strip()
-                for path in overlap
-                if str(owner_by_path.get(path, "")).strip()
-            })
-            deferred.append({
-                "subtask_id": subtask_id,
-                "phase_id": str(getattr(subtask, "phase_id", "") or "").strip(),
-                "conflicting_paths": overlap,
-                "conflicting_with": conflicting_with,
-            })
+            conflicting_with = sorted(
+                {
+                    str(owner_by_path.get(path, "")).strip()
+                    for path in overlap
+                    if str(owner_by_path.get(path, "")).strip()
+                }
+            )
+            deferred.append(
+                {
+                    "subtask_id": subtask_id,
+                    "phase_id": str(getattr(subtask, "phase_id", "") or "").strip(),
+                    "conflicting_paths": overlap,
+                    "conflicting_with": conflicting_with,
+                }
+            )
             continue
         selected.append(subtask)
         for path in paths:
@@ -297,11 +301,13 @@ def phase_worker_artifact_paths(orchestrator, *, task, phase_id: str) -> dict[st
     for worker_id, entries in latest.items():
         if not isinstance(entries, list):
             continue
-        paths = sorted({
-            str(item.get("artifact_path", "")).strip()
-            for item in entries
-            if isinstance(item, dict) and str(item.get("artifact_path", "")).strip()
-        })
+        paths = sorted(
+            {
+                str(item.get("artifact_path", "")).strip()
+                for item in entries
+                if isinstance(item, dict) and str(item.get("artifact_path", "")).strip()
+            }
+        )
         if paths:
             artifact_paths[str(worker_id).strip()] = paths
     return artifact_paths
@@ -313,10 +319,7 @@ def evaluate_finalizer_manifest_requirements(orchestrator, *, task, subtask) -> 
     output_strategy = str(output_policy.get("output_strategy", "") or "").strip().lower()
     output_role = str(output_policy.get("output_role", "") or "").strip().lower()
     phase_id = str(getattr(subtask, "phase_id", "") or "").strip()
-    if (
-        output_strategy != "fan_in"
-        or output_role != orchestrator._OUTPUT_ROLE_PHASE_FINALIZER
-    ):
+    if output_strategy != "fan_in" or output_role != orchestrator._OUTPUT_ROLE_PHASE_FINALIZER:
         return {
             "enabled": False,
             "policy": "",
@@ -337,16 +340,11 @@ def evaluate_finalizer_manifest_requirements(orchestrator, *, task, subtask) -> 
         phase_id=phase_id,
     )
     missing_worker_ids = [
-        worker_id
-        for worker_id in worker_ids
-        if worker_id not in artifact_paths_by_worker
+        worker_id for worker_id in worker_ids if worker_id not in artifact_paths_by_worker
     ]
-    allowed_manifest_paths = sorted({
-        path
-        for paths in artifact_paths_by_worker.values()
-        for path in paths
-        if str(path).strip()
-    })
+    allowed_manifest_paths = sorted(
+        {path for paths in artifact_paths_by_worker.values() for path in paths if str(path).strip()}
+    )
     return {
         "enabled": True,
         "policy": orchestrator._phase_finalizer_input_policy(phase_id),
@@ -401,19 +399,21 @@ def record_fan_in_worker_artifacts(orchestrator, *, task, subtask, result) -> No
             digest = hashlib.sha1(payload).hexdigest()
         except Exception:
             digest = ""
-        entries.append({
-            "schema_version": 1,
-            "task_id": task.id,
-            "run_id": orchestrator._task_run_id(task),
-            "phase_id": phase_id,
-            "subtask_id": subtask.id,
-            "attempt": attempt,
-            "generated_at": generated_at,
-            "output_role": orchestrator._OUTPUT_ROLE_WORKER,
-            "output_strategy": "fan_in",
-            "artifact_path": artifact_path,
-            "content_hash": digest,
-        })
+        entries.append(
+            {
+                "schema_version": 1,
+                "task_id": task.id,
+                "run_id": orchestrator._task_run_id(task),
+                "phase_id": phase_id,
+                "subtask_id": subtask.id,
+                "attempt": attempt,
+                "generated_at": generated_at,
+                "output_role": orchestrator._OUTPUT_ROLE_WORKER,
+                "output_strategy": "fan_in",
+                "artifact_path": artifact_path,
+                "content_hash": digest,
+            }
+        )
     with manifest_path.open("a", encoding="utf-8") as handle:
         for entry in entries:
             handle.write(json.dumps(entry, ensure_ascii=False))
@@ -506,11 +506,13 @@ def augment_retry_context_with_phase_artifacts(
     lines = ["FAN-IN WORKER ARTIFACT MANIFEST (LATEST SUCCESSFUL BY WORKER):"]
     for worker_id in sorted(latest):
         entries = latest.get(worker_id, [])
-        artifact_paths = sorted({
-            str(item.get("artifact_path", "")).strip()
-            for item in entries
-            if str(item.get("artifact_path", "")).strip()
-        })
+        artifact_paths = sorted(
+            {
+                str(item.get("artifact_path", "")).strip()
+                for item in entries
+                if str(item.get("artifact_path", "")).strip()
+            }
+        )
         if artifact_paths:
             lines.append(f"- {worker_id}: {', '.join(artifact_paths)}")
         else:
@@ -677,16 +679,8 @@ def manifest_only_input_violations(
     phase_prefix = orchestrator._intermediate_phase_prefix(task=task, phase_id=phase_id)
     if not phase_prefix:
         return []
-    allowed_paths = {
-        str(item).strip()
-        for item in allowed_manifest_paths
-        if str(item).strip()
-    }
-    extra_prefixes = [
-        str(item).strip()
-        for item in allowed_extra_prefixes
-        if str(item).strip()
-    ]
+    allowed_paths = {str(item).strip() for item in allowed_manifest_paths if str(item).strip()}
+    extra_prefixes = [str(item).strip() for item in allowed_extra_prefixes if str(item).strip()]
     manifest_path = orchestrator._phase_artifact_manifest_path(task=task, phase_id=phase_id)
     workspace = Path(task.workspace) if task.workspace else None
     manifest_rel = ""
@@ -778,11 +772,9 @@ def commit_finalizer_stage_publish(
     if not stage_to_canonical:
         return False, "Transactional publish failed: no staged outputs declared."
 
-    canonical_paths = sorted({
-        str(path).strip()
-        for path in stage_to_canonical.values()
-        if str(path).strip()
-    })
+    canonical_paths = sorted(
+        {str(path).strip() for path in stage_to_canonical.values() if str(path).strip()}
+    )
     seals_snapshot = orchestrator._artifact_seals_snapshot(task)
     backup_paths: dict[str, str] = {}
     installed_paths: set[str] = set()
@@ -852,6 +844,7 @@ def commit_finalizer_stage_publish(
 
 # Extracted output coordination + retry-context helpers
 
+
 def _expected_deliverables_for_subtask(self, subtask: Subtask) -> list[str]:
     if self._process is None:
         return []
@@ -860,22 +853,12 @@ def _expected_deliverables_for_subtask(self, subtask: Subtask) -> list[str]:
         return []
     phase_hint = str(getattr(subtask, "phase_id", "") or "").strip()
     if phase_hint in deliverables:
-        return [
-            str(item).strip()
-            for item in deliverables[phase_hint]
-            if str(item).strip()
-        ]
+        return [str(item).strip() for item in deliverables[phase_hint] if str(item).strip()]
     if subtask.id in deliverables:
-        return [
-            str(item).strip()
-            for item in deliverables[subtask.id]
-            if str(item).strip()
-        ]
+        return [str(item).strip() for item in deliverables[subtask.id] if str(item).strip()]
     if len(deliverables) == 1:
         return [
-            str(item).strip()
-            for item in next(iter(deliverables.values()))
-            if str(item).strip()
+            str(item).strip() for item in next(iter(deliverables.values())) if str(item).strip()
         ]
     phase_descriptions: dict[str, str] = {}
     for phase in getattr(self._process, "phases", []):
@@ -887,21 +870,20 @@ def _expected_deliverables_for_subtask(self, subtask: Subtask) -> list[str]:
         ).strip()
     phase_id = infer_phase_id_for_subtask(
         subtask_id=subtask.id,
-        text=" ".join([
-            str(getattr(subtask, "description", "")).strip(),
-            str(getattr(subtask, "acceptance_criteria", "")).strip(),
-        ]).strip(),
+        text=" ".join(
+            [
+                str(getattr(subtask, "description", "")).strip(),
+                str(getattr(subtask, "acceptance_criteria", "")).strip(),
+            ]
+        ).strip(),
         phase_ids=list(deliverables.keys()),
         phase_descriptions=phase_descriptions,
         phase_deliverables=deliverables,
     )
     if phase_id in deliverables:
-        return [
-            str(item).strip()
-            for item in deliverables[phase_id]
-            if str(item).strip()
-        ]
+        return [str(item).strip() for item in deliverables[phase_id] if str(item).strip()]
     return []
+
 
 def _output_write_policy_for_subtask(
     self,
@@ -929,6 +911,7 @@ def _output_write_policy_for_subtask(
         "forbidden_deliverables": forbidden_deliverables,
     }
 
+
 def _files_from_attempts(attempts: list[AttemptRecord], *, max_items: int = 24) -> list[str]:
     files: list[str] = []
     seen: set[str] = set()
@@ -951,6 +934,7 @@ def _files_from_attempts(attempts: list[AttemptRecord], *, max_items: int = 24) 
                     return files
     return files
 
+
 def _files_from_tool_calls(tool_calls: list, *, max_items: int = 24) -> list[str]:
     files: list[str] = []
     seen: set[str] = set()
@@ -972,6 +956,7 @@ def _files_from_tool_calls(tool_calls: list, *, max_items: int = 24) -> list[str
             if len(files) >= max_items:
                 return files
     return files
+
 
 def _augment_retry_context_for_outputs(
     self,
@@ -1001,29 +986,21 @@ def _augment_retry_context_for_outputs(
     if output_strategy == "fan_in":
         if output_role == self._OUTPUT_ROLE_PHASE_FINALIZER:
             lines.append("OUTPUT COORDINATION MODE: FAN-IN PHASE FINALIZER")
-            lines.append(
-                "Consolidate worker intermediate artifacts into canonical deliverables."
-            )
-            lines.append(
-                "Read worker artifacts from phase intermediate root before publishing:"
-            )
+            lines.append("Consolidate worker intermediate artifacts into canonical deliverables.")
+            lines.append("Read worker artifacts from phase intermediate root before publishing:")
             lines.append(
                 f"- {intermediate_root}/<run-id>/{phase_id}/",
             )
         else:
             lines.append("OUTPUT COORDINATION MODE: FAN-IN WORKER")
-            lines.append(
-                "This worker must not modify canonical deliverables for the phase."
-            )
+            lines.append("This worker must not modify canonical deliverables for the phase.")
             lines.append("Write intermediate artifacts under:")
             lines.append(f"- {intermediate_root}/<run-id>/{phase_id}/{subtask.id}/")
     if forbidden_deliverables:
         lines.append("CANONICAL DELIVERABLE FILES FORBIDDEN IN THIS SUBTASK:")
         for name in forbidden_deliverables:
             lines.append(f"- {name}")
-        lines.append(
-            "Do not write these canonical filenames in this step."
-        )
+        lines.append("Do not write these canonical filenames in this step.")
     if expected_deliverables:
         lines.append("CANONICAL DELIVERABLE FILES FOR THIS SUBTASK:")
         for name in expected_deliverables:
@@ -1040,7 +1017,10 @@ def _augment_retry_context_for_outputs(
                 "calling tools and return your completion response."
             )
     if (
-        strategy in {
+        strategy
+        in {
+            RetryStrategy.CONTRACT_REPAIR,
+            RetryStrategy.OUTPUT_REROUTE,
             RetryStrategy.RATE_LIMIT,
             RetryStrategy.EVIDENCE_GAP,
             RetryStrategy.UNCONFIRMED_DATA,
@@ -1061,10 +1041,20 @@ def _augment_retry_context_for_outputs(
 
 # Extracted task finalization orchestration
 
+
 def _apply_finalization_outcome(self, task: Task) -> None:
     """Apply final task status, telemetry, and event emissions before persistence."""
     completed, total = task.progress
     run_validity_summary = self._refresh_run_validity_scorecard(task)
+    correction_states = getattr(self, "_task_correction_cycle_states", {}).get(
+        task.id,
+        {},
+    )
+    open_correction_cycles = sorted(
+        cycle_id
+        for cycle_id, state in correction_states.items()
+        if str(state or "").strip().lower() not in {"resolved", "terminal"}
+    )
     blocking_remediation_failures: list[str] = []
     blocked_subtasks: list[dict[str, object]] = []
     raw_blocked_subtasks = task.metadata.get("blocked_subtasks")
@@ -1086,10 +1076,12 @@ def _apply_finalization_outcome(self, task: Task) -> None:
                     reasons.append(text)
             if not subtask_id:
                 continue
-            blocked_subtasks.append({
-                "subtask_id": subtask_id,
-                "reasons": reasons,
-            })
+            blocked_subtasks.append(
+                {
+                    "subtask_id": subtask_id,
+                    "reasons": reasons,
+                }
+            )
     queue = task.metadata.get("remediation_queue")
     if isinstance(queue, list):
         for item in queue:
@@ -1111,11 +1103,40 @@ def _apply_finalization_outcome(self, task: Task) -> None:
                     label,
                 )
 
-    all_done = (
-        completed == total
-        and total > 0
-        and not blocking_remediation_failures
+    catastrophic = bool(task.metadata.get("catastrophic_failure"))
+    artifact_seals = task.metadata.get("artifact_seals", {})
+    if not isinstance(artifact_seals, dict):
+        artifact_seals = {}
+    synthesis_subtasks = [subtask for subtask in task.plan.subtasks if bool(subtask.is_synthesis)]
+    synthesis_artifact_required = False
+    synthesis_artifact_present = False
+    for synthesis_subtask in synthesis_subtasks:
+        expected_paths = set(self._expected_deliverables_for_subtask(synthesis_subtask))
+        synthesis_artifact_required = bool(expected_paths or artifact_seals)
+        for path, seal in artifact_seals.items():
+            if not isinstance(seal, dict):
+                continue
+            if (
+                str(path or "").strip() in expected_paths
+                or str(seal.get("subtask_id", "") or "").strip() == synthesis_subtask.id
+            ):
+                synthesis_artifact_present = True
+                break
+        if synthesis_artifact_present:
+            break
+    missing_synthesis_artifact = (
+        bool(synthesis_subtasks) and synthesis_artifact_required and not synthesis_artifact_present
     )
+    task.metadata["synthesis_completion"] = {
+        "required": synthesis_artifact_required,
+        "artifact_present": synthesis_artifact_present,
+        "status": ("needs_attention" if missing_synthesis_artifact else "complete_or_not_required"),
+    }
+    noncatastrophic_outcome = (
+        str(getattr(self._config.execution, "noncatastrophic_outcome", "degraded")).strip().lower()
+    )
+    if noncatastrophic_outcome not in {"degraded", "paused"}:
+        noncatastrophic_outcome = "degraded"
 
     if task.status == TaskStatus.CANCELLED:
         for s in task.plan.subtasks:
@@ -1124,54 +1145,216 @@ def _apply_finalization_outcome(self, task: Task) -> None:
         cancel_reason = ""
         if isinstance(task.metadata, dict):
             cancel_reason = str(task.metadata.get("cancel_reason", "") or "").strip()
-        self._emit(TASK_CANCELLED, task.id, {
-            "completed": completed,
-            "total": total,
-            "reason": cancel_reason or "cancel_requested",
-            "outcome": "cancelled",
-        })
-    elif all_done:
-        task.status = TaskStatus.COMPLETED
-        task.completed_at = datetime.now().isoformat()
-        self._emit(TASK_COMPLETED, task.id, {
-            "completed": completed,
-            "total": total,
-            "reason": "all_subtasks_completed",
-            "outcome": "completed",
-            "validity_summary": run_validity_summary,
-        })
-    else:
+        self._emit(
+            TASK_CANCELLED,
+            task.id,
+            {
+                "completed": completed,
+                "total": total,
+                "reason": cancel_reason or "cancel_requested",
+                "outcome": "cancelled",
+            },
+        )
+    elif catastrophic:
         task.status = TaskStatus.FAILED
         failed = [s for s in task.plan.subtasks if s.status == SubtaskStatus.FAILED]
-        failure_reason = "subtask_failure"
-        if blocking_remediation_failures:
-            task.add_error(
-                "remediation",
-                "Blocking remediation unresolved for: "
-                + ", ".join(blocking_remediation_failures),
-            )
-            failure_reason = "blocking_remediation_unresolved"
-        if blocked_subtasks:
-            labels = ", ".join(
-                entry["subtask_id"] for entry in blocked_subtasks
-                if isinstance(entry, dict) and entry.get("subtask_id")
-            )
-            task.add_error(
-                "scheduler",
-                "Execution stalled with blocked pending subtasks: "
-                + (labels or "unknown"),
-            )
-            failure_reason = "blocked_pending_subtasks"
-        self._emit(TASK_FAILED, task.id, {
-            "completed": completed,
-            "total": total,
-            "failed_subtasks": [s.id for s in failed],
-            "reason": failure_reason,
-            "outcome": "failed",
+        task.metadata["completion_grade"] = "catastrophic_failure"
+        self._emit(
+            TASK_FAILED,
+            task.id,
+            {
+                "completed": completed,
+                "total": total,
+                "failed_subtasks": [s.id for s in failed],
+                "reason": "catastrophic_blocker",
+                "outcome": "failed",
+                "catastrophic_failure": task.metadata.get("catastrophic_failure"),
+                "validity_summary": run_validity_summary,
+            },
+        )
+    elif task.status == TaskStatus.PAUSED or (
+        noncatastrophic_outcome == "paused"
+        and (
+            any(subtask.status != SubtaskStatus.COMPLETED for subtask in task.plan.subtasks)
+            or blocking_remediation_failures
+            or blocked_subtasks
+        )
+    ):
+        task.status = TaskStatus.PAUSED
+        task.metadata["completion_grade"] = "paused_recoverable"
+        task.metadata["recovery_required"] = True
+        task.metadata["recovery_context"] = {
             "blocking_remediation_failures": blocking_remediation_failures,
             "blocked_subtasks": blocked_subtasks,
-            "validity_summary": run_validity_summary,
-        })
+        }
+    else:
+        degraded_reasons: list[str] = []
+        partial_ids: list[str] = [
+            subtask.id for subtask in task.plan.subtasks if subtask.status == SubtaskStatus.PARTIAL
+        ]
+        skipped_ids: list[str] = [
+            subtask.id for subtask in task.plan.subtasks if subtask.status == SubtaskStatus.SKIPPED
+        ]
+
+        for subtask in task.plan.subtasks:
+            if subtask.status in {
+                SubtaskStatus.FAILED,
+                SubtaskStatus.BLOCKED,
+                SubtaskStatus.RUNNING,
+            }:
+                subtask.status = SubtaskStatus.PARTIAL
+                if not subtask.summary:
+                    subtask.summary = (
+                        "Usable checkpoint preserved; remaining verification "
+                        "or recovery work is recorded in run metadata."
+                    )
+                partial_ids.append(subtask.id)
+            elif subtask.status == SubtaskStatus.PENDING:
+                subtask.status = SubtaskStatus.SKIPPED
+                if not subtask.summary:
+                    subtask.summary = (
+                        "Not executed because an upstream recoverable gap "
+                        "exhausted this run's bounded recovery budget."
+                    )
+                skipped_ids.append(subtask.id)
+
+        if partial_ids:
+            degraded_reasons.append("partial_subtasks")
+        if skipped_ids:
+            degraded_reasons.append("skipped_subtasks")
+        if total == 0:
+            degraded_reasons.append("empty_plan")
+        if blocking_remediation_failures:
+            degraded_reasons.append("open_remediation")
+        if blocked_subtasks:
+            degraded_reasons.append("blocked_dependencies")
+        validity_reason_codes = {
+            str(item or "").strip().lower()
+            for item in list(run_validity_summary.get("reason_codes", []))
+            if str(item or "").strip()
+        }
+        if "no_claims_extracted" in validity_reason_codes:
+            degraded_reasons.append("missing_required_claim_evidence")
+        if open_correction_cycles:
+            degraded_reasons.append("open_correction_cycles")
+        if missing_synthesis_artifact:
+            degraded_reasons.append("missing_synthesis_artifact")
+            task.metadata["recovery_required"] = True
+        quality_by_subtask = task.metadata.get("subtask_quality", {})
+        below_floor_subtasks: list[str] = []
+        quality_scorecard: dict[str, dict[str, object]] = {}
+        if isinstance(quality_by_subtask, dict):
+            for subtask_id, quality in quality_by_subtask.items():
+                if not isinstance(quality, dict):
+                    continue
+                dimensions = quality.get("dimensions", {})
+                if not isinstance(dimensions, dict):
+                    dimensions = {}
+                missing_targets = quality.get("missing_targets", [])
+                if not isinstance(missing_targets, list):
+                    missing_targets = []
+                quality_scorecard[str(subtask_id)] = {
+                    "overall": quality.get("overall"),
+                    "requirement_coverage": quality.get("requirement_coverage"),
+                    "dimensions": {
+                        str(key): value for key, value in dimensions.items() if str(key).strip()
+                    },
+                    "meets_floor": quality.get("meets_floor"),
+                    "reason_code": str(quality.get("reason_code", "") or ""),
+                    "policy_mode": str(quality.get("policy_mode", "enforce") or "enforce"),
+                    "missing_targets": [
+                        str(item).strip() for item in missing_targets[:12] if str(item).strip()
+                    ],
+                }
+            below_floor_subtasks = sorted(
+                str(subtask_id)
+                for subtask_id, quality in quality_by_subtask.items()
+                if isinstance(quality, dict)
+                and quality.get("meets_floor") is False
+                and str(quality.get("policy_mode", "enforce") or "enforce").strip().lower()
+                == "enforce"
+            )
+        if below_floor_subtasks:
+            degraded_reasons.append("quality_below_floor")
+        task.metadata["quality_scorecard"] = quality_scorecard
+
+        completed, total = task.progress
+        task.status = TaskStatus.COMPLETED
+        task.completed_at = datetime.now().isoformat()
+        verification_outcome_counts = task.metadata.get(
+            "verification_outcome_counts",
+            {},
+        )
+        if not isinstance(verification_outcome_counts, dict):
+            verification_outcome_counts = {}
+        warning_outcomes = sum(
+            int(verification_outcome_counts.get(key, 0) or 0)
+            for key in ("pass_with_warnings", "partial_verified")
+        )
+        recovered_executor_failures = task.metadata.get(
+            "recovered_executor_failures",
+            [],
+        )
+        if not isinstance(recovered_executor_failures, list):
+            recovered_executor_failures = []
+        completion_grade = (
+            "needs_attention"
+            if missing_synthesis_artifact
+            else (
+                "degraded"
+                if degraded_reasons
+                else (
+                    "verified_with_warnings"
+                    if warning_outcomes > 0 or recovered_executor_failures
+                    else "verified"
+                )
+            )
+        )
+        task.metadata["completion_grade"] = completion_grade
+        task.metadata["degraded_completion"] = {
+            "reasons": degraded_reasons,
+            "partial_subtasks": partial_ids,
+            "skipped_subtasks": skipped_ids,
+            "blocking_remediation_failures": blocking_remediation_failures,
+            "blocked_subtasks": blocked_subtasks,
+            "open_correction_cycles": open_correction_cycles,
+            "warning_outcomes": warning_outcomes,
+            "recovered_executor_failures": recovered_executor_failures,
+            "quality_below_floor_subtasks": below_floor_subtasks,
+            "quality_scorecard": quality_scorecard,
+        }
+        self._emit(
+            TASK_COMPLETED,
+            task.id,
+            {
+                "completed": completed,
+                "total": total,
+                "reason": (
+                    "completed_with_recoverable_gaps"
+                    if degraded_reasons
+                    else (
+                        "completed_with_warnings"
+                        if completion_grade == "verified_with_warnings"
+                        else "all_subtasks_completed"
+                    )
+                ),
+                "outcome": (
+                    "completed_degraded"
+                    if degraded_reasons
+                    else (
+                        "completed_with_warnings"
+                        if completion_grade == "verified_with_warnings"
+                        else "completed"
+                    )
+                ),
+                "completion_grade": completion_grade,
+                "partial_subtasks": partial_ids,
+                "quality_below_floor_subtasks": below_floor_subtasks,
+                "quality_scorecard": quality_scorecard,
+                "skipped_subtasks": skipped_ids,
+                "validity_summary": run_validity_summary,
+            },
+        )
 
     self._emit_run_validity_scorecard(task)
     self._emit_telemetry_run_summary(task)

@@ -141,6 +141,17 @@ _register(
 
 _register(
     (
+        types.CORRECTION_DETECTED,
+        types.CORRECTION_PLANNED,
+        types.CORRECTION_PROGRESS,
+        types.CORRECTION_RESOLVED,
+        types.CORRECTION_TERMINAL,
+    ),
+    "correction",
+)
+
+_register(
+    (
         types.ITERATION_STARTED,
         types.ITERATION_GATE_FAILED,
         types.ITERATION_RETRYING,
@@ -184,6 +195,7 @@ _FAMILY_REQUIRED_KEYS: dict[str, tuple[str, ...]] = {
     "verification": ("subtask_id",),
     "human_loop": (),
     "remediation": ("subtask_id",),
+    "correction": ("subtask_id", "cycle_id", "state"),
     "iteration": ("subtask_id",),
     "webhook": ("delivery_target_host",),
     "internal": (),

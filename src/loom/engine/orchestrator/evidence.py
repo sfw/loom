@@ -65,6 +65,7 @@ def evidence_csv_rows(records: list[dict]) -> list[dict[str, str]]:
 
 # Extracted evidence/artifact/scorecard orchestration helpers
 
+
 def _evidence_for_subtask(self, task_id: str, subtask_id: str) -> list[dict]:
     """Load persisted evidence records scoped to one subtask."""
     try:
@@ -80,6 +81,7 @@ def _evidence_for_subtask(self, task_id: str, subtask_id: str) -> list[dict]:
             continue
         scoped.append(item)
     return scoped
+
 
 def _persist_subtask_evidence(
     self,
@@ -191,6 +193,7 @@ async def _persist_subtask_evidence_async(
     except Exception as e:
         logger.warning("Failed persisting evidence ledger for %s: %s", task_id, e)
 
+
 def _artifact_content_for_call(
     tool_name: str,
     args: dict[str, object],
@@ -221,6 +224,7 @@ def _artifact_content_for_call(
             return "\n\n".join(parts)
         return str(result_data.get("content", "") or "")
     return ""
+
 
 def _artifact_seal_registry(self, task: Task) -> dict[str, dict[str, object]]:
     metadata = task.metadata if isinstance(task.metadata, dict) else {}
@@ -335,6 +339,7 @@ def _record_artifact_seals(
         task.metadata["artifact_seals"] = seals
     return updated
 
+
 def _is_intermediate_artifact_path(self, *, task: Task, relpath: str) -> bool:
     workspace = Path(task.workspace) if task.workspace else None
     if workspace is None:
@@ -349,6 +354,7 @@ def _is_intermediate_artifact_path(self, *, task: Task, relpath: str) -> bool:
     if not intermediate_root:
         return False
     return normalized == intermediate_root or normalized.startswith(intermediate_root + "/")
+
 
 def _validate_artifact_seals(
     self,
@@ -386,34 +392,43 @@ def _validate_artifact_seals(
             artifact_path = (workspace / str(relpath)).resolve()
             artifact_path.relative_to(workspace)
         except Exception:
-            mismatches.append({
-                "path": str(relpath),
-                "reason": "path_outside_workspace",
-            })
+            mismatches.append(
+                {
+                    "path": str(relpath),
+                    "reason": "path_outside_workspace",
+                }
+            )
             continue
         validated += 1
         if not artifact_path.exists() or not artifact_path.is_file():
-            mismatches.append({
-                "path": str(relpath),
-                "reason": "artifact_missing",
-            })
+            mismatches.append(
+                {
+                    "path": str(relpath),
+                    "reason": "artifact_missing",
+                }
+            )
             continue
         try:
             observed = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
         except Exception:
-            mismatches.append({
-                "path": str(relpath),
-                "reason": "artifact_unreadable",
-            })
+            mismatches.append(
+                {
+                    "path": str(relpath),
+                    "reason": "artifact_unreadable",
+                }
+            )
             continue
         if observed != expected:
-            mismatches.append({
-                "path": str(relpath),
-                "reason": "artifact_seal_mismatch",
-                "expected_sha256": expected,
-                "observed_sha256": observed,
-            })
+            mismatches.append(
+                {
+                    "path": str(relpath),
+                    "reason": "artifact_seal_mismatch",
+                    "expected_sha256": expected,
+                    "observed_sha256": observed,
+                }
+            )
     return len(mismatches) == 0, mismatches, validated
+
 
 def _backfill_artifact_seals_from_evidence(self, task: Task) -> int:
     seals = self._artifact_seal_registry(task)
@@ -460,6 +475,7 @@ def _backfill_artifact_seals_from_evidence(self, task: Task) -> int:
     task.metadata["artifact_seals"] = seals
     return len(latest_by_path)
 
+
 def _validity_scorecard_state(self, task: Task) -> dict[str, object]:
     metadata = task.metadata if isinstance(task.metadata, dict) else {}
     if not isinstance(metadata, dict):
@@ -474,6 +490,7 @@ def _validity_scorecard_state(self, task: Task) -> dict[str, object]:
     metadata["validity_scorecard"] = scorecard
     task.metadata = metadata
     return scorecard
+
 
 def _record_subtask_validity_metrics(
     self,
@@ -507,7 +524,8 @@ def _record_subtask_validity_metrics(
                 int(counts.get("contradicted", 0) or 0)
                 + int(counts.get("insufficient_evidence", 0) or 0)
                 + int(counts.get("stale", 0) or 0),
-            ) or 0,
+            )
+            or 0,
         ),
         "critical_total": int(counts.get("critical_total", 0) or 0),
         "critical_supported": int(counts.get("critical_supported", 0) or 0),
@@ -516,18 +534,15 @@ def _record_subtask_validity_metrics(
     ratios = self._claim_ratios(counts)
     contract = self._validity_contract_for_subtask(subtask)
     claim_extraction = contract.get("claim_extraction", {})
-    claim_extraction_expected = (
-        isinstance(claim_extraction, dict)
-        and bool(claim_extraction.get("enabled", False))
+    claim_extraction_expected = isinstance(claim_extraction, dict) and bool(
+        claim_extraction.get("enabled", False)
     )
     reason_codes = metadata.get("claim_reason_codes")
     if not isinstance(reason_codes, list):
         reason_codes = []
-    normalized_reason_codes = sorted({
-        str(item or "").strip().lower()
-        for item in reason_codes
-        if str(item or "").strip()
-    })
+    normalized_reason_codes = sorted(
+        {str(item or "").strip().lower() for item in reason_codes if str(item or "").strip()}
+    )
     per_subtask[subtask.id] = {
         "subtask_id": subtask.id,
         "phase_id": str(subtask.phase_id or ""),
@@ -546,19 +561,23 @@ def _record_subtask_validity_metrics(
     }
     scorecard["run"] = self._build_run_validity_scorecard(task)
 
+
 def _scorecard_source_window(self, task: Task) -> dict[str, str]:
     try:
         records = self._state.load_evidence_records(task.id)
     except Exception:
         return {"min": "", "max": ""}
-    timestamps = sorted({
-        str(record.get("created_at", "") or "").strip()
-        for record in records
-        if isinstance(record, dict) and str(record.get("created_at", "") or "").strip()
-    })
+    timestamps = sorted(
+        {
+            str(record.get("created_at", "") or "").strip()
+            for record in records
+            if isinstance(record, dict) and str(record.get("created_at", "") or "").strip()
+        }
+    )
     if not timestamps:
         return {"min": "", "max": ""}
     return {"min": timestamps[0], "max": timestamps[-1]}
+
 
 def _build_run_validity_scorecard(self, task: Task) -> dict[str, object]:
     scorecard = self._validity_scorecard_state(task)
@@ -591,9 +610,7 @@ def _build_run_validity_scorecard(self, task: Task) -> dict[str, object]:
         raw_codes = entry.get("reason_codes", [])
         if isinstance(raw_codes, list):
             reason_codes.update(
-                str(item or "").strip().lower()
-                for item in raw_codes
-                if str(item or "").strip()
+                str(item or "").strip().lower() for item in raw_codes if str(item or "").strip()
             )
         entry_reason = str(entry.get("reason_code", "") or "").strip().lower()
         if entry_reason:
@@ -607,12 +624,15 @@ def _build_run_validity_scorecard(self, task: Task) -> dict[str, object]:
     extracted = max(0, int(aggregate.get("extracted", 0) or 0))
     contradicted = max(0, int(aggregate.get("contradicted", 0) or 0))
     contradicted_ratio = (float(contradicted) / float(extracted)) if extracted > 0 else 0.0
-    if extracted <= 0 and (synthesis_claims_expected or "infra_verifier_error" in reason_codes):
-        reason_codes.add("no_claims_extracted")
+    assessment_status = "assessed"
+    if extracted <= 0:
+        assessment_status = "insufficient_evidence" if claim_extraction_expected else "not_assessed"
+        if synthesis_claims_expected or "infra_verifier_error" in reason_codes:
+            reason_codes.add("no_claims_extracted")
         ratios = {
             "supported_ratio": 0.0,
             "unverified_ratio": 1.0 if claim_extraction_expected else 0.0,
-            "critical_support_ratio": 0.0 if claim_extraction_expected else 1.0,
+            "critical_support_ratio": 0.0,
         }
     trust_score = max(
         0.0,
@@ -635,9 +655,11 @@ def _build_run_validity_scorecard(self, task: Task) -> dict[str, object]:
             4,
         ),
         "trust_score": round(trust_score, 4),
+        "assessment_status": assessment_status,
         "reason_codes": sorted(reason_codes),
         "verification_report_path": self._VALIDITY_SCORECARD_JSON_NAME,
     }
+
 
 def _refresh_run_validity_scorecard(self, task: Task) -> dict[str, object]:
     scorecard = self._validity_scorecard_state(task)
@@ -645,6 +667,7 @@ def _refresh_run_validity_scorecard(self, task: Task) -> dict[str, object]:
     scorecard["run"] = run_summary
     task.metadata["validity_scorecard"] = scorecard
     return run_summary
+
 
 def _export_validity_scorecard_json(self, task: Task) -> None:
     workspace_text = str(task.workspace or "").strip()
@@ -671,12 +694,18 @@ def _export_validity_scorecard_json(self, task: Task) -> None:
     except Exception as e:
         logger.warning("Failed exporting validity scorecard for %s: %s", task.id, e)
 
+
 def _emit_run_validity_scorecard(self, task: Task) -> None:
     run_summary = self._refresh_run_validity_scorecard(task)
-    self._emit(RUN_VALIDITY_SCORECARD, task.id, {
-        "run_id": self._task_run_id(task),
-        **run_summary,
-    })
+    self._emit(
+        RUN_VALIDITY_SCORECARD,
+        task.id,
+        {
+            "run_id": self._task_run_id(task),
+            **run_summary,
+        },
+    )
+
 
 def _append_synthesis_provenance_footer(
     self,
@@ -711,6 +740,7 @@ def _append_synthesis_provenance_footer(
     if not base:
         return footer
     return f"{base}\n\n{footer}"
+
 
 def _export_evidence_ledger_csv(self, task: Task) -> None:
     """Best-effort evidence ledger export to the task workspace."""

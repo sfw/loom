@@ -28,7 +28,7 @@ from tests.orchestrator.conftest import (
 
 class TestOrchestratorCriticalPathBehavior:
     @pytest.mark.asyncio
-    async def test_critical_path_failure_exhausted_retries_aborts_without_replan(
+    async def test_critical_path_recovery_exhaustion_preserves_partial_and_continues(
         self, tmp_path
     ):
         plan_json = json.dumps({
@@ -47,6 +47,7 @@ class TestOrchestratorCriticalPathBehavior:
         })
         cfg = Config(execution=ExecutionConfig(
             max_subtask_retries=0,
+            max_correction_retries=0,
             max_loop_iterations=50,
             max_parallel_subtasks=3,
             auto_approve_confidence_threshold=0.8,
@@ -61,19 +62,74 @@ class TestOrchestratorCriticalPathBehavior:
             event_bus=_make_event_bus(),
             config=cfg,
         )
-        orch._runner.run = AsyncMock(return_value=(
-            SubtaskResult(status="failed", summary="failed"),
-            VerificationResult(tier=1, passed=False, feedback="failed checks"),
-        ))
+        orch._runner.run = AsyncMock(side_effect=[
+            (
+                SubtaskResult(status="failed", summary="failed"),
+                VerificationResult(tier=1, passed=False, feedback="failed checks"),
+            ),
+            (
+                SubtaskResult(status="success", summary="downstream synthesis"),
+                VerificationResult(tier=1, passed=True),
+            ),
+        ])
         orch._replan_task = AsyncMock(return_value=True)
 
         task = _make_task()
         result = await orch.execute_task(task)
 
-        assert result.status == TaskStatus.FAILED
-        assert result.get_subtask("critical-step").status == SubtaskStatus.FAILED
-        assert result.get_subtask("later-step").status == SubtaskStatus.SKIPPED
+        assert result.status == TaskStatus.COMPLETED
+        assert result.metadata["completion_grade"] == "degraded"
+        assert result.get_subtask("critical-step").status == SubtaskStatus.PARTIAL
+        assert result.get_subtask("later-step").status == SubtaskStatus.COMPLETED
         orch._replan_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_catastrophic_integrity_blocker_remains_terminal(self, tmp_path):
+        plan_json = json.dumps({
+            "subtasks": [
+                {
+                    "id": "publish",
+                    "description": "Publish safely",
+                    "is_critical_path": True,
+                },
+                {
+                    "id": "notify",
+                    "description": "Notify stakeholders",
+                    "depends_on": ["publish"],
+                },
+            ]
+        })
+        cfg = Config(execution=ExecutionConfig(
+            max_subtask_retries=0,
+            max_correction_retries=0,
+            enable_streaming=False,
+        ))
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text=plan_json),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=_make_state_manager(tmp_path),
+            event_bus=_make_event_bus(),
+            config=cfg,
+        )
+        orch._runner.run = AsyncMock(return_value=(
+            SubtaskResult(status="failed", summary="unsafe"),
+            VerificationResult(
+                tier=1,
+                passed=False,
+                feedback="Safety policy violation.",
+                reason_code="safety_policy_violation",
+                severity_class="hard_invariant",
+            ),
+        ))
+
+        result = await orch.execute_task(_make_task())
+
+        assert result.status == TaskStatus.FAILED
+        assert result.metadata["completion_grade"] == "catastrophic_failure"
+        assert result.get_subtask("publish").status == SubtaskStatus.FAILED
+        assert result.get_subtask("notify").status == SubtaskStatus.SKIPPED
 
     @pytest.mark.asyncio
     async def test_non_critical_failure_still_triggers_replan(self, tmp_path):
@@ -169,7 +225,8 @@ class TestOrchestratorCriticalPathBehavior:
         task = _make_task()
         result = await orch.execute_task(task)
 
-        assert result.status == TaskStatus.FAILED
+        assert result.status == TaskStatus.COMPLETED
+        assert result.metadata["completion_grade"] == "degraded"
         assert call_order == ["success", "replan"]
         orch._replan_task.assert_awaited_once()
 

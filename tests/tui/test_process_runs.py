@@ -1247,7 +1247,7 @@ class TestWorkspaceRefresh:
             "payload": {
                 "tool_name": "web_search",
                 "tool_call_id": "call_3",
-                "args": {"query": "blink49 canada"},
+                "args": {"query": "example studios television"},
             },
         })
         assert app._render_chat_event({
@@ -1255,10 +1255,10 @@ class TestWorkspaceRefresh:
             "payload": {
                 "tool_name": "web_search",
                 "tool_call_id": "call_3",
-                "args": {"query": "blink49 canada"},
+                "args": {"query": "example studios television"},
                 "success": True,
                 "elapsed_ms": 280,
-                "output": "1. Blink49\n   https://blink49.com",
+                "output": "1. Example Studios\n   https://studio.example.test",
             },
         })
 

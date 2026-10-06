@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from loom.models.base import ModelConnectionError
@@ -14,6 +16,36 @@ from loom.models.retry import (
 
 
 class TestModelRetry:
+    @pytest.mark.asyncio
+    async def test_global_model_concurrency_is_bounded(self):
+        active = 0
+        peak = 0
+        release = asyncio.Event()
+
+        async def invoke():
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            await release.wait()
+            active -= 1
+            return "ok"
+
+        policy = ModelRetryPolicy(
+            max_attempts=1,
+            base_delay_seconds=0.0,
+            max_delay_seconds=0.0,
+            jitter_seconds=0.0,
+            global_max_concurrency=2,
+        )
+        pending = [
+            asyncio.create_task(call_with_model_retry(invoke, policy=policy)) for _ in range(5)
+        ]
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert peak == 2
+        release.set()
+        assert await asyncio.gather(*pending) == ["ok"] * 5
+
     @pytest.mark.asyncio
     async def test_retries_failures_until_success(self):
         calls = {"count": 0}

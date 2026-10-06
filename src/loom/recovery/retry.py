@@ -22,8 +22,12 @@ from loom.recovery.errors import ErrorCategory, categorize_error
 
 
 class RetryStrategy(StrEnum):
+    CHECKPOINT_CONTINUE = "checkpoint_continue"
+    CONTRACT_REPAIR = "contract_repair"
     GENERIC = "generic"
+    OUTPUT_REROUTE = "output_reroute"
     RATE_LIMIT = "rate_limit"
+    SCHEMA_REPAIR = "schema_repair"
     VERIFIER_PARSE = "verifier_parse"
     EVIDENCE_GAP = "evidence_gap"
     UNCONFIRMED_DATA = "unconfirmed_data"
@@ -119,9 +123,7 @@ class RetryManager:
             if a.retry_strategy and a.retry_strategy != RetryStrategy.GENERIC:
                 lines.append(f"  Retry strategy: {a.retry_strategy.value}")
             if a.missing_targets:
-                lines.append(
-                    "  Missing targets: " + ", ".join(a.missing_targets)
-                )
+                lines.append("  Missing targets: " + ", ".join(a.missing_targets))
             if a.error_category and a.error_category != ErrorCategory.UNKNOWN:
                 categorized = categorize_error(a.error or "")
                 lines.append(f"  Error type: {a.error_category.value}")
@@ -137,6 +139,75 @@ class RetryManager:
             )
 
         strategy = attempts[-1].retry_strategy if attempts else RetryStrategy.GENERIC
+        if strategy == RetryStrategy.CHECKPOINT_CONTINUE:
+            lines.append(
+                "\nCHECKPOINT CONTINUATION:\n"
+                "- Reuse existing artifacts, evidence, and completed analysis.\n"
+                "- Read only the files needed to recover exact remaining work.\n"
+                "- Do not repeat broad discovery or revisit accepted findings.\n"
+                "- Complete the smallest remaining deliverable gap, then stop."
+            )
+        elif strategy == RetryStrategy.SCHEMA_REPAIR:
+            lines.append(
+                "\nTARGETED SCHEMA REPAIR:\n"
+                "- Inspect the named existing files and malformed rows.\n"
+                "- Treat the current header as canonical unless the verifier explicitly "
+                "provides a different expected schema.\n"
+                "- Repair field counts, delimiters, quoting, and escaping in place while "
+                "preserving valid values.\n"
+                "- Do not repeat research or create replacement/versioned files.\n"
+                "- Finish by re-reading the edited rows and checking every non-empty row "
+                "against the header width."
+            )
+        elif strategy == RetryStrategy.CONTRACT_REPAIR:
+            missing_targets = attempts[-1].missing_targets
+            reason_code = (
+                str(
+                    getattr(attempts[-1], "reason_code", "") or "",
+                )
+                .strip()
+                .lower()
+            )
+            if reason_code in {
+                "evidence_traceability_below_threshold",
+                "quality_assessment_missing",
+                "quality_below_threshold",
+            }:
+                target_text = ", ".join(missing_targets) or "weak quality dimensions"
+                lines.append(
+                    "\nTARGETED QUALITY REVISION:\n"
+                    "- Read the complete existing artifact set and preserve every "
+                    "supported finding.\n"
+                    "- Repair the named omissions or weak dimensions; do not compress, "
+                    "summarize away, or restart already-valid work.\n"
+                    f"- Required targets: {target_text}.\n"
+                    "- Strengthen the chain from evidence to analysis, implication, "
+                    "proposed action, and uncertainty.\n"
+                    "- Reconcile contradictions and restore missing cross-artifact "
+                    "connections before finishing.\n"
+                    "- Re-audit all required components after the targeted edit."
+                )
+            else:
+                target_text = ", ".join(missing_targets) or "verifier-named targets"
+                lines.append(
+                    "\nTARGETED CONTRACT REPAIR:\n"
+                    "- Reuse the existing deliverables and validated evidence.\n"
+                    "- Add or repair only the verifier-named fields, rows, or sections.\n"
+                    f"- Required targets: {target_text}.\n"
+                    "- Do not repeat broad research or rewrite already-valid content.\n"
+                    "- Re-run only the failed contract checks, then stop."
+                )
+        elif strategy == RetryStrategy.OUTPUT_REROUTE:
+            allowed_targets = attempts[-1].missing_targets
+            allowed_target_text = ", ".join(allowed_targets) or "declared canonical targets"
+            lines.append(
+                "\nTARGETED OUTPUT REROUTE:\n"
+                "- Preserve the existing content; change only its output destination.\n"
+                f"- Allowed targets: {allowed_target_text}.\n"
+                "- Do not create versioned, copied, temporary, or alternate deliverables.\n"
+                "- Preflight the exact target against output policy before writing.\n"
+                "- Stop immediately after the canonical output is accepted."
+            )
         if strategy == RetryStrategy.RATE_LIMIT:
             lines.append(
                 "\nTARGETED RETRY PLAN:\n"
@@ -160,9 +231,27 @@ class RetryManager:
             )
         elif strategy == RetryStrategy.UNCONFIRMED_DATA:
             reason_code = str(getattr(attempts[-1], "reason_code", "") or "").strip().lower()
+            missing_targets = list(getattr(attempts[-1], "missing_targets", []) or [])
             capability_unavailable_reason_codes = self._capability_unavailable_reason_codes()
             method_failure_reason_codes = self._method_failure_reason_codes()
-            if reason_code in capability_unavailable_reason_codes:
+            if reason_code in {
+                "required_verifier_missing",
+                "required_verifier_empty",
+            }:
+                target_text = ", ".join(missing_targets) or "material claim verdicts"
+                lines.append(
+                    "\nTARGETED CLAIM-GROUNDING RETRY:\n"
+                    "- Verification is missing required claim-level fact-check verdicts.\n"
+                    "- Reuse the existing deliverables and evidence; do not restart "
+                    "broad research.\n"
+                    "- Submit the material claims and their best source evidence to "
+                    "the required fact-check tool.\n"
+                    "- If a claim cannot be supported, explicitly prune it or label "
+                    "the uncertainty instead of omitting the verdict.\n"
+                    f"- Required targets: {target_text}.\n"
+                    "- Finish only after successful verdicts are available for verification."
+                )
+            elif reason_code in capability_unavailable_reason_codes:
                 lines.append(
                     "\nTARGETED RETRY PLAN:\n"
                     "- A tool path failed because the required runtime capability "
@@ -204,10 +293,7 @@ class RetryManager:
                 "- Keep validated content; apply minimal filename/path corrections."
             )
 
-        lines.append(
-            "\nFix the issues identified above. "
-            "Take a different approach if needed."
-        )
+        lines.append("\nFix the issues identified above. Take a different approach if needed.")
         return "\n".join(lines)
 
     @staticmethod
@@ -223,6 +309,7 @@ class RetryManager:
     @staticmethod
     def _method_failure_reason_codes() -> set[str]:
         return {
+            "artifact_confirmation_required",
             "tool_method_failed",
             "tool_transient_failure",
             "tool_upstream_unavailable",
@@ -296,8 +383,21 @@ class RetryManager:
             "partial_evidence_coverage",
             "unverified_entries_remaining",
             "missing_precedent_transactions",
-            "csv_schema_mismatch",
         }
+        if reason_code == "csv_schema_mismatch":
+            return RetryStrategy.SCHEMA_REPAIR, missing_targets
+        if reason_code in {
+            "missing_structured_leading_indicators",
+            "unverified_primary_deliverables",
+            "missing_required_contract_field",
+            "structured_output_contract_failed",
+        }:
+            return RetryStrategy.CONTRACT_REPAIR, missing_targets
+        if reason_code in {
+            "forbidden_output_path",
+            "output_path_policy_violation",
+        }:
+            return RetryStrategy.OUTPUT_REROUTE, missing_targets
         capability_unavailable_reason_codes = RetryManager._capability_unavailable_reason_codes()
         method_failure_reason_codes = RetryManager._method_failure_reason_codes()
 
@@ -314,12 +414,9 @@ class RetryManager:
             if remediation_mode == "confirm_or_prune":
                 return RetryStrategy.UNCONFIRMED_DATA, missing_targets
             if reason_code == "hard_invariant_failed":
-                if (
-                    has_placeholder_findings
-                    and (
-                        failure_class == "recoverable_placeholder"
-                        or remediation_mode == "confirm_or_prune"
-                    )
+                if has_placeholder_findings and (
+                    failure_class == "recoverable_placeholder"
+                    or remediation_mode == "confirm_or_prune"
                 ):
                     return RetryStrategy.UNCONFIRMED_DATA, missing_targets
             return RetryStrategy.GENERIC, []
@@ -353,12 +450,8 @@ class RetryManager:
             return RetryStrategy.GENERIC, missing_targets
 
         if reason_code == "hard_invariant_failed":
-            if (
-                has_placeholder_findings
-                and (
-                    failure_class == "recoverable_placeholder"
-                    or remediation_mode == "confirm_or_prune"
-                )
+            if has_placeholder_findings and (
+                failure_class == "recoverable_placeholder" or remediation_mode == "confirm_or_prune"
             ):
                 return RetryStrategy.UNCONFIRMED_DATA, missing_targets
             return RetryStrategy.GENERIC, []
@@ -368,7 +461,7 @@ class RetryManager:
             "forbidden_output_path",
             "output_path_policy_violation",
         }:
-            return RetryStrategy.GENERIC, missing_targets
+            return RetryStrategy.OUTPUT_REROUTE, missing_targets
         if reason_code in {
             "evidence_gap",
             "missing_evidence",
@@ -405,41 +498,53 @@ class RetryManager:
 
         if "could not parse verifier output" in haystack:
             return RetryStrategy.VERIFIER_PARSE, []
-        if any(marker in haystack for marker in (
-            "parse_inconclusive",
-            "infra_verifier_error",
-            "verifier raised an exception",
-            "verification inconclusive:",
-        )):
+        if any(
+            marker in haystack
+            for marker in (
+                "parse_inconclusive",
+                "infra_verifier_error",
+                "verifier raised an exception",
+                "verification inconclusive:",
+            )
+        ):
             return RetryStrategy.VERIFIER_PARSE, []
 
-        if any(marker in haystack for marker in (
-            "forbidden_output_path",
-            "output_path_policy_violation",
-            "canonical deliverable policy violation",
-            "retry/remediation writes must stay in canonical deliverables",
-            "looks like a versioned copy of a required file",
-            "do not rename or delete files during retry",
-        )):
-            return RetryStrategy.GENERIC, []
+        if any(
+            marker in haystack
+            for marker in (
+                "forbidden_output_path",
+                "output_path_policy_violation",
+                "canonical deliverable policy violation",
+                "retry/remediation writes must stay in canonical deliverables",
+                "looks like a versioned copy of a required file",
+                "do not rename or delete files during retry",
+            )
+        ):
+            return RetryStrategy.OUTPUT_REROUTE, []
 
-        if any(marker in haystack for marker in (
-            "unconfirmed",
-            "insufficiently confirmed",
-            "remediation required",
-            "queue follow-up",
-            "queue_follow_up",
-            "confirm_or_prune",
-            "partial_verified",
-        )):
+        if any(
+            marker in haystack
+            for marker in (
+                "unconfirmed",
+                "insufficiently confirmed",
+                "remediation required",
+                "queue follow-up",
+                "queue_follow_up",
+                "confirm_or_prune",
+                "partial_verified",
+            )
+        ):
             return RetryStrategy.UNCONFIRMED_DATA, []
 
-        if any(marker in haystack for marker in (
-            "no successful tool-call evidence found for target",
-            "missing evidence for",
-            "missing evidence coverage",
-            "insufficient evidence for",
-        )):
+        if any(
+            marker in haystack
+            for marker in (
+                "no successful tool-call evidence found for target",
+                "missing evidence for",
+                "missing evidence coverage",
+                "insufficient evidence for",
+            )
+        ):
             return RetryStrategy.EVIDENCE_GAP, RetryManager._extract_missing_targets(
                 feedback,
             )
@@ -477,18 +582,22 @@ class RetryManager:
         normalized_error = re.sub(r"\s+", " ", error)
         normalized_feedback = re.sub(r"\d+", "#", normalized_feedback)
         normalized_error = re.sub(r"\d+", "#", normalized_error)
-        targets = sorted({
-            str(item or "").strip().lower()
-            for item in (missing_targets or [])
-            if str(item or "").strip()
-        })
-        return "|".join([
-            str(strategy.value),
-            str(reason_code or "").strip().lower(),
-            ",".join(targets),
-            normalized_feedback[:180],
-            normalized_error[:180],
-        ])
+        targets = sorted(
+            {
+                str(item or "").strip().lower()
+                for item in (missing_targets or [])
+                if str(item or "").strip()
+            }
+        )
+        return "|".join(
+            [
+                str(strategy.value),
+                str(reason_code or "").strip().lower(),
+                ",".join(targets),
+                normalized_feedback[:180],
+                normalized_error[:180],
+            ]
+        )
 
     def should_stop_for_no_progress(
         self,
@@ -501,10 +610,7 @@ class RetryManager:
         if len(attempts) < window:
             return False
         recent = attempts[-window:]
-        signatures = [
-            str(getattr(item, "progress_signature", "") or "").strip()
-            for item in recent
-        ]
+        signatures = [str(getattr(item, "progress_signature", "") or "").strip() for item in recent]
         signatures = [sig for sig in signatures if sig]
         if len(signatures) < window:
             return False
@@ -614,12 +720,15 @@ class RetryManager:
 
     @staticmethod
     def _is_rate_limit_haystack(haystack: str) -> bool:
-        return any(marker in haystack for marker in (
-            "http 429",
-            "rate limit",
-            "rate-limited",
-            "too many requests",
-        ))
+        return any(
+            marker in haystack
+            for marker in (
+                "http 429",
+                "rate limit",
+                "rate-limited",
+                "too many requests",
+            )
+        )
 
     @staticmethod
     def _extract_missing_targets(feedback: str) -> list[str]:
@@ -647,10 +756,12 @@ class RetryManager:
 
     @staticmethod
     def _is_output_path_policy_failure(attempt: AttemptRecord) -> bool:
-        haystack = " ".join([
-            str(getattr(attempt, "feedback", "") or ""),
-            str(getattr(attempt, "error", "") or ""),
-        ]).lower()
+        haystack = " ".join(
+            [
+                str(getattr(attempt, "feedback", "") or ""),
+                str(getattr(attempt, "error", "") or ""),
+            ]
+        ).lower()
         markers = (
             "forbidden_output_path",
             "output_path_policy_violation",

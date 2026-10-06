@@ -54,9 +54,22 @@ instructions: |
 
 constraints: |
   - Create 3-30 subtasks. Let task complexity determine the count.
-  - The first subtask should always read/inspect the current state before making changes.
+  - The first subtask should read/analyze the relevant current state before making changes.
+    When attached inputs are listed as readable in the deterministic input capability
+    manifest, read and analyze them directly in the consuming subtask.
   - Do NOT create subtasks that depend on information you don't have — inspect first, plan second.
-  - Do NOT assume non-obvious tool capabilities will be available at execution time; add an early inspection/discovery subtask when capability fit is uncertain.
+  - `read_file` natively reads text, PDF, DOC/DOCX, and PPT/PPTX files, including
+    explicitly attached read-only paths. Treat this as a guaranteed registered capability.
+  - Do NOT create capability-probe subtasks, temporary extractor scripts, or redundant
+    extracted-text copies for formats already supported by `read_file`.
+  - If the deterministic manifest reports `text_extractable=false` for a required
+    document, plan an OCR fallback using the registered document/OCR tools; do not
+    probe shell binaries first.
+  - Do NOT assume other non-obvious tool capabilities will be available at execution
+    time; add discovery only when the deterministic manifest and registered tools do
+    not establish a viable execution path.
+  - A capability probe must not be a critical-path prerequisite when a registered
+    native tool can perform the underlying work directly.
   - Prefer root-level deliverable filenames unless the user goal explicitly requires subdirectories.
   - Do NOT create subtasks whose primary goal is scaffolding numbered phase folders or workspace schema docs unless explicitly requested.
   - Use depends_on to expose independent subtasks so parallel work can be scheduled.

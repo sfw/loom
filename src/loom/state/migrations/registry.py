@@ -7,6 +7,7 @@ import hashlib
 from loom.state.migrations.runner import MigrationStep
 from loom.state.migrations.steps import (
     conversation_turn_metadata_v1,
+    correction_lifecycle_v1,
     data_authority_unification,
     events_v2,
     search_provider_state_v1,
@@ -69,5 +70,12 @@ MIGRATIONS: tuple[MigrationStep, ...] = (
         checksum=_checksum("20260416_007_conversation_turn_metadata_v1/conversation_turn_metadata_v1"),
         apply=conversation_turn_metadata_v1.apply,
         verify=conversation_turn_metadata_v1.verify,
+    ),
+    MigrationStep(
+        id="20260728_008_correction_lifecycle_v1",
+        description="Add durable unified correction cycles, attempts, and actions.",
+        checksum=_checksum("20260728_008_correction_lifecycle_v1/correction_lifecycle_v1"),
+        apply=correction_lifecycle_v1.apply,
+        verify=correction_lifecycle_v1.verify,
     ),
 )

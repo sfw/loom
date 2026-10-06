@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import json
 import logging
@@ -33,6 +34,9 @@ _WHITESPACE_RE = re.compile(r"\s+")
 _SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?])\s+")
 _DEFAULT_MAX_EVIDENCE_SNIPPETS = 6
 _MAX_SNIPPET_CHARS = 460
+_MAX_SEMANTIC_CLAIMS = 6
+_MAX_CONCURRENT_CLAIM_CHECKS = 4
+_SEMANTIC_CLAIM_TIMEOUT_SECONDS = 10.0
 
 logger = logging.getLogger(__name__)
 
@@ -191,22 +195,39 @@ class FactCheckerTool(Tool):
         if verifier_model is not None and semantic_mode in {"auto", "llm"}:
             effective_mode = "llm"
 
-        verdicts: list[FactCheckVerdict] = []
-        for claim in claims:
-            verdicts.append(
-                await _check_one_claim(
+        semantic_claim_limit = (
+            min(len(claims), _MAX_SEMANTIC_CLAIMS)
+            if verifier_model is not None and semantic_mode in {"auto", "llm"}
+            else 0
+        )
+        claim_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_CLAIM_CHECKS)
+
+        async def _check_indexed_claim(
+            index: int,
+            claim: str,
+        ) -> FactCheckVerdict:
+            async with claim_semaphore:
+                return await _check_one_claim(
                     claim,
                     sources,
                     support_threshold=thresholds["supported"],
                     partial_threshold=thresholds["partial"],
                     require_primary=require_primary,
                     max_evidence_snippets=max_snippets,
-                    verifier_model=verifier_model,
+                    verifier_model=(
+                        verifier_model if index < semantic_claim_limit else None
+                    ),
                     semantic_mode=semantic_mode,
                     config=self._config,
                     validator=self._response_validator,
                 )
-            )
+
+        verdicts = list(
+            await asyncio.gather(*(
+                _check_indexed_claim(index, claim)
+                for index, claim in enumerate(claims)
+            )),
+        )
 
         counts = {
             "supported": 0,
@@ -260,6 +281,8 @@ class FactCheckerTool(Tool):
                 "require_primary_sources": require_primary,
                 "semantic_verification_requested": semantic_mode,
                 "semantic_verification_effective": effective_mode,
+                "semantic_claims_scheduled": semantic_claim_limit,
+                "semantic_claim_limit": _MAX_SEMANTIC_CLAIMS,
                 "verifier_model": getattr(verifier_model, "name", ""),
                 "verdicts": [verdict.to_dict() for verdict in verdicts],
             },
@@ -420,24 +443,28 @@ async def _load_sources(
             timeout=httpx.Timeout(FETCH_TIMEOUT),
             headers=headers,
         ) as client:
-            for url in urls:
+            fetch_semaphore = asyncio.Semaphore(6)
+
+            async def _fetch(url: str) -> SourceDoc | None:
                 try:
-                    response = await client.get(url)
-                    response.raise_for_status()
+                    async with fetch_semaphore:
+                        response = await client.get(url)
+                        response.raise_for_status()
                 except Exception:
-                    continue
+                    return None
                 body = response.text or ""
                 text = _extract_text_from_web(body)
                 if not text:
-                    continue
-                docs.append(
-                    SourceDoc(
-                        label=url,
-                        text=text,
-                        origin=url,
-                        is_primary=is_primary_domain(url),
-                    )
+                    return None
+                return SourceDoc(
+                    label=url,
+                    text=text,
+                    origin=url,
+                    is_primary=is_primary_domain(url),
                 )
+
+            fetched = await asyncio.gather(*(_fetch(url) for url in urls))
+            docs.extend(doc for doc in fetched if doc is not None)
 
     return docs
 
@@ -943,12 +970,15 @@ async def _check_one_claim(
 
     if llm_attempted:
         try:
-            llm_verdict = await _classify_with_llm(
-                claim=claim,
-                snippets=snippets,
-                model=verifier_model,
-                validator=validator,
-                config=config,
+            llm_verdict = await asyncio.wait_for(
+                _classify_with_llm(
+                    claim=claim,
+                    snippets=snippets,
+                    model=verifier_model,
+                    validator=validator,
+                    config=config,
+                ),
+                timeout=_SEMANTIC_CLAIM_TIMEOUT_SECONDS,
             )
             if llm_verdict is not None:
                 selected = llm_verdict

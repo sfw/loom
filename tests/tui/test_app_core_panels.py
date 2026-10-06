@@ -420,7 +420,7 @@ class TestProcessRunPane:
         run = ProcessRunState(
             run_id="abc123",
             process_name="market-research",
-            goal="Analyze EPCOR",
+            goal="Analyze Example Utility",
             run_workspace=Path("/tmp"),
             process_defn=None,
             pane_id="tab-run-abc123",
@@ -544,7 +544,7 @@ class TestProcessRunPane:
         run = ProcessRunState(
             run_id="abc777",
             process_name="market-research",
-            goal="Analyze EPCOR",
+            goal="Analyze Example Utility",
             run_workspace=Path("/tmp"),
             process_defn=None,
             pane_id="tab-run-abc777",
@@ -571,7 +571,7 @@ class TestProcessRunPane:
         run = ProcessRunState(
             run_id="abc125",
             process_name="market-research",
-            goal="Analyze EPCOR",
+            goal="Analyze Example Utility",
             run_workspace=Path("/tmp"),
             process_defn=None,
             pane_id="tab-run-abc125",
@@ -948,23 +948,25 @@ class TestChatLogStreaming:
 
         log.add_tool_call(
             "web_search",
-            {"query": "blink49 canada"},
+            {"query": "example studios television"},
             tool_call_id="call_1",
         )
         log.add_tool_call(
             "web_search",
-            {"query": "blink49 canada"},
+            {"query": "example studios television"},
             tool_call_id="call_1",
             success=True,
             elapsed_ms=420,
-            output="1. Blink49\n   https://blink49.com",
+            output="1. Example Studios\n   https://studio.example.test",
         )
 
         assert len(mounted) == 1
         widget = mounted[0]
         assert getattr(widget, "_success", None) is True
         assert getattr(widget, "_elapsed_ms", 0) == 420
-        assert getattr(widget, "_output", "") == "1. Blink49\n   https://blink49.com"
+        assert getattr(widget, "_output", "") == (
+            "1. Example Studios\n   https://studio.example.test"
+        )
         assert log._tool_call_widgets["call_1"] is widget
 
 class TestCoworkSessionTokens:

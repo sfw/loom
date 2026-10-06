@@ -8,6 +8,7 @@ results so the orchestrator never touches raw prompts or messages.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import hashlib
 import json
 import logging
@@ -102,7 +103,7 @@ class SubtaskRunner:
     MINIMAL_TEXT_OUTPUT_CHARS = 180
     TOOL_CALL_ARGUMENT_CONTEXT_CHARS = 700
     COMPACT_TOOL_CALL_ARGUMENT_CHARS = 1_600
-    RUNNER_COMPACTION_POLICY_MODE = "off"
+    RUNNER_COMPACTION_POLICY_MODE = "hybrid"
     PRESERVE_RECENT_CRITICAL_MESSAGES = 6
     COMPACTION_PRESSURE_RATIO_SOFT = 0.86
     COMPACTION_PRESSURE_RATIO_HARD = 1.02
@@ -125,45 +126,55 @@ class SubtaskRunner:
     SEALED_ARTIFACT_POST_CALL_GUARD = "warn"
     OVERFLOW_FALLBACK_TOOL_MESSAGE_MIN_CHARS = 4_000
     OVERFLOW_FALLBACK_TOOL_OUTPUT_EXCERPT_CHARS = 1_200
-    _OVERFLOW_BINARY_CONTENT_KINDS = frozenset({
-        "pdf",
-        "office_doc",
-        "image",
-        "archive",
-        "unknown_binary",
-    })
-    _HEAVY_OUTPUT_TOOLS = frozenset({
-        "web_fetch",
-        "web_fetch_html",
-        "web_search",
-        "read_file",
-        "search_files",
-        "ripgrep_search",
-        "list_directory",
-        "glob_find",
-        "conversation_recall",
-    })
+    _OVERFLOW_BINARY_CONTENT_KINDS = frozenset(
+        {
+            "pdf",
+            "office_doc",
+            "image",
+            "archive",
+            "unknown_binary",
+        }
+    )
+    _HEAVY_OUTPUT_TOOLS = frozenset(
+        {
+            "web_fetch",
+            "web_fetch_html",
+            "web_search",
+            "read_file",
+            "search_files",
+            "ripgrep_search",
+            "list_directory",
+            "glob_find",
+            "conversation_recall",
+        }
+    )
     TOOL_CALL_CONTEXT_PLACEHOLDER = "Tool call context omitted."
     LEGACY_TOOL_CALL_CONTEXT_PLACEHOLDER = "Tool call required to continue."
-    _TOOL_CALL_CONTEXT_PLACEHOLDERS = frozenset({
-        TOOL_CALL_CONTEXT_PLACEHOLDER.lower(),
-        LEGACY_TOOL_CALL_CONTEXT_PLACEHOLDER.lower(),
-    })
+    _TOOL_CALL_CONTEXT_PLACEHOLDERS = frozenset(
+        {
+            TOOL_CALL_CONTEXT_PLACEHOLDER.lower(),
+            LEGACY_TOOL_CALL_CONTEXT_PLACEHOLDER.lower(),
+        }
+    )
     _TODO_REMINDER_PREFIX = "CURRENT TASK STATE:\n"
-    _WRITE_MUTATING_TOOLS = frozenset({
-        "write_file",
-        "edit_file",
-        "document_write",
-        "move_file",
-        "delete_file",
-        "spreadsheet",
-    })
-    _SPREADSHEET_WRITE_OPERATIONS = frozenset({
-        "create",
-        "add_rows",
-        "add_column",
-        "update_cell",
-    })
+    _WRITE_MUTATING_TOOLS = frozenset(
+        {
+            "write_file",
+            "edit_file",
+            "document_write",
+            "move_file",
+            "delete_file",
+            "spreadsheet",
+        }
+    )
+    _SPREADSHEET_WRITE_OPERATIONS = frozenset(
+        {
+            "create",
+            "add_rows",
+            "add_column",
+            "update_cell",
+        }
+    )
     _VARIANT_SUFFIX_MARKERS = (
         "v",
         "rev",
@@ -173,19 +184,23 @@ class SubtaskRunner:
         "updated",
         "new",
     )
-    _VERIFIED_SEAL_OUTCOMES = frozenset({
-        "pass",
-        "pass_with_warnings",
-        "partial_verified",
-    })
-    _SEAL_CONFIRMATION_EVIDENCE_TOOLS = frozenset({
-        "read_file",
-        "spreadsheet",
-        "web_search",
-        "web_fetch",
-        "web_fetch_html",
-        "fact_checker",
-    })
+    _VERIFIED_SEAL_OUTCOMES = frozenset(
+        {
+            "pass",
+            "pass_with_warnings",
+            "partial_verified",
+        }
+    )
+    _SEAL_CONFIRMATION_EVIDENCE_TOOLS = frozenset(
+        {
+            "read_file",
+            "spreadsheet",
+            "web_search",
+            "web_fetch",
+            "web_fetch_html",
+            "fact_checker",
+        }
+    )
 
     def __init__(
         self,
@@ -213,6 +228,17 @@ class SubtaskRunner:
         self._task_snapshot_writer = task_snapshot_writer
         settings = RunnerSettings.from_config(config, runner_defaults=self)
         self._max_tool_iterations = settings.max_tool_iterations
+        self._runner_checkpoint_reserve_iterations = max(
+            1,
+            int(
+                getattr(
+                    config.execution,
+                    "runner_checkpoint_reserve_iterations",
+                    2,
+                )
+                or 2
+            ),
+        )
         self._max_subtask_wall_clock_seconds = settings.max_subtask_wall_clock_seconds
         self._max_model_context_tokens = settings.max_model_context_tokens
         self._max_state_summary_chars = settings.max_state_summary_chars
@@ -238,9 +264,7 @@ class SubtaskRunner:
         self._compaction_churn_warning_calls = settings.compaction_churn_warning_calls
         self._enable_filetype_ingest_router = settings.enable_filetype_ingest_router
         self._enable_artifact_telemetry_events = settings.enable_artifact_telemetry_events
-        self._artifact_telemetry_max_metadata_chars = (
-            settings.artifact_telemetry_max_metadata_chars
-        )
+        self._artifact_telemetry_max_metadata_chars = settings.artifact_telemetry_max_metadata_chars
         self._enable_model_overflow_fallback = settings.enable_model_overflow_fallback
         self._sealed_artifact_post_call_guard = settings.sealed_artifact_post_call_guard
         self._ingest_artifact_retention_max_age_days = (
@@ -258,13 +282,9 @@ class SubtaskRunner:
         self._ask_user_runtime_blocking_enabled = settings.ask_user_runtime_blocking_enabled
         self._ask_user_policy = settings.ask_user_policy
         self._ask_user_timeout_seconds = settings.ask_user_timeout_seconds
-        self._ask_user_timeout_default_response = (
-            settings.ask_user_timeout_default_response
-        )
+        self._ask_user_timeout_default_response = settings.ask_user_timeout_default_response
         self._ask_user_max_pending_per_task = settings.ask_user_max_pending_per_task
-        self._ask_user_max_questions_per_subtask = (
-            settings.ask_user_max_questions_per_subtask
-        )
+        self._ask_user_max_questions_per_subtask = settings.ask_user_max_questions_per_subtask
         self._ask_user_min_seconds_between_questions = (
             settings.ask_user_min_seconds_between_questions
         )
@@ -279,18 +299,35 @@ class SubtaskRunner:
             allow_role_fallback=False,
             **settings.compactor_kwargs,
         )
-        self._subtask_deadline_monotonic: float | None = None
-        self._last_compaction_diagnostics: dict[str, Any] = {}
+        self._subtask_deadline_context: contextvars.ContextVar[float | None] = (
+            contextvars.ContextVar(
+                f"loom_subtask_deadline_{id(self)}",
+                default=None,
+            )
+        )
+        self._compaction_diagnostics_context: contextvars.ContextVar[dict[str, Any]] = (
+            contextvars.ContextVar(
+                f"loom_compaction_diagnostics_{id(self)}",
+                default={},
+            )
+        )
         self._runner_compaction_cache: dict[tuple[str, int, str], str] = {}
         self._runner_compaction_no_gain: dict[tuple[str, int, str], int] = {}
         self._runner_compaction_overshoot: set[tuple[str, int, str]] = set()
+        self._exhausted_web_targets_by_task: dict[str, dict[str, str]] = {}
         self._compaction_compactor_call_max_per_turn = (
             settings.compaction_compactor_call_max_per_turn
         )
         self._compaction_circuit_breaker_failure_limit = (
             settings.compaction_circuit_breaker_failure_limit
         )
-        self._compaction_runtime_stats: dict[str, Any] = {
+        self._compaction_runtime_stats_context: contextvars.ContextVar[dict[str, Any]] = (
+            contextvars.ContextVar(
+                f"loom_compaction_runtime_stats_{id(self)}",
+                default={},
+            )
+        )
+        self._compaction_runtime_stats = {
             "compactor_calls": 0,
             "compactor_failures": 0,
             "circuit_breaker_tripped": False,
@@ -298,7 +335,69 @@ class SubtaskRunner:
             "microcompact_chars_reduced": 0,
             "skip_reasons": {},
         }
-        self._active_subtask_telemetry_counters: dict[str, int] | None = None
+        self._subtask_telemetry_context: contextvars.ContextVar[dict[str, int] | None] = (
+            contextvars.ContextVar(
+                f"loom_subtask_telemetry_{id(self)}",
+                default=None,
+            )
+        )
+
+    @property
+    def _subtask_deadline_monotonic(self) -> float | None:
+        context = getattr(self, "_subtask_deadline_context", None)
+        return context.get() if context is not None else None
+
+    @_subtask_deadline_monotonic.setter
+    def _subtask_deadline_monotonic(self, value: float | None) -> None:
+        context = getattr(self, "_subtask_deadline_context", None)
+        if context is None:
+            context = contextvars.ContextVar(f"loom_subtask_deadline_{id(self)}", default=None)
+            object.__setattr__(self, "_subtask_deadline_context", context)
+        context.set(value)
+
+    @property
+    def _last_compaction_diagnostics(self) -> dict[str, Any]:
+        context = getattr(self, "_compaction_diagnostics_context", None)
+        return context.get() if context is not None else {}
+
+    @_last_compaction_diagnostics.setter
+    def _last_compaction_diagnostics(self, value: dict[str, Any]) -> None:
+        context = getattr(self, "_compaction_diagnostics_context", None)
+        if context is None:
+            context = contextvars.ContextVar(f"loom_compaction_diagnostics_{id(self)}", default={})
+            object.__setattr__(self, "_compaction_diagnostics_context", context)
+        context.set(value)
+
+    @property
+    def _compaction_runtime_stats(self) -> dict[str, Any]:
+        context = getattr(self, "_compaction_runtime_stats_context", None)
+        return context.get() if context is not None else {}
+
+    @_compaction_runtime_stats.setter
+    def _compaction_runtime_stats(self, value: dict[str, Any]) -> None:
+        context = getattr(self, "_compaction_runtime_stats_context", None)
+        if context is None:
+            context = contextvars.ContextVar(
+                f"loom_compaction_runtime_stats_{id(self)}", default={}
+            )
+            object.__setattr__(self, "_compaction_runtime_stats_context", context)
+        context.set(value)
+
+    @property
+    def _active_subtask_telemetry_counters(self) -> dict[str, int] | None:
+        context = getattr(self, "_subtask_telemetry_context", None)
+        return context.get() if context is not None else None
+
+    @_active_subtask_telemetry_counters.setter
+    def _active_subtask_telemetry_counters(
+        self,
+        value: dict[str, int] | None,
+    ) -> None:
+        context = getattr(self, "_subtask_telemetry_context", None)
+        if context is None:
+            context = contextvars.ContextVar(f"loom_subtask_telemetry_{id(self)}", default=None)
+            object.__setattr__(self, "_subtask_telemetry_context", context)
+        context.set(value)
 
     def _reset_compaction_runtime_stats(self) -> None:
         self._compaction_runtime_stats = {
@@ -539,14 +638,16 @@ class SubtaskRunner:
             user_summary = f"{user_summary[:139].rstrip()}…"
 
         try:
-            await self._memory.store(MemoryEntry(
-                task_id=task.id,
-                subtask_id=subtask.id,
-                entry_type="user_instruction",
-                summary=user_summary,
-                detail="\n".join(detail_lines),
-                tags="ask_user,clarification",
-            ))
+            await self._memory.store(
+                MemoryEntry(
+                    task_id=task.id,
+                    subtask_id=subtask.id,
+                    entry_type="user_instruction",
+                    summary=user_summary,
+                    detail="\n".join(detail_lines),
+                    tags="ask_user,clarification",
+                )
+            )
         except Exception:
             logger.debug(
                 "Failed storing ask_user instruction memory for %s/%s",
@@ -562,24 +663,26 @@ class SubtaskRunner:
         if len(decision_summary) > 140:
             decision_summary = f"{decision_summary[:139].rstrip()}…"
         try:
-            await self._memory.store(MemoryEntry(
-                task_id=task.id,
-                subtask_id=subtask.id,
-                entry_type="decision",
-                summary=decision_summary,
-                detail=json.dumps(
-                    {
-                        "question_id": answer.question_id,
-                        "selected_option_ids": list(answer.selected_option_ids),
-                        "selected_labels": list(answer.selected_labels),
-                        "response_type": answer.response_type,
-                        "source": answer.source,
-                    },
-                    ensure_ascii=False,
-                    sort_keys=True,
-                ),
-                tags="ask_user,decision",
-            ))
+            await self._memory.store(
+                MemoryEntry(
+                    task_id=task.id,
+                    subtask_id=subtask.id,
+                    entry_type="decision",
+                    summary=decision_summary,
+                    detail=json.dumps(
+                        {
+                            "question_id": answer.question_id,
+                            "selected_option_ids": list(answer.selected_option_ids),
+                            "selected_labels": list(answer.selected_labels),
+                            "response_type": answer.response_type,
+                            "source": answer.source,
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    tags="ask_user,decision",
+                )
+            )
         except Exception:
             logger.debug(
                 "Failed storing ask_user decision memory for %s/%s",
@@ -615,8 +718,7 @@ class SubtaskRunner:
             limit=120,
         )
         decision_text = (
-            f"Clarification ({str(subtask.id or '').strip()}): "
-            f"{question_text} -> {answer_text}"
+            f"Clarification ({str(subtask.id or '').strip()}): {question_text} -> {answer_text}"
         )
         task.add_decision(decision_text)
 
@@ -626,12 +728,14 @@ class SubtaskRunner:
         history = metadata.get("clarification_history", [])
         if not isinstance(history, list):
             history = []
-        history.append({
-            "subtask_id": str(subtask.id or "").strip(),
-            "question": question_text,
-            "answer": answer_text,
-            "answered_at": str(answer.answered_at or datetime.now().isoformat()).strip(),
-        })
+        history.append(
+            {
+                "subtask_id": str(subtask.id or "").strip(),
+                "question": question_text,
+                "answer": answer_text,
+                "answered_at": str(answer.answered_at or datetime.now().isoformat()).strip(),
+            }
+        )
         metadata["clarification_history"] = history[-20:]
         task.metadata = metadata
         try:
@@ -660,16 +764,28 @@ class SubtaskRunner:
         return remaining <= max(0.0, guard)
 
     def _runner_compaction_mode(self) -> str:
-        mode = str(
-            getattr(
-                self,
-                "_runner_compaction_policy_mode",
-                self.RUNNER_COMPACTION_POLICY_MODE,
-            ),
-        ).strip().lower()
+        mode = (
+            str(
+                getattr(
+                    self,
+                    "_runner_compaction_policy_mode",
+                    self.RUNNER_COMPACTION_POLICY_MODE,
+                ),
+            )
+            .strip()
+            .lower()
+        )
         return (
             mode
-            if mode in {"legacy", "tiered", "off"}
+            if mode
+            in {
+                "hybrid",
+                "deterministic",
+                "semantic",
+                "legacy",
+                "tiered",
+                "off",
+            }
             else self.RUNNER_COMPACTION_POLICY_MODE
         )
 
@@ -916,11 +1032,7 @@ class SubtaskRunner:
         touched = contract.get("deliverables_touched")
         if not isinstance(touched, list):
             return ""
-        declared = [
-            str(item).strip()
-            for item in touched
-            if str(item).strip()
-        ]
+        declared = [str(item).strip() for item in touched if str(item).strip()]
         declared_normalized = self._normalize_deliverable_paths(
             declared,
             workspace=workspace,
@@ -1088,7 +1200,10 @@ class SubtaskRunner:
         )
 
     def _spawn_memory_extraction(
-        self, task_id: str, subtask_id: str, result: SubtaskResult,
+        self,
+        task_id: str,
+        subtask_id: str,
+        result: SubtaskResult,
     ) -> None:
         runner_memory.spawn_memory_extraction(
             self,
@@ -1099,7 +1214,10 @@ class SubtaskRunner:
         )
 
     async def _extract_memory(
-        self, task_id: str, subtask_id: str, result: SubtaskResult,
+        self,
+        task_id: str,
+        subtask_id: str,
+        result: SubtaskResult,
     ) -> None:
         await runner_memory.extract_memory(
             self,
@@ -1110,7 +1228,10 @@ class SubtaskRunner:
         )
 
     def _parse_memory_entries(
-        self, response: ModelResponse, task_id: str, subtask_id: str,
+        self,
+        response: ModelResponse,
+        task_id: str,
+        subtask_id: str,
     ) -> list[MemoryEntry]:
         return runner_memory.parse_memory_entries(
             self,
@@ -1150,15 +1271,17 @@ class SubtaskRunner:
                 text_parts.append(chunk.text)
                 # Emit token event
                 if self._event_bus:
-                    self._event_bus.emit(Event(
-                        event_type=TOKEN_STREAMED,
-                        task_id=task_id,
-                        data={
-                            "subtask_id": subtask_id,
-                            "token": chunk.text,
-                            "model": model.name,
-                        },
-                    ))
+                    self._event_bus.emit(
+                        Event(
+                            event_type=TOKEN_STREAMED,
+                            task_id=task_id,
+                            data={
+                                "subtask_id": subtask_id,
+                                "token": chunk.text,
+                                "model": model.name,
+                            },
+                        )
+                    )
             if chunk.tool_calls is not None:
                 final_tool_calls = chunk.tool_calls
             if chunk.usage is not None:
@@ -1172,9 +1295,7 @@ class SubtaskRunner:
         from loom.models.base import TokenUsage
 
         stream_close_reason = (
-            "final_chunk"
-            if final_chunk_seen
-            else "generator_exhausted_without_final_chunk"
+            "final_chunk" if final_chunk_seen else "generator_exhausted_without_final_chunk"
         )
         return ModelResponse(
             text="".join(text_parts),
@@ -1228,12 +1349,15 @@ class SubtaskRunner:
                 data["files_changed_paths"] = files_changed
             if result.content_blocks:
                 from loom.content import serialize_block
-                data["content_blocks"] = [
-                    serialize_block(b) for b in result.content_blocks
-                ]
-        self._event_bus.emit(Event(
-            event_type=event_type, task_id=task_id, data=data,
-        ))
+
+                data["content_blocks"] = [serialize_block(b) for b in result.content_blocks]
+        self._event_bus.emit(
+            Event(
+                event_type=event_type,
+                task_id=task_id,
+                data=data,
+            )
+        )
 
         if (
             result is not None
@@ -1251,11 +1375,13 @@ class SubtaskRunner:
             attempted_path = str(tool_args.get("path", "")).strip()
             if attempted_path:
                 violation_data["attempted_path"] = attempted_path
-            self._event_bus.emit(Event(
-                event_type=ARTIFACT_CONFINEMENT_VIOLATION,
-                task_id=task_id,
-                data=violation_data,
-            ))
+            self._event_bus.emit(
+                Event(
+                    event_type=ARTIFACT_CONFINEMENT_VIOLATION,
+                    task_id=task_id,
+                    data=violation_data,
+                )
+            )
 
     @staticmethod
     def _is_artifact_confinement_violation(error: str | None) -> bool:
@@ -1282,11 +1408,7 @@ class SubtaskRunner:
         task_id, subtask_id = context
         model_name = str(payload.get("model", "")).strip() or "unknown"
         phase = str(payload.get("phase", "")).strip() or "done"
-        details = {
-            key: value
-            for key, value in payload.items()
-            if key not in {"model", "phase"}
-        }
+        details = {key: value for key, value in payload.items() if key not in {"model", "phase"}}
         self._emit_model_event(
             task_id=task_id,
             subtask_id=subtask_id,
@@ -1316,11 +1438,13 @@ class SubtaskRunner:
         }
         if isinstance(details, dict) and details:
             data.update(details)
-        self._event_bus.emit(Event(
-            event_type=MODEL_INVOCATION,
-            task_id=task_id,
-            data=data,
-        ))
+        self._event_bus.emit(
+            Event(
+                event_type=MODEL_INVOCATION,
+                task_id=task_id,
+                data=data,
+            )
+        )
 
     @staticmethod
     def _build_todo_reminder(task: Task, subtask: Subtask) -> str:
@@ -1343,9 +1467,45 @@ class SubtaskRunner:
         has_expected_deliverables: bool,
         base_budget: int | None = None,
     ) -> int:
-        del subtask, retry_strategy, has_expected_deliverables  # configured globally
-        budget = int(base_budget) if isinstance(base_budget, int) else cls.MAX_TOOL_ITERATIONS
-        return max(1, min(200, budget))
+        base = int(base_budget) if isinstance(base_budget, int) else cls.MAX_TOOL_ITERATIONS
+        base = max(1, min(200, base))
+        budget = base
+        strategy = str(getattr(retry_strategy, "value", retry_strategy) or "").lower()
+        task_text = " ".join(
+            [
+                str(subtask.description or ""),
+                str(subtask.acceptance_criteria or ""),
+            ]
+        ).lower()
+
+        # Correction passes operate on a machine-identified gap and must not
+        # inherit the broad research budget.
+        if strategy in {
+            "schema_repair",
+            "contract_repair",
+            "output_reroute",
+            "verifier_parse",
+        }:
+            return max(3, min(6, base))
+        if strategy in {
+            "checkpoint_continue",
+            "evidence_gap",
+            "unconfirmed_data",
+        }:
+            return max(4, min(8, base))
+
+        # Research and artifact production routinely need more than the global
+        # baseline on the initial pass.
+        if any(
+            token in task_text
+            for token in ("research", "evidence", "analyze", "investigate", "compare")
+        ):
+            budget += max(2, base // 4)
+        if has_expected_deliverables:
+            budget += max(2, base // 4)
+        # A contextual pass may use up to twice the configured baseline. Global
+        # task budgets remain the outer guardrail across retries and subtasks.
+        return max(1, min(200, base * 2, budget))
 
     @staticmethod
     def _normalize_path_for_policy(path_text: str, workspace: Path | None) -> str:
@@ -1533,9 +1693,8 @@ class SubtaskRunner:
             if not cls._is_confirmation_evidence_call(call):
                 continue
             timestamp = str(getattr(call, "timestamp", "") or "").strip()
-            if (
-                baseline_timestamp
-                and not cls._seal_timestamp_is_after(timestamp, baseline_timestamp)
+            if baseline_timestamp and not cls._seal_timestamp_is_after(
+                timestamp, baseline_timestamp
             ):
                 continue
             return True
@@ -1684,13 +1843,17 @@ class SubtaskRunner:
         )
 
     def _sealed_artifact_post_call_guard_mode(self) -> str:
-        mode = str(
-            getattr(
-                self,
-                "_sealed_artifact_post_call_guard",
-                self.SEALED_ARTIFACT_POST_CALL_GUARD,
-            ),
-        ).strip().lower()
+        mode = (
+            str(
+                getattr(
+                    self,
+                    "_sealed_artifact_post_call_guard",
+                    self.SEALED_ARTIFACT_POST_CALL_GUARD,
+                ),
+            )
+            .strip()
+            .lower()
+        )
         if mode not in {"off", "warn", "enforce"}:
             return self.SEALED_ARTIFACT_POST_CALL_GUARD
         return mode
@@ -1808,14 +1971,16 @@ class SubtaskRunner:
                 max_chars=arg_limit,
                 label=f"{name} tool call args",
             )
-            serialized.append({
-                "id": str(getattr(tc, "id", "") or ""),
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "arguments": json.dumps(compact_args, ensure_ascii=False, default=str),
-                },
-            })
+            serialized.append(
+                {
+                    "id": str(getattr(tc, "id", "") or ""),
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": json.dumps(compact_args, ensure_ascii=False, default=str),
+                    },
+                }
+            )
         return serialized
 
     async def _compact_assistant_tool_calls(
@@ -2023,6 +2188,7 @@ class SubtaskRunner:
         tools: list[dict] | None = None,
         remaining_seconds: float | None = None,
     ) -> list[dict]:
+        started_at = time.monotonic()
         mode = self._runner_compaction_mode()
         if mode == "off":
             context_budget = int(
@@ -2040,33 +2206,58 @@ class SubtaskRunner:
                 origin="runner.compaction.disabled",
             ).request_est_tokens
             pressure_ratio = estimate / max(1, context_budget)
-            self._set_compaction_diagnostics({
-                "compaction_policy_mode": mode,
-                "compaction_stage": "none",
-                "compaction_candidate_count": 0,
-                "compaction_skipped_reason": "policy_disabled",
-                "compaction_est_tokens_before": estimate,
-                "compaction_est_tokens_after": estimate,
-                "compaction_pressure_ratio": round(pressure_ratio, 4),
-                "compaction_pressure_ratio_after": round(pressure_ratio, 4),
-                "compaction_deficit_tokens_before": max(0, estimate - context_budget),
-                "compaction_terminal_state": runner_compaction.compaction_terminal_state(
-                    estimate_after=estimate,
-                    context_budget=context_budget,
-                    microcompact_hits=0,
-                    compactor_calls=0,
-                    overflow_fallback_applied=False,
-                ),
-                "compaction_compactor_calls": 0,
-            })
+            self._set_compaction_diagnostics(
+                {
+                    "compaction_policy_mode": mode,
+                    "compaction_stage": "none",
+                    "compaction_candidate_count": 0,
+                    "compaction_skipped_reason": "policy_disabled",
+                    "compaction_est_tokens_before": estimate,
+                    "compaction_est_tokens_after": estimate,
+                    "compaction_pressure_ratio": round(pressure_ratio, 4),
+                    "compaction_pressure_ratio_after": round(pressure_ratio, 4),
+                    "compaction_deficit_tokens_before": max(0, estimate - context_budget),
+                    "compaction_terminal_state": runner_compaction.compaction_terminal_state(
+                        estimate_after=estimate,
+                        context_budget=context_budget,
+                        microcompact_hits=0,
+                        compactor_calls=0,
+                        overflow_fallback_applied=False,
+                    ),
+                    "compaction_compactor_calls": 0,
+                    "compaction_strategy": "disabled",
+                    "compaction_wall_time_ms": round(
+                        (time.monotonic() - started_at) * 1000,
+                        3,
+                    ),
+                }
+            )
             return messages
-        if mode == "tiered":
-            return await self._compact_messages_for_model_tiered(
+        if mode in {"hybrid", "deterministic", "semantic", "tiered"}:
+            compacted = await self._compact_messages_for_model_tiered(
                 messages,
                 tools=tools,
                 remaining_seconds=remaining_seconds,
             )
-        return await self._compact_messages_for_model_legacy(messages, tools=tools)
+        else:
+            compacted = await self._compact_messages_for_model_legacy(
+                messages,
+                tools=tools,
+            )
+        diagnostics = dict(getattr(self, "_last_compaction_diagnostics", {}))
+        diagnostics.update(
+            {
+                "compaction_strategy": (
+                    mode if mode in {"hybrid", "deterministic"} else "model_assisted"
+                ),
+                "compaction_wall_time_ms": round(
+                    (time.monotonic() - started_at) * 1000,
+                    3,
+                ),
+            }
+        )
+        self._set_compaction_diagnostics(diagnostics)
+        return compacted
 
     async def _compact_messages_for_model_tiered(
         self,

@@ -427,12 +427,14 @@ missing tools, process activation/task creation fails fast with a clear error.
 
 Process contract v2 is the recommended authoring format (`schema_version: 2`),
 with behavior declared under `verification.policy`, `verification.remediation`,
-`evidence`, `validity_contract`, and `prompt_contracts`. v1 definitions still load in compatibility
+`evidence`, `validity_contract`, `quality_contract`, and `prompt_contracts`. v1 definitions still load in compatibility
 mode, with compatibility removal targeted for June 30, 2026.
 
 Current schema additions for process safety/evidence rigor:
 - `risk_level` (`low|medium|high|critical`) to make default rigor floors explicit.
 - `validity_contract` for claim extraction, prune behavior, and synthesis gates.
+- `quality_contract` for completeness, evidence traceability, analytical depth,
+  required output components, and bounded targeted revision.
 - `final_gate.temporal_consistency` for as-of alignment, stale-source checks, and date-conflict detection.
 
 ```yaml
@@ -460,6 +462,13 @@ Both ad hoc and defined process runs use the same enforcement path for these
 contracts (claim pruning/intermediate continuation, synthesis gating, and final
 failure on unsupported critical claims). For full authoring + migration guidance,
 see [docs/creating-packages.md](docs/creating-packages.md).
+
+Quality rollout can be staged with
+`verification.quality_policy_mode = "observe" | "assist" | "enforce"`.
+Observe mode scores only, assist mode performs bounded repair without degrading
+the overall completion grade, and enforce mode surfaces an unresolved quality
+floor as a recoverable completed gap. Evidence traceability accepts either
+indexed evidence IDs or normalized source URLs.
 Run telemetry now includes `run_validity_scorecard` and
 `artifact_seal_validation` for evidence/provenance audits.
 

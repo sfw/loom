@@ -10,13 +10,24 @@ from unittest.mock import ANY, AsyncMock, MagicMock
 import pytest
 
 from loom.config import Config, ExecutionConfig, VerificationConfig
+from loom.engine.correction import (
+    Blocker,
+    BlockerClass,
+    CorrectionDecision,
+    CorrectionHandler,
+    CorrectionState,
+    ProgressVector,
+    Repairability,
+    RepairAction,
+)
 from loom.engine.orchestrator import (
     Orchestrator,
     SubtaskResult,
     SubtaskResultStatus,
     ToolCallRecord,
 )
-from loom.engine.verification import VerificationResult
+from loom.engine.orchestrator.dispatch import _record_quality_observation
+from loom.engine.verification import Check, VerificationResult
 from loom.events.types import (
     FORBIDDEN_CANONICAL_WRITE_BLOCKED,
     PLACEHOLDER_CONFIRM_OR_PRUNE_STARTED,
@@ -26,6 +37,7 @@ from loom.events.types import (
     SUBTASK_BLOCKED,
     SUBTASK_OUTPUT_CONFLICT_DEFERRED,
     SUBTASK_OUTPUT_CONFLICT_STARVATION_WARNING,
+    TASK_COMPLETED,
     TASK_FAILED,
     TASK_STALLED,
 )
@@ -57,6 +69,67 @@ from tests.orchestrator.conftest import (
 
 class TestOrchestratorExecution:
     """Tests for the subtask execution phase."""
+
+    def test_quality_repair_ledger_is_bounded_and_privacy_safe(self):
+        task = _make_task()
+        subtask = Subtask(id="synthesis", description="Synthesize")
+        failed_quality = {
+            "overall": 0.62,
+            "requirement_coverage": 0.70,
+            "dimensions": {"completeness": 0.64, "depth": 0.73},
+            "meets_floor": False,
+            "reason_code": "quality_below_threshold",
+            "policy_mode": "enforce",
+            "missing_targets": ["generic requirement"],
+            "diagnostics": {
+                "traceability_ratio": 0.5,
+                "artifact_metrics": [{
+                    "path": "private-output-name.md",
+                    "role": "current",
+                    "word_count": 100,
+                }],
+            },
+        }
+        repaired_quality = {
+            **failed_quality,
+            "overall": 0.84,
+            "requirement_coverage": 0.92,
+            "dimensions": {"completeness": 0.86, "depth": 0.82},
+            "meets_floor": True,
+            "reason_code": "",
+            "missing_targets": [],
+            "diagnostics": {
+                "traceability_ratio": 0.9,
+                "artifact_metrics": [{
+                    "path": "private-output-name.md",
+                    "role": "current",
+                    "word_count": 180,
+                }],
+            },
+        }
+
+        _record_quality_observation(
+            task=task,
+            subtask=subtask,
+            quality=failed_quality,
+            stage="verification_failure",
+        )
+        _record_quality_observation(
+            task=task,
+            subtask=subtask,
+            quality=repaired_quality,
+            stage="verification_success",
+        )
+
+        observations = task.metadata["quality_observations"]
+        assert len(observations) == 2
+        assert all("path" not in item for item in observations)
+        assert "private-output-name.md" not in repr(observations)
+        outcome = task.metadata["quality_repair_outcomes"][0]
+        assert outcome["recovered"] is True
+        assert outcome["overall_delta"] == 0.22
+        assert outcome["word_count_delta"] == 80
+        assert outcome["regressed_dimensions"] == []
 
     @pytest.mark.asyncio
     async def test_dispatch_subtask_carries_prior_successful_tool_calls(self, tmp_path):
@@ -1145,7 +1218,7 @@ class TestOrchestratorExecution:
         assert "scratch-notes.md" in list(payload.get("attempted_paths", []))
 
     @pytest.mark.asyncio
-    async def test_stalled_plan_emits_blocked_subtasks_on_failure(self, tmp_path):
+    async def test_stalled_plan_emits_blocked_subtasks_on_degraded_completion(self, tmp_path):
         bus = _make_event_bus()
         events = []
         bus.subscribe_all(lambda e: events.append(e))
@@ -1181,12 +1254,13 @@ class TestOrchestratorExecution:
 
         result = await orch.execute_task(task, reuse_existing_plan=True)
 
-        assert result.status == TaskStatus.FAILED
+        assert result.status == TaskStatus.COMPLETED
+        assert result.metadata["completion_grade"] == "degraded"
         assert TASK_STALLED in [e.event_type for e in events]
         assert SUBTASK_BLOCKED in [e.event_type for e in events]
-        failed_events = [e for e in events if e.event_type == TASK_FAILED]
-        assert failed_events
-        blocked_subtasks = failed_events[-1].data.get("blocked_subtasks")
+        completed_events = [e for e in events if e.event_type == TASK_COMPLETED]
+        assert completed_events
+        blocked_subtasks = result.metadata["degraded_completion"]["blocked_subtasks"]
         assert isinstance(blocked_subtasks, list)
         assert blocked_subtasks[0]["subtask_id"] == "downstream-pending"
         orch._replan_task.assert_awaited_once()
@@ -1522,6 +1596,406 @@ class TestOrchestratorExecution:
         attempts = attempts_by_subtask.get("s1", [])
         assert len(attempts) == 1
         assert attempts[0].error is not None
+
+    @pytest.mark.asyncio
+    async def test_failed_verification_only_retry_is_reclassified_without_stale_fallthrough(
+        self,
+        tmp_path,
+    ):
+        state_manager = _make_state_manager(tmp_path)
+        bus = _make_event_bus()
+        events = []
+        bus.subscribe_all(lambda event: events.append(event))
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text='{"subtasks": []}'),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=state_manager,
+            event_bus=bus,
+            config=Config(execution=ExecutionConfig(max_subtask_retries=3)),
+        )
+        task = _make_task()
+        subtask = Subtask(
+            id="synthesis",
+            description="Produce recommendations",
+            is_critical_path=True,
+            max_retries=3,
+        )
+        task.plan.subtasks = [subtask]
+        state_manager.create(task)
+        progress = ProgressVector(1, 1, 1, 0, 0, 1, 0.4)
+        verifier_blocker = Blocker(
+            code="infra_verifier_error",
+            message="Verifier output could not be parsed.",
+            blocking=True,
+            repairability=Repairability.AUTOMATIC,
+            blocker_class=BlockerClass.VERIFIER_FAILURE,
+        )
+        contract_blocker = Blocker(
+            code="missing_required_contract_field",
+            message="Market-specific recommendations are missing.",
+            blocking=True,
+            repairability=Repairability.AUTOMATIC,
+            blocker_class=BlockerClass.ARTIFACT_CONTRACT,
+            targets=("recommendations.md",),
+        )
+        verifier_decision = CorrectionDecision(
+            cycle_id="corr-verifier",
+            blockers=(verifier_blocker,),
+            repairability=Repairability.AUTOMATIC,
+            handler=CorrectionHandler.RETRY_VERIFICATION,
+            state=CorrectionState.PLANNED,
+            actions=(
+                RepairAction(
+                    action_type="rerun_verifier",
+                    handler=CorrectionHandler.RETRY_VERIFICATION,
+                ),
+            ),
+            progress=progress,
+            progress_made=True,
+            no_progress_count=0,
+            stop_for_no_progress=False,
+            total_attempt_count=1,
+        )
+        contract_decision = CorrectionDecision(
+            cycle_id="corr-contract",
+            blockers=(contract_blocker,),
+            repairability=Repairability.AUTOMATIC,
+            handler=CorrectionHandler.CONTRACT_REPAIR,
+            state=CorrectionState.PLANNED,
+            actions=(
+                RepairAction(
+                    action_type="repair_structured_output_contract",
+                    handler=CorrectionHandler.CONTRACT_REPAIR,
+                    arguments={"targets": ["recommendations.md"], "guardrails": []},
+                ),
+            ),
+            progress=progress,
+            progress_made=True,
+            no_progress_count=0,
+            stop_for_no_progress=False,
+            total_attempt_count=2,
+        )
+        orch._correction.record_failure = AsyncMock(
+            side_effect=[verifier_decision, contract_decision],
+        )
+        orch._correction.mark_routed = AsyncMock()
+        orch._retry_verification_only = AsyncMock(return_value=VerificationResult(
+            tier=2,
+            passed=False,
+            outcome="partial_verified",
+            reason_code="missing_required_contract_field",
+            severity_class="semantic",
+            feedback="Market-specific recommendations are missing.",
+            metadata={"missing_targets": ["recommendations.md"]},
+        ))
+        orch._handle_success = AsyncMock()
+
+        await orch._handle_failure(
+            task,
+            subtask,
+            SubtaskResult(status="failed", summary="Usable draft."),
+            VerificationResult(
+                tier=2,
+                passed=False,
+                outcome="fail",
+                reason_code="parse_inconclusive",
+                severity_class="infra",
+                feedback="Verifier output could not be parsed.",
+            ),
+            attempts_by_subtask={},
+        )
+
+        orch._retry_verification_only.assert_awaited_once()
+        orch._handle_success.assert_not_awaited()
+        assert subtask.retry_count == 1
+        retry_events = [
+            event for event in events
+            if event.event_type == "subtask_retrying"
+            and event.data.get("correction_handler")
+        ]
+        assert retry_events[-1].data["correction_handler"] == "contract_repair"
+        assert retry_events[-1].data["retry_strategy"] == "contract_repair"
+
+    @pytest.mark.asyncio
+    async def test_exhausted_verifier_lane_completes_with_caveats_without_executor_retry(
+        self,
+        tmp_path,
+    ):
+        state_manager = _make_state_manager(tmp_path)
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text='{"subtasks": []}'),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=state_manager,
+            event_bus=_make_event_bus(),
+            config=Config(execution=ExecutionConfig(max_subtask_retries=3)),
+        )
+        task = _make_task()
+        subtask = Subtask(
+            id="synthesis",
+            description="Produce recommendations",
+            is_critical_path=True,
+            is_synthesis=True,
+            max_retries=3,
+        )
+        task.plan.subtasks = [subtask]
+        state_manager.create(task)
+        decision = CorrectionDecision(
+            cycle_id="corr-verifier",
+            blockers=(
+                Blocker(
+                    code="infra_verifier_error",
+                    message="Verifier remained unavailable.",
+                    blocking=True,
+                    repairability=Repairability.AUTOMATIC,
+                    blocker_class=BlockerClass.VERIFIER_FAILURE,
+                ),
+            ),
+            repairability=Repairability.AUTOMATIC,
+            handler=CorrectionHandler.RETRY_VERIFICATION,
+            state=CorrectionState.TERMINAL,
+            actions=(
+                RepairAction(
+                    action_type="rerun_verifier",
+                    handler=CorrectionHandler.RETRY_VERIFICATION,
+                ),
+            ),
+            progress=ProgressVector(1, 1, 0, 0, 0, 1, 0.4),
+            progress_made=False,
+            no_progress_count=2,
+            stop_for_no_progress=True,
+            total_attempt_count=2,
+        )
+        orch._correction.record_failure = AsyncMock(return_value=decision)
+        orch._retry_verification_only = AsyncMock()
+        orch._handle_success = AsyncMock()
+        result = SubtaskResult(status="failed", summary="Usable final draft.")
+        verification = VerificationResult(
+            tier=2,
+            passed=False,
+            outcome="fail",
+            reason_code="infra_verifier_error",
+            severity_class="infra",
+            feedback="Verifier remained unavailable.",
+        )
+
+        await orch._handle_failure(
+            task,
+            subtask,
+            result,
+            verification,
+            attempts_by_subtask={},
+        )
+
+        orch._retry_verification_only.assert_not_awaited()
+        orch._handle_success.assert_awaited_once()
+        assert result.status == SubtaskResultStatus.SUCCESS
+        assert verification.passed is True
+        assert verification.outcome == "pass_with_warnings"
+        assert verification.metadata["verifier_retry_exhausted"] is True
+        assert subtask.retry_count == 0
+
+    @pytest.mark.asyncio
+    async def test_handle_failure_grants_one_progressing_checkpoint_continuation(
+        self,
+        tmp_path,
+    ):
+        state_manager = _make_state_manager(tmp_path)
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text='{"subtasks": []}'),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=state_manager,
+            event_bus=_make_event_bus(),
+            config=Config(execution=ExecutionConfig(max_subtask_retries=3)),
+        )
+        task = _make_task()
+        subtask = Subtask(
+            id="risk-register",
+            description="Finish the risk register",
+            is_critical_path=True,
+            retry_count=3,
+            max_retries=3,
+        )
+        task.plan.subtasks = [subtask]
+        state_manager.create(task)
+        result = SubtaskResult(
+            status="failed",
+            summary="Partial risk register exists.",
+        )
+        verification = VerificationResult(
+            tier=2,
+            passed=False,
+            outcome="fail",
+            reason_code="tool_budget_exhausted",
+            severity_class="infra",
+            feedback="Only RISK-006 remains.",
+            metadata={"missing_targets": ["RISK-006"]},
+        )
+        orch._abort_on_critical_path_failure = AsyncMock()
+
+        await orch._handle_failure(
+            task,
+            subtask,
+            result,
+            verification,
+            attempts_by_subtask={},
+        )
+
+        assert subtask.retry_count == 4
+        assert subtask.status == SubtaskStatus.PENDING
+        orch._abort_on_critical_path_failure.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_handle_failure_grants_llm_planned_schema_repair_at_retry_ceiling(
+        self,
+        tmp_path,
+    ):
+        state_manager = _make_state_manager(tmp_path)
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text='{"subtasks": []}'),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=state_manager,
+            event_bus=_make_event_bus(),
+            config=Config(execution=ExecutionConfig(max_subtask_retries=3)),
+        )
+        task = _make_task()
+        subtask = Subtask(
+            id="structured-output",
+            description="Produce a comparison matrix",
+            is_critical_path=True,
+            retry_count=3,
+            max_retries=3,
+        )
+        task.plan.subtasks = [subtask]
+        state_manager.create(task)
+        result = SubtaskResult(
+            status="failed",
+            summary="The comparison matrix was written.",
+        )
+        verification = VerificationResult(
+            tier=1,
+            passed=False,
+            outcome="fail",
+            reason_code="csv_schema_mismatch",
+            severity_class="semantic",
+            feedback=(
+                "Verification failed: syntax_comparison-matrix.csv — "
+                "CSV row 8 has 13 columns (expected 11)."
+            ),
+            checks=[
+                Check(
+                    name="syntax_comparison-matrix.csv",
+                    passed=False,
+                    detail="CSV row 8 has 13 columns (expected 11).",
+                ),
+            ],
+        )
+        attempts_by_subtask: dict[str, list[AttemptRecord]] = {}
+        orch._plan_failure_resolution = AsyncMock(
+            return_value=(
+                "Edit comparison-matrix.csv in place, correct row 8 quoting, "
+                "then validate all row widths."
+            ),
+        )
+        orch._abort_on_critical_path_failure = AsyncMock()
+
+        await orch._handle_failure(
+            task,
+            subtask,
+            result,
+            verification,
+            attempts_by_subtask,
+        )
+
+        assert subtask.retry_count == 4
+        assert subtask.status == SubtaskStatus.PENDING
+        assert (
+            attempts_by_subtask["structured-output"][0].retry_strategy
+            == RetryStrategy.SCHEMA_REPAIR
+        )
+        assert "comparison-matrix.csv" in (
+            attempts_by_subtask["structured-output"][0].missing_targets
+        )
+        orch._plan_failure_resolution.assert_awaited_once()
+        orch._abort_on_critical_path_failure.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_handle_failure_repairs_unambiguous_csv_without_runner_rerun(
+        self,
+        tmp_path,
+    ):
+        state_manager = _make_state_manager(tmp_path)
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text='{"subtasks": []}'),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=state_manager,
+            event_bus=_make_event_bus(),
+            config=Config(execution=ExecutionConfig(max_subtask_retries=3)),
+        )
+        task = _make_task(workspace=str(tmp_path))
+        subtask = Subtask(
+            id="structured-output",
+            description="Produce a comparison matrix",
+            is_critical_path=True,
+            max_retries=3,
+        )
+        task.plan.subtasks = [subtask]
+        state_manager.create(task)
+        target = tmp_path / "comparison-matrix.csv"
+        target.write_text(
+            "company,score,source\nExample,5,public,,\n",
+            encoding="utf-8",
+        )
+        result = SubtaskResult(
+            status="failed",
+            summary="The comparison matrix was written.",
+        )
+        verification = VerificationResult(
+            tier=1,
+            passed=False,
+            outcome="fail",
+            reason_code="csv_schema_mismatch",
+            severity_class="semantic",
+            feedback="CSV row 2 has 5 columns (expected 3).",
+            checks=[
+                Check(
+                    name="syntax_comparison-matrix.csv",
+                    passed=False,
+                    detail="CSV row 2 has 5 columns (expected 3).",
+                ),
+            ],
+        )
+        orch._retry_verification_only = AsyncMock(return_value=VerificationResult(
+            tier=2,
+            passed=True,
+            outcome="pass",
+            feedback="Schema repaired.",
+        ))
+        orch._handle_success = AsyncMock()
+
+        await orch._handle_failure(
+            task,
+            subtask,
+            result,
+            verification,
+            attempts_by_subtask={},
+        )
+
+        assert target.read_text(encoding="utf-8") == (
+            "company,score,source\nExample,5,public\n"
+        )
+        orch._retry_verification_only.assert_awaited_once()
+        orch._handle_success.assert_awaited_once()
+        assert subtask.retry_count == 0
 
     @pytest.mark.asyncio
     async def test_handle_failure_allows_optional_dev_verifier_warning_success(self, tmp_path):
@@ -2755,3 +3229,77 @@ class TestOrchestratorExecution:
 
         with pytest.raises(asyncio.CancelledError):
             await orch.execute_task(task, reuse_existing_plan=True)
+
+    def test_dispatch_exception_is_classified_as_compaction_infrastructure(self, tmp_path):
+        orch = Orchestrator(
+            model_router=_make_mock_router(),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=_make_state_manager(tmp_path),
+            event_bus=_make_event_bus(),
+            config=_make_config(),
+        )
+        try:
+            exec(compile(
+                "raise IndexError('stale candidate index')",
+                "/tmp/loom/engine/runner/compaction.py",
+                "exec",
+            ))
+        except IndexError as error:
+            _, result, verification = orch._build_subtask_exception_outcome(
+                Subtask(id="research", description="Research"),
+                error,
+            )
+        else:  # pragma: no cover - the compiled fixture always raises
+            raise AssertionError("expected fixture to raise")
+
+        assert result.status == SubtaskResultStatus.FAILED
+        assert verification.reason_code == "infra_compaction_error"
+        assert verification.severity_class == "infra"
+        assert verification.metadata["exception_component"] == "runner_compaction"
+        assert verification.checks[0].name == "executor_infrastructure"
+
+    @pytest.mark.asyncio
+    async def test_partial_checkpoint_reports_no_progress_not_budget_exhaustion(
+        self,
+        tmp_path,
+    ):
+        state = _make_state_manager(tmp_path)
+        orch = Orchestrator(
+            model_router=_make_mock_router(),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=state,
+            event_bus=_make_event_bus(),
+            config=_make_config(),
+        )
+        task = _make_task()
+        subtask = Subtask(
+            id="research",
+            description="Research",
+            is_critical_path=True,
+        )
+        task.plan = Plan(subtasks=[subtask])
+        state.create(task)
+        verification = VerificationResult(
+            tier=1,
+            passed=False,
+            feedback="The targeted repair made no progress.",
+            reason_code="coverage_below_threshold",
+            severity_class="semantic",
+            metadata={
+                "correction": {
+                    "stop_for_no_progress": True,
+                    "stop_for_attempt_budget": False,
+                },
+            },
+        )
+
+        await orch._abort_on_critical_path_failure(task, subtask, verification)
+
+        assert subtask.status == SubtaskStatus.PARTIAL
+        assert "no-progress attempts" in subtask.summary
+        assert "budget exhausted" not in subtask.summary.lower()
+        assert task.metadata["recoverable_gaps"][-1]["terminal_reason"] == "no_progress"

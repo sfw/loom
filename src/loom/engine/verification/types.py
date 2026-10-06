@@ -33,6 +33,7 @@ _VALID_ASSERTION_VERDICTS = {
 }
 
 _REASON_CODE_SEVERITY: dict[str, str] = {
+    "artifact_confirmation_required": "infra",
     "dev_browser_check_failed": "semantic",
     "dev_build_failed": "semantic",
     "dev_contract_failed": "semantic",
@@ -43,6 +44,8 @@ _REASON_CODE_SEVERITY: dict[str, str] = {
     "hard_invariant_failed": "hard_invariant",
     "infra_runner_context_unfit": "infra",
     "infra_runner_empty_response": "infra",
+    "model_stream_empty": "infra",
+    "runner_empty_response": "infra",
     "provider_binary_not_found": "infra",
     "provider_binary_unsupported": "infra",
     "parse_inconclusive": "inconclusive",

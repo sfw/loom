@@ -6,6 +6,7 @@ import asyncio
 import json
 import random
 import re
+import time
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -47,6 +48,50 @@ _MODEL_BACKPRESSURE_RETRY_BASE_DELAY_SECONDS = 2.0
 _MODEL_BACKPRESSURE_MIN_ATTEMPTS = 8
 
 
+class _GlobalModelCallCoordinator:
+    """Coordinate provider pressure across concurrent tasks in this process."""
+
+    def __init__(self) -> None:
+        self._semaphores: dict[tuple[int, int], asyncio.Semaphore] = {}
+        self._cooldown_until = 0.0
+
+    def _semaphore(self, limit: int) -> asyncio.Semaphore:
+        loop = asyncio.get_running_loop()
+        key = (id(loop), max(1, int(limit)))
+        semaphore = self._semaphores.get(key)
+        if semaphore is None:
+            semaphore = asyncio.Semaphore(key[1])
+            self._semaphores[key] = semaphore
+        return semaphore
+
+    async def acquire(self, limit: int) -> asyncio.Semaphore:
+        remaining = self.cooldown_remaining_seconds()
+        if remaining > 0:
+            await asyncio.sleep(remaining)
+        semaphore = self._semaphore(limit)
+        await semaphore.acquire()
+        return semaphore
+
+    def defer(self, seconds: float) -> None:
+        if seconds <= 0:
+            return
+        self._cooldown_until = max(
+            self._cooldown_until,
+            time.monotonic() + float(seconds),
+        )
+
+    def cooldown_remaining_seconds(self) -> float:
+        return max(0.0, self._cooldown_until - time.monotonic())
+
+
+_GLOBAL_MODEL_CALL_COORDINATOR = _GlobalModelCallCoordinator()
+
+
+def model_backpressure_cooldown_remaining_seconds() -> float:
+    """Return the active process-wide provider cooldown, if any."""
+    return _GLOBAL_MODEL_CALL_COORDINATOR.cooldown_remaining_seconds()
+
+
 @dataclass(frozen=True)
 class ModelRetryPolicy:
     """Retry policy for model invocations."""
@@ -55,28 +100,47 @@ class ModelRetryPolicy:
     base_delay_seconds: float = 0.5
     max_delay_seconds: float = 8.0
     jitter_seconds: float = 0.25
+    global_max_concurrency: int = 3
+    backpressure_cooldown_seconds: float = 0.0
 
     @classmethod
     def from_execution_config(cls, execution: ExecutionConfig) -> ModelRetryPolicy:
         max_attempts = int(getattr(execution, "model_call_max_attempts", 5) or 5)
-        base_delay = float(
-            getattr(execution, "model_call_retry_base_delay_seconds", 0.5) or 0.5
-        )
-        max_delay = float(
-            getattr(execution, "model_call_retry_max_delay_seconds", 8.0) or 8.0
-        )
-        jitter = float(
-            getattr(execution, "model_call_retry_jitter_seconds", 0.25) or 0.25
-        )
+        base_delay = float(getattr(execution, "model_call_retry_base_delay_seconds", 0.5) or 0.5)
+        max_delay = float(getattr(execution, "model_call_retry_max_delay_seconds", 8.0) or 8.0)
+        jitter = float(getattr(execution, "model_call_retry_jitter_seconds", 0.25) or 0.25)
         max_attempts = max(1, min(10, max_attempts))
         base_delay = max(0.0, base_delay)
         max_delay = max(base_delay, max(0.0, max_delay))
         jitter = max(0.0, jitter)
+        global_max_concurrency = max(
+            1,
+            min(
+                32,
+                int(getattr(execution, "model_call_global_max_concurrency", 3) or 3),
+            ),
+        )
+        backpressure_cooldown_seconds = max(
+            0.0,
+            min(
+                120.0,
+                float(
+                    getattr(
+                        execution,
+                        "model_call_backpressure_cooldown_seconds",
+                        2.0,
+                    )
+                    or 0.0
+                ),
+            ),
+        )
         return cls(
             max_attempts=max_attempts,
             base_delay_seconds=base_delay,
             max_delay_seconds=max_delay,
             jitter_seconds=jitter,
+            global_max_concurrency=global_max_concurrency,
+            backpressure_cooldown_seconds=backpressure_cooldown_seconds,
         )
 
 
@@ -165,14 +229,17 @@ def is_model_backpressure_error(error: BaseException) -> bool:
         return True
 
     error_code = extract_model_error_code(error).strip().lower()
-    if error_code and any(marker in error_code for marker in (
-        "overload",
-        "rate_limit",
-        "rate-limit",
-        "too_many_requests",
-        "too-many-requests",
-        "throttle",
-    )):
+    if error_code and any(
+        marker in error_code
+        for marker in (
+            "overload",
+            "rate_limit",
+            "rate-limit",
+            "too_many_requests",
+            "too-many-requests",
+            "throttle",
+        )
+    ):
         return True
 
     text = str(error or "").strip().lower()
@@ -254,9 +321,7 @@ async def call_with_model_retry(
     policy: ModelRetryPolicy,
     should_retry: Callable[[BaseException], bool] | None = None,
     on_failure: Callable[[int, int, BaseException, int], None] | None = None,
-    on_retry_scheduled: (
-        Callable[[int, int, BaseException, int, float], None] | None
-    ) = None,
+    on_retry_scheduled: (Callable[[int, int, BaseException, int, float], None] | None) = None,
 ) -> T:
     """Invoke an async model call with a queued retry policy."""
     decider = should_retry or _retry_all_failures
@@ -267,14 +332,24 @@ async def call_with_model_retry(
 
     while attempt < max_attempts:
         attempt += 1
+        semaphore = await _GLOBAL_MODEL_CALL_COORDINATOR.acquire(
+            policy.global_max_concurrency,
+        )
+        semaphore_acquired = True
         try:
             return await invoke()
         except Exception as error:  # pragma: no cover - exercised by callers
+            semaphore.release()
+            semaphore_acquired = False
             last_error = error
-            if (
-                is_model_backpressure_error(error)
-                and not backpressure_retry_extended
-            ):
+            if is_model_backpressure_error(error):
+                _GLOBAL_MODEL_CALL_COORDINATOR.defer(
+                    max(
+                        policy.backpressure_cooldown_seconds,
+                        extract_model_retry_after_seconds(error) or 0.0,
+                    ),
+                )
+            if is_model_backpressure_error(error) and not backpressure_retry_extended:
                 max_attempts = max(
                     max_attempts,
                     _MODEL_BACKPRESSURE_MIN_ATTEMPTS,
@@ -295,6 +370,9 @@ async def call_with_model_retry(
                 on_retry_scheduled(attempt, max_attempts, error, remaining, delay)
             if delay > 0:
                 await asyncio.sleep(delay)
+        finally:
+            if semaphore_acquired:
+                semaphore.release()
 
     if last_error is not None:
         raise last_error
@@ -312,9 +390,7 @@ async def stream_with_model_retry(
     policy: ModelRetryPolicy,
     should_retry: Callable[[BaseException], bool] | None = None,
     on_failure: Callable[[int, int, BaseException, int], None] | None = None,
-    on_retry_scheduled: (
-        Callable[[int, int, BaseException, int, float], None] | None
-    ) = None,
+    on_retry_scheduled: (Callable[[int, int, BaseException, int, float], None] | None) = None,
 ) -> AsyncGenerator[T, None]:
     """Invoke an async model stream with queued retries on stream failures.
 
@@ -330,17 +406,27 @@ async def stream_with_model_retry(
     while attempt < max_attempts:
         attempt += 1
         yielded_chunk = False
+        semaphore = await _GLOBAL_MODEL_CALL_COORDINATOR.acquire(
+            policy.global_max_concurrency,
+        )
+        semaphore_acquired = True
         try:
             async for chunk in invoke_stream():
                 yielded_chunk = True
                 yield chunk
             return
         except Exception as error:  # pragma: no cover - exercised by callers
+            semaphore.release()
+            semaphore_acquired = False
             last_error = error
-            if (
-                is_model_backpressure_error(error)
-                and not backpressure_retry_extended
-            ):
+            if is_model_backpressure_error(error):
+                _GLOBAL_MODEL_CALL_COORDINATOR.defer(
+                    max(
+                        policy.backpressure_cooldown_seconds,
+                        extract_model_retry_after_seconds(error) or 0.0,
+                    ),
+                )
+            if is_model_backpressure_error(error) and not backpressure_retry_extended:
                 max_attempts = max(
                     max_attempts,
                     _MODEL_BACKPRESSURE_MIN_ATTEMPTS,
@@ -361,6 +447,9 @@ async def stream_with_model_retry(
                 on_retry_scheduled(attempt, max_attempts, error, remaining, delay)
             if delay > 0:
                 await asyncio.sleep(delay)
+        finally:
+            if semaphore_acquired:
+                semaphore.release()
 
     if last_error is not None:
         raise last_error
@@ -399,7 +488,7 @@ def _error_payloads_from_text(text: str) -> list[dict]:
     start = text.find("{")
     end = text.rfind("}")
     if start >= 0 and end > start:
-        candidates.append(text[start:end + 1])
+        candidates.append(text[start : end + 1])
 
     for candidate in candidates:
         candidate = str(candidate or "").strip()

@@ -24,7 +24,7 @@ from loom.engine.orchestrator import Orchestrator
 from loom.events.bus import Event, EventBus, EventPersister
 from loom.events.types import (
     TASK_CANCELLED,
-    TASK_FAILED,
+    TASK_PAUSED,
     TASK_RUN_ACQUIRED,
     TASK_RUN_HEARTBEAT,
     TASK_RUN_RECOVERED,
@@ -1120,13 +1120,7 @@ class Engine:
         return paused_count
 
     async def reconcile_interrupted_task_runs(self) -> int:
-        """Mark interrupted non-durable runs failed on startup.
-
-        The TUI already treats busy runs restored after a client restart as failed
-        unless there is an explicit resume flow. Desktop/loomd needs the same
-        behavior when the durable runner is disabled, otherwise stale runs can
-        appear resumable even though there is no worker left to continue them.
-        """
+        """Preserve interrupted non-durable runs as resumable checkpoints."""
         if bool(getattr(self.config.execution, "enable_durable_task_runner", False)):
             return 0
         try:
@@ -1139,8 +1133,8 @@ class Engine:
             return 0
 
         interrupted_note = (
-            "Run interrupted when Loom Desktop closed before recovery was available; "
-            "marked failed. Restart the run to continue."
+            "Run interrupted when Loom Desktop closed. Its checkpoint was preserved; "
+            "restart the run to continue."
         )
         reconciled_count = 0
 
@@ -1201,7 +1195,10 @@ class Engine:
                         exc_info=True,
                     )
 
-            task.status = TaskStatus.FAILED
+            task.status = TaskStatus.PAUSED
+            task.metadata = metadata
+            task.metadata["recovery_required"] = True
+            task.metadata["interrupted_checkpoint"] = True
             task.add_error("system", interrupted_note, resolution="Restart the run to continue.")
             try:
                 await self._save_task_state(task)
@@ -1223,7 +1220,7 @@ class Engine:
                         try:
                             await self.database.complete_task_run(
                                 run_id=task_run_id,
-                                status="failed",
+                                status="paused",
                                 last_error=interrupted_note,
                             )
                         except Exception:
@@ -1235,12 +1232,13 @@ class Engine:
 
             self.event_bus.emit(
                 Event(
-                    event_type=TASK_FAILED,
+                    event_type=TASK_PAUSED,
                     task_id=task_id,
                     data={
                         "run_id": run_id_for_event,
                         "interrupted": True,
                         "recovered": False,
+                        "recovery_required": True,
                         "message": interrupted_note,
                     },
                 ),
@@ -1333,13 +1331,23 @@ class Engine:
                 status_map = {
                     TaskStatus.COMPLETED: "completed",
                     TaskStatus.CANCELLED: "cancelled",
+                    TaskStatus.FAILED: "failed",
                 }
-                run_status = status_map.get(raw_status, "failed")
-                await self.database.complete_task_run(
-                    run_id=run_id,
-                    status=run_status,
-                    last_error="",
-                )
+                run_status = status_map.get(raw_status)
+                if run_status is not None:
+                    await self.database.complete_task_run(
+                        run_id=run_id,
+                        status=run_status,
+                        last_error="",
+                    )
+                elif bool(result.metadata.get("automatic_recovery_requested", False)):
+                    await self.database.requeue_task_run(run_id=run_id)
+                else:
+                    await self.database.complete_task_run(
+                        run_id=run_id,
+                        status="paused",
+                        last_error="Recoverable run checkpoint requires resume.",
+                    )
         except asyncio.CancelledError:
             cancelled_task = task
             if cancelled_task.status != TaskStatus.CANCELLED:
@@ -1395,21 +1403,19 @@ class Engine:
                     )
             raise
         except Exception as e:
-            logger.exception("Task run %s failed: %s", run_id, e)
+            logger.exception("Task run %s interrupted by recoverable error: %s", run_id, e)
             try:
-                task.status = TaskStatus.FAILED
+                task.metadata["recovery_required"] = True
+                task.metadata["automatic_recovery_requested"] = lease_enabled
+                task.status = TaskStatus.PENDING if lease_enabled else TaskStatus.PAUSED
                 await self._save_task_state(task)
             except Exception:
-                logger.exception("Failed persisting failure state for task %s", task.id)
+                logger.exception("Failed persisting recovery state for task %s", task.id)
             if lease_enabled:
                 try:
-                    await self.database.complete_task_run(
-                        run_id=run_id,
-                        status="failed",
-                        last_error=f"{type(e).__name__}: {e}",
-                    )
+                    await self.database.requeue_task_run(run_id=run_id)
                 except Exception:
-                    logger.exception("Failed completing task run %s", run_id)
+                    logger.exception("Failed requeueing task run %s", run_id)
         finally:
             if heartbeat_task is not None:
                 heartbeat_task.cancel()
