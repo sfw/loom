@@ -34,6 +34,14 @@ validity_contract:
     synthesis_min_verification_tier: 2
     critical_claim_support_ratio: 1.0
 
+quality_contract:
+  enabled: true
+  applies_to_phases: [investment-memo]
+  dimensions: [completeness, evidence_traceability, specificity, analytical_depth, cross_artifact_synthesis, actionability, uncertainty_handling, internal_consistency]
+  minimum_overall_score: 0.82
+  minimum_dimension_score: 0.70
+  minimum_requirement_coverage: 0.92
+
 tool_guidance: |
   Use CSV for models and Markdown for narrative. Always state fiscal period,
   currency, and reported vs adjusted metrics. For filing-derived metrics,
@@ -45,7 +53,7 @@ tools:
   guidance: >
     Use web_search/web_fetch for filings and market context, spreadsheet for
     valuation/return models, and document_write for memo assembly.
-  required: [web_search, web_fetch, spreadsheet, calculator, read_file, write_file, document_write, search_files]
+  required: [web_search, web_fetch, spreadsheet, calculator, read_file, read_artifact, write_file, document_write, search_files, fact_checker]
   excluded: [delete_file, shell_execute, git_command]
 
 phases:
@@ -230,6 +238,7 @@ verification:
         - remediation_required
         - remediation_mode
         - missing_targets
+        - quality
     outcome_policy:
       pass_states: [pass, pass_with_warnings, partial_verified]
       fail_states: [fail]

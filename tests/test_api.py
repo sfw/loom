@@ -5072,7 +5072,20 @@ class TestWorkspaceFirstEndpoints:
             goal="State-backed run",
             status=TaskStatus.EXECUTING,
             workspace=str(workspace_path),
-            metadata={"process": "state-first", "run_id": "exec-run-state-only-1"},
+            metadata={
+                "process": "state-first",
+                "run_id": "exec-run-state-only-1",
+                "quality_scorecard": {
+                    "synthesis": {
+                        "overall": 0.84,
+                        "requirement_coverage": 0.92,
+                        "dimensions": {"completeness": 0.88},
+                        "meets_floor": True,
+                        "reason_code": "",
+                        "missing_targets": [],
+                    },
+                },
+            },
         )
         state_manager.save(task)
         await database.insert_task_run(
@@ -5097,6 +5110,7 @@ class TestWorkspaceFirstEndpoints:
         assert detail["task"]["status"] == TaskStatus.EXECUTING.value
         assert detail["task"]["workspace_path"] == str(workspace_path)
         assert detail["task_run"]["run_id"] == "exec-run-state-only-1"
+        assert detail["quality_scorecard"]["synthesis"]["overall"] == 0.84
 
         timeline_response = await client.get(f"/runs/{task.id}/timeline")
         assert timeline_response.status_code == 200
@@ -5248,7 +5262,9 @@ class TestWorkspaceFirstEndpoints:
         assert failure["primary_reason_code"] == "hard_invariant_failed"
         assert "0% had it" in failure["summary"]
         assert "HTTP 999" in failure["summary"]
-        assert "hard invariant verification failure" in failure["remediation"]["why_not_remedied"]
+        remediation = failure["remediation"]["why_not_remedied"]
+        assert "terminal hard-invariant failure" in remediation
+        assert "retries were exhausted" not in remediation
 
     @pytest.mark.asyncio
     async def test_run_failure_analysis_prefers_terminal_subtask_failure_event(

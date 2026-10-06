@@ -68,15 +68,18 @@ def is_model_request_overflow_error(error: BaseException | str) -> bool:
     text = str(error or "").strip().lower()
     if not text:
         return False
-    return any(marker in text for marker in (
-        "total message size",
-        "exceeds limit",
-        "exceeded model token limit",
-        "maximum context length",
-        "context length exceeded",
-        "context_length_exceeded",
-        "too many tokens",
-    ))
+    return any(
+        marker in text
+        for marker in (
+            "total message size",
+            "exceeds limit",
+            "exceeded model token limit",
+            "maximum context length",
+            "context length exceeded",
+            "context_length_exceeded",
+            "too many tokens",
+        )
+    )
 
 
 def tool_call_name_index(messages: list[dict]) -> dict[str, str]:
@@ -137,10 +140,7 @@ def _preview_scalar(value: Any, *, max_chars: int) -> Any:
         return {
             "type": "array",
             "item_count": len(value),
-            "sample": [
-                _preview_scalar(item, max_chars=40)
-                for item in list(value)[:3]
-            ],
+            "sample": [_preview_scalar(item, max_chars=40) for item in list(value)[:3]],
         }
     return str(type(value).__name__)
 
@@ -178,10 +178,7 @@ def _structured_microcompact_text(raw: str, *, max_chars: int) -> str | None:
             "_loom_compact": "deterministic",
             "type": "array",
             "item_count": len(parsed),
-            "sample": [
-                _preview_scalar(item, max_chars=56)
-                for item in list(parsed)[:4]
-            ],
+            "sample": [_preview_scalar(item, max_chars=56) for item in list(parsed)[:4]],
         }
     else:
         return None
@@ -197,17 +194,21 @@ def _structured_microcompact_text(raw: str, *, max_chars: int) -> str | None:
         compact.pop("preview", None)
         variants.append(compact)
     if isinstance(parsed, dict):
-        variants.append({
-            "_loom_compact": "deterministic",
-            "type": "object",
-            "key_count": len(parsed),
-        })
+        variants.append(
+            {
+                "_loom_compact": "deterministic",
+                "type": "object",
+                "key_count": len(parsed),
+            }
+        )
     elif isinstance(parsed, list):
-        variants.append({
-            "_loom_compact": "deterministic",
-            "type": "array",
-            "item_count": len(parsed),
-        })
+        variants.append(
+            {
+                "_loom_compact": "deterministic",
+                "type": "array",
+                "item_count": len(parsed),
+            }
+        )
     for variant in variants:
         rendered = json.dumps(
             variant,
@@ -463,13 +464,11 @@ def rewrite_tool_payload_for_overflow(
     output_excerpt = overflow_excerpt(raw_output, max_chars=excerpt_chars)
     if output_excerpt:
         summary_output = (
-            f"{output_excerpt}\n\n"
-            "[overflow fallback applied: condensed oversized tool payload]"
+            f"{output_excerpt}\n\n[overflow fallback applied: condensed oversized tool payload]"
         )
     else:
         summary_output = (
-            "[overflow fallback applied: tool payload condensed to reduce "
-            "request size]"
+            "[overflow fallback applied: tool payload condensed to reduce request size]"
         )
 
     compact_payload: dict[str, Any] = {
@@ -500,11 +499,7 @@ def rewrite_tool_payload_for_overflow(
             "extracted_chars",
             "extraction_truncated",
         )
-        compact_data = {
-            key: data_dict[key]
-            for key in keep_keys
-            if key in data_dict
-        }
+        compact_data = {key: data_dict[key] for key in keep_keys if key in data_dict}
         compact_data["overflow_fallback"] = True
         compact_data["tool_name"] = tool_name
         compact_data["original_chars"] = len(content_text)
@@ -540,8 +535,7 @@ def apply_model_overflow_fallback(
         (
             idx
             for idx, msg in enumerate(messages)
-            if isinstance(msg, dict)
-            and str(msg.get("role", "")).strip().lower() == "tool"
+            if isinstance(msg, dict) and str(msg.get("role", "")).strip().lower() == "tool"
         ),
         default=-1,
     )
@@ -762,9 +756,7 @@ def prune_tool_schemas_for_fit(
         }
 
     schema_by_name = {
-        _tool_schema_name(schema): schema
-        for schema in schemas
-        if _tool_schema_name(schema)
+        _tool_schema_name(schema): schema for schema in schemas if _tool_schema_name(schema)
     }
     ordered_names: list[str] = []
     seen: set[str] = set()
@@ -777,11 +769,7 @@ def prune_tool_schemas_for_fit(
             ordered_names.append(name)
             seen.add(name)
 
-    remaining = [
-        schema
-        for schema in schemas
-        if _tool_schema_name(schema) not in seen
-    ]
+    remaining = [schema for schema in schemas if _tool_schema_name(schema) not in seen]
     remaining.sort(key=lambda schema: (_tool_schema_bytes(schema), _tool_schema_name(schema)))
     ordered = [schema_by_name[name] for name in ordered_names] + remaining
 
@@ -911,11 +899,7 @@ def build_compaction_plan(
             ),
         )
         merge_limit = max(1, total - max(3, preserve_recent + 1))
-        merge_set = {
-            idx
-            for idx in range(1, merge_limit)
-            if idx not in preserve_tool_exchange
-        }
+        merge_set = {idx for idx in range(1, merge_limit) if idx not in preserve_tool_exchange}
 
         # Provider tool-call messages are an atomic protocol unit.  Expanding a
         # merge boundary through an old exchange is safe; retaining only its tool
@@ -1363,24 +1347,27 @@ async def compact_messages_for_model_tiered(
         if request_budget.request_est_tokens <= max(1, context_budget):
             pressure_ratio = request_budget.usage_ratio
             deficit_before = request_budget.deficit_tokens
-            set_compaction_diagnostics(runner, {
-                "compaction_policy_mode": mode,
-                "compaction_pressure_tier": CompactionPressureTier.NORMAL.value,
-                "compaction_pressure_ratio": round(pressure_ratio, 4),
-                "compaction_stage": "none",
-                "compaction_candidate_count": 0,
-                "compaction_skipped_reason": "short_history",
-                "compaction_est_tokens_before": request_budget.request_est_tokens,
-                "compaction_est_tokens_after": request_budget.request_est_tokens,
-                "compaction_deficit_tokens_before": deficit_before,
-                "compaction_protected_tail_count": len(messages),
-                "compaction_terminal_state": "fit",
-                "compaction_compactor_calls": 0,
-                "compaction_compactor_failures": 0,
-                "compaction_circuit_breaker_tripped": False,
-                "compaction_microcompact_hits": 0,
-                "compaction_microcompact_chars_reduced": 0,
-            })
+            set_compaction_diagnostics(
+                runner,
+                {
+                    "compaction_policy_mode": mode,
+                    "compaction_pressure_tier": CompactionPressureTier.NORMAL.value,
+                    "compaction_pressure_ratio": round(pressure_ratio, 4),
+                    "compaction_stage": "none",
+                    "compaction_candidate_count": 0,
+                    "compaction_skipped_reason": "short_history",
+                    "compaction_est_tokens_before": request_budget.request_est_tokens,
+                    "compaction_est_tokens_after": request_budget.request_est_tokens,
+                    "compaction_deficit_tokens_before": deficit_before,
+                    "compaction_protected_tail_count": len(messages),
+                    "compaction_terminal_state": "fit",
+                    "compaction_compactor_calls": 0,
+                    "compaction_compactor_failures": 0,
+                    "compaction_circuit_breaker_tripped": False,
+                    "compaction_microcompact_hits": 0,
+                    "compaction_microcompact_chars_reduced": 0,
+                },
+            )
             return messages
         # A first-turn prompt can be the whole problem. Continue into the
         # pressure path so the initial prompt can be compacted.
@@ -1437,36 +1424,37 @@ async def compact_messages_for_model_tiered(
     deficit_before = request_budget_before.deficit_tokens
     tier = compute_compaction_pressure_tier(runner, pressure_ratio)
     if tier == CompactionPressureTier.NORMAL:
-        set_compaction_diagnostics(runner, {
-            "compaction_policy_mode": mode,
-            "compaction_pressure_tier": tier.value,
-            "compaction_pressure_ratio": round(pressure_ratio, 4),
-            "compaction_stage": "none",
-            "compaction_candidate_count": 0,
-            "compaction_skipped_reason": "no_pressure",
-            "compaction_est_tokens_before": estimate_before,
-            "compaction_est_tokens_after": estimate_before,
-            "compaction_deficit_tokens_before": deficit_before,
-            "compaction_protected_tail_count": len(
-                critical_message_indices(runner, messages),
-            ),
-            "compaction_terminal_state": "fit",
-            "compaction_compactor_calls": 0,
-            "compaction_compactor_failures": 0,
-            "compaction_circuit_breaker_tripped": False,
-            "compaction_microcompact_hits": 0,
-            "compaction_microcompact_chars_reduced": 0,
-        })
+        set_compaction_diagnostics(
+            runner,
+            {
+                "compaction_policy_mode": mode,
+                "compaction_pressure_tier": tier.value,
+                "compaction_pressure_ratio": round(pressure_ratio, 4),
+                "compaction_stage": "none",
+                "compaction_candidate_count": 0,
+                "compaction_skipped_reason": "no_pressure",
+                "compaction_est_tokens_before": estimate_before,
+                "compaction_est_tokens_after": estimate_before,
+                "compaction_deficit_tokens_before": deficit_before,
+                "compaction_protected_tail_count": len(
+                    critical_message_indices(runner, messages),
+                ),
+                "compaction_terminal_state": "fit",
+                "compaction_compactor_calls": 0,
+                "compaction_compactor_failures": 0,
+                "compaction_circuit_breaker_tripped": False,
+                "compaction_microcompact_hits": 0,
+                "compaction_microcompact_chars_reduced": 0,
+            },
+        )
         return messages
 
     compacted: list[dict] = [
-        dict(message) if isinstance(message, dict) else message
-        for message in messages
+        dict(message) if isinstance(message, dict) else message for message in messages
     ]
     plan = build_compaction_plan(runner, compacted, tier=tier)
-    timeout_guard_active = (
-        mode not in {"deterministic"}
-        and runner._is_timeout_guard_active(remaining_seconds)
+    timeout_guard_active = mode not in {"deterministic"} and runner._is_timeout_guard_active(
+        remaining_seconds
     )
     total_candidates = (
         len(plan.stage1_tool_args)
@@ -1485,24 +1473,27 @@ async def compact_messages_for_model_tiered(
                 total_candidates += 1
     protected_tail_count = len(plan.critical_indices)
     if total_candidates == 0:
-        set_compaction_diagnostics(runner, {
-            "compaction_policy_mode": mode,
-            "compaction_pressure_tier": tier.value,
-            "compaction_pressure_ratio": round(pressure_ratio, 4),
-            "compaction_stage": "none",
-            "compaction_candidate_count": 0,
-            "compaction_skipped_reason": "policy_preserve",
-            "compaction_est_tokens_before": estimate_before,
-            "compaction_est_tokens_after": estimate_before,
-            "compaction_deficit_tokens_before": deficit_before,
-            "compaction_protected_tail_count": protected_tail_count,
-            "compaction_terminal_state": "unfit",
-            "compaction_compactor_calls": 0,
-            "compaction_compactor_failures": 0,
-            "compaction_circuit_breaker_tripped": False,
-            "compaction_microcompact_hits": 0,
-            "compaction_microcompact_chars_reduced": 0,
-        })
+        set_compaction_diagnostics(
+            runner,
+            {
+                "compaction_policy_mode": mode,
+                "compaction_pressure_tier": tier.value,
+                "compaction_pressure_ratio": round(pressure_ratio, 4),
+                "compaction_stage": "none",
+                "compaction_candidate_count": 0,
+                "compaction_skipped_reason": "policy_preserve",
+                "compaction_est_tokens_before": estimate_before,
+                "compaction_est_tokens_after": estimate_before,
+                "compaction_deficit_tokens_before": deficit_before,
+                "compaction_protected_tail_count": protected_tail_count,
+                "compaction_terminal_state": "unfit",
+                "compaction_compactor_calls": 0,
+                "compaction_compactor_failures": 0,
+                "compaction_circuit_breaker_tripped": False,
+                "compaction_microcompact_hits": 0,
+                "compaction_microcompact_chars_reduced": 0,
+            },
+        )
         return compacted
 
     estimate_after = estimate_before
@@ -1513,6 +1504,8 @@ async def compact_messages_for_model_tiered(
     async def _compact_stage_1() -> bool:
         changed = False
         for idx in plan.stage1_tool_args:
+            if idx < 0 or idx >= len(compacted):
+                continue
             msg = compacted[idx]
             if not isinstance(msg, dict):
                 continue
@@ -1529,6 +1522,8 @@ async def compact_messages_for_model_tiered(
     async def _compact_stage_2() -> bool:
         changed = False
         for idx in plan.stage2_tool_output:
+            if idx < 0 or idx >= len(compacted):
+                continue
             msg = compacted[idx]
             if not isinstance(msg, dict):
                 continue
@@ -1546,11 +1541,11 @@ async def compact_messages_for_model_tiered(
     async def _compact_stage_3() -> bool:
         changed = False
         text_budget = (
-            compact_text_chars
-            if tier == CompactionPressureTier.PRESSURE
-            else minimal_text_chars
+            compact_text_chars if tier == CompactionPressureTier.PRESSURE else minimal_text_chars
         )
         for idx in plan.stage3_historical:
+            if idx < 0 or idx >= len(compacted):
+                continue
             msg = compacted[idx]
             if not isinstance(msg, dict):
                 continue
@@ -1582,6 +1577,27 @@ async def compact_messages_for_model_tiered(
                 return False
         elif tier != CompactionPressureTier.CRITICAL or pressure_after <= hard_ratio:
             return False
+        existing_checkpoint = next(
+            (
+                str(message.get("content", "") or "")
+                for message in compacted
+                if isinstance(message, dict)
+                and str(message.get("role", "") or "").strip().lower() == "user"
+                and str(message.get("content", "") or "").startswith(
+                    "Prior semantic context checkpoint "
+                )
+            ),
+            "",
+        )
+        if existing_checkpoint:
+            checkpoint_report = {
+                "checkpoint_reused": True,
+                "checkpoint_cache_hit": True,
+                "checkpoint_model_calls": 0,
+                "checkpoint_skipped_reason": "existing_checkpoint_reused",
+            }
+            runner._record_compaction_skip("existing_checkpoint_reused")
+            return False
         if not plan.stage4_merge:
             return False
 
@@ -1592,7 +1608,7 @@ async def compact_messages_for_model_tiered(
         merge_candidates = set(plan.stage4_merge)
         atomic_groups: list[list[int]] = []
         cursor = 0
-        ordered_candidates = sorted(merge_candidates)
+        ordered_candidates = sorted(idx for idx in merge_candidates if 0 <= idx < len(compacted))
         while cursor < len(ordered_candidates):
             idx = ordered_candidates[cursor]
             msg = compacted[idx]
@@ -1625,9 +1641,7 @@ async def compact_messages_for_model_tiered(
                     for tc in list(msg.get("tool_calls", []))
                     if isinstance(tc, dict)
                 ]
-                return (
-                    f"[assistant/tool_call] {', '.join(tool_names) or 'tool call'}"
-                )
+                return f"[assistant/tool_call] {', '.join(tool_names) or 'tool call'}"
             content = msg.get("content", "")
             if not isinstance(content, str):
                 content = str(content)
@@ -1706,13 +1720,15 @@ async def compact_messages_for_model_tiered(
 
         merge_set = set(selected_indices)
         rebuilt = [compacted[0]]
-        rebuilt.append({
-            "role": "user",
-            "content": (
-                "Prior semantic context checkpoint "
-                f"(source_sha256={source_hash[:16]}):\n{validated_summary}"
-            ),
-        })
+        rebuilt.append(
+            {
+                "role": "user",
+                "content": (
+                    "Prior semantic context checkpoint "
+                    f"(source_sha256={source_hash[:16]}):\n{validated_summary}"
+                ),
+            }
+        )
         for idx, msg in enumerate(compacted[1:], start=1):
             if idx in merge_set:
                 continue
@@ -1724,6 +1740,8 @@ async def compact_messages_for_model_tiered(
         if not initial_prompt_candidate:
             return False
         if pressure_after <= 1.0:
+            return False
+        if not compacted:
             return False
         msg = compacted[0]
         if not isinstance(msg, dict):
@@ -1750,7 +1768,21 @@ async def compact_messages_for_model_tiered(
 
     async def _run_stage(stage_name: str, apply_fn) -> bool:
         nonlocal estimate_after, pressure_after
-        changed = await apply_fn()
+        before_stage = [
+            dict(message) if isinstance(message, dict) else message for message in compacted
+        ]
+        try:
+            changed = await apply_fn()
+        except Exception:
+            # Context reduction is a resilience mechanism, not a reason to
+            # discard an otherwise healthy executor pass. Roll back partial
+            # mutations and let the remaining policy stages (or the model's
+            # native context guard) make the next decision.
+            compacted[:] = before_stage
+            runner._record_compaction_failure()
+            runner._record_compaction_skip(f"{stage_name}_error")
+            logger.exception("Runner compaction stage %s failed open", stage_name)
+            return False
         if changed:
             request_budget_after = compute_request_budget(
                 messages=compacted,
@@ -1769,7 +1801,16 @@ async def compact_messages_for_model_tiered(
             if timeout_guard_active:
                 runner._record_compaction_skip("timeout_guard")
             else:
-                await _run_stage("stage_4_semantic_checkpoint", _compact_stage_4)
+                semantic_checkpoint_applied = await _run_stage(
+                    "stage_4_semantic_checkpoint",
+                    _compact_stage_4,
+                )
+                if semantic_checkpoint_applied:
+                    # Stage 4 structurally rebuilds the message list. Every
+                    # candidate index in the original plan is now stale, even
+                    # when it still happens to be in bounds. Re-plan against
+                    # the semantic checkpoint before applying in-place stages.
+                    plan = build_compaction_plan(runner, compacted, tier=tier)
         if pressure_after > soft_ratio:
             await _run_stage("stage_1_tool_args", _compact_stage_1)
         if pressure_after > soft_ratio:
@@ -1848,46 +1889,49 @@ async def compact_messages_for_model_tiered(
         pressure_after = request_budget_after.usage_ratio
         applied_stages.append("overflow_fallback")
 
-    set_compaction_diagnostics(runner, {
-        "compaction_policy_mode": mode,
-        "compaction_pressure_tier": tier.value,
-        "compaction_pressure_ratio": round(pressure_ratio, 4),
-        "compaction_pressure_ratio_after": round(pressure_after, 4),
-        "compaction_stage": applied_stages[-1] if applied_stages else "none",
-        "compaction_applied_stages": applied_stages,
-        "compaction_candidate_count": total_candidates,
-        "compaction_skipped_reason": skipped_reason,
-        "compaction_est_tokens_before": estimate_before,
-        "compaction_est_tokens_after": estimate_after,
-        "compaction_deficit_tokens_before": deficit_before,
-        "compaction_protected_tail_count": protected_tail_count,
-        "compaction_compactor_calls": compactor_calls,
-        "compaction_compactor_failures": int(stats.get("compactor_failures", 0)),
-        "compaction_circuit_breaker_tripped": bool(
-            stats.get("circuit_breaker_tripped", False),
-        ),
-        "compaction_microcompact_hits": int(stats.get("microcompact_hits", 0)),
-        "compaction_microcompact_chars_reduced": int(
-            stats.get("microcompact_chars_reduced", 0),
-        ),
-        "compaction_overflow_fallback_applied": bool(
-            proactive_overflow_report
-            and proactive_overflow_report.get("overflow_fallback_applied", False),
-        ),
-        "compaction_overflow_fallback_report": proactive_overflow_report or {},
-        "compaction_terminal_state": compaction_terminal_state(
-            estimate_after=estimate_after,
-            context_budget=context_budget,
-            microcompact_hits=int(stats.get("microcompact_hits", 0)),
-            compactor_calls=compactor_calls,
-            overflow_fallback_applied=bool(
+    set_compaction_diagnostics(
+        runner,
+        {
+            "compaction_policy_mode": mode,
+            "compaction_pressure_tier": tier.value,
+            "compaction_pressure_ratio": round(pressure_ratio, 4),
+            "compaction_pressure_ratio_after": round(pressure_after, 4),
+            "compaction_stage": applied_stages[-1] if applied_stages else "none",
+            "compaction_applied_stages": applied_stages,
+            "compaction_candidate_count": total_candidates,
+            "compaction_skipped_reason": skipped_reason,
+            "compaction_est_tokens_before": estimate_before,
+            "compaction_est_tokens_after": estimate_after,
+            "compaction_deficit_tokens_before": deficit_before,
+            "compaction_protected_tail_count": protected_tail_count,
+            "compaction_compactor_calls": compactor_calls,
+            "compaction_compactor_failures": int(stats.get("compactor_failures", 0)),
+            "compaction_circuit_breaker_tripped": bool(
+                stats.get("circuit_breaker_tripped", False),
+            ),
+            "compaction_microcompact_hits": int(stats.get("microcompact_hits", 0)),
+            "compaction_microcompact_chars_reduced": int(
+                stats.get("microcompact_chars_reduced", 0),
+            ),
+            "compaction_overflow_fallback_applied": bool(
                 proactive_overflow_report
                 and proactive_overflow_report.get("overflow_fallback_applied", False),
             ),
-        ),
-        "compaction_skip_reasons": stats.get("skip_reasons", {}),
-        "compaction_checkpoint": checkpoint_report,
-    })
+            "compaction_overflow_fallback_report": proactive_overflow_report or {},
+            "compaction_terminal_state": compaction_terminal_state(
+                estimate_after=estimate_after,
+                context_budget=context_budget,
+                microcompact_hits=int(stats.get("microcompact_hits", 0)),
+                compactor_calls=compactor_calls,
+                overflow_fallback_applied=bool(
+                    proactive_overflow_report
+                    and proactive_overflow_report.get("overflow_fallback_applied", False),
+                ),
+            ),
+            "compaction_skip_reasons": stats.get("skip_reasons", {}),
+            "compaction_checkpoint": checkpoint_report,
+        },
+    )
     return compacted
 
 
@@ -1901,20 +1945,23 @@ async def compact_messages_for_model_legacy(
     runner._reset_compaction_runtime_stats()
     mode = runner._runner_compaction_mode()
     if len(messages) < 3:
-        set_compaction_diagnostics(runner, {
-            "compaction_policy_mode": mode,
-            "compaction_stage": "none",
-            "compaction_candidate_count": 0,
-            "compaction_skipped_reason": "short_history",
-            "compaction_deficit_tokens_before": 0,
-            "compaction_protected_tail_count": len(messages),
-            "compaction_terminal_state": "fit",
-            "compaction_compactor_calls": 0,
-            "compaction_compactor_failures": 0,
-            "compaction_circuit_breaker_tripped": False,
-            "compaction_microcompact_hits": 0,
-            "compaction_microcompact_chars_reduced": 0,
-        })
+        set_compaction_diagnostics(
+            runner,
+            {
+                "compaction_policy_mode": mode,
+                "compaction_stage": "none",
+                "compaction_candidate_count": 0,
+                "compaction_skipped_reason": "short_history",
+                "compaction_deficit_tokens_before": 0,
+                "compaction_protected_tail_count": len(messages),
+                "compaction_terminal_state": "fit",
+                "compaction_compactor_calls": 0,
+                "compaction_compactor_failures": 0,
+                "compaction_circuit_breaker_tripped": False,
+                "compaction_microcompact_hits": 0,
+                "compaction_microcompact_chars_reduced": 0,
+            },
+        )
         return messages
 
     context_budget = int(
@@ -1951,27 +1998,29 @@ async def compact_messages_for_model_legacy(
     estimate_before = request_budget_before.request_est_tokens
     deficit_before = request_budget_before.deficit_tokens
     if estimate_before <= context_budget:
-        set_compaction_diagnostics(runner, {
-            "compaction_policy_mode": mode,
-            "compaction_stage": "none",
-            "compaction_candidate_count": 0,
-            "compaction_skipped_reason": "no_pressure",
-            "compaction_est_tokens_before": estimate_before,
-            "compaction_est_tokens_after": estimate_before,
-            "compaction_deficit_tokens_before": deficit_before,
-            "compaction_protected_tail_count": 0,
-            "compaction_terminal_state": "fit",
-            "compaction_compactor_calls": 0,
-            "compaction_compactor_failures": 0,
-            "compaction_circuit_breaker_tripped": False,
-            "compaction_microcompact_hits": 0,
-            "compaction_microcompact_chars_reduced": 0,
-        })
+        set_compaction_diagnostics(
+            runner,
+            {
+                "compaction_policy_mode": mode,
+                "compaction_stage": "none",
+                "compaction_candidate_count": 0,
+                "compaction_skipped_reason": "no_pressure",
+                "compaction_est_tokens_before": estimate_before,
+                "compaction_est_tokens_after": estimate_before,
+                "compaction_deficit_tokens_before": deficit_before,
+                "compaction_protected_tail_count": 0,
+                "compaction_terminal_state": "fit",
+                "compaction_compactor_calls": 0,
+                "compaction_compactor_failures": 0,
+                "compaction_circuit_breaker_tripped": False,
+                "compaction_microcompact_hits": 0,
+                "compaction_microcompact_chars_reduced": 0,
+            },
+        )
         return messages
 
     compacted: list[dict] = [
-        dict(message) if isinstance(message, dict) else message
-        for message in messages
+        dict(message) if isinstance(message, dict) else message for message in messages
     ]
     stage_name = "stage_1_tool_args"
     candidate_count = 0
@@ -2036,8 +2085,7 @@ async def compact_messages_for_model_legacy(
                 if isinstance(content, str):
                     if content.startswith(runner._TODO_REMINDER_PREFIX):
                         msg["content"] = (
-                            "Continue current subtask only. "
-                            "Do NOT move to the next subtask."
+                            "Continue current subtask only. Do NOT move to the next subtask."
                         )
                     elif len(content) > text_chars:
                         msg["content"] = await compact_text(
@@ -2062,13 +2110,16 @@ async def compact_messages_for_model_legacy(
         text_chars=compact_text_chars,
         stage="stage_2_general",
     )
-    if compute_request_budget(
-        messages=compacted,
-        tools=tools,
-        context_budget_tokens=context_budget,
-        target_ratio=1.0,
-        origin="runner.compaction.legacy.stage2",
-    ).request_est_tokens > context_budget:
+    if (
+        compute_request_budget(
+            messages=compacted,
+            tools=tools,
+            context_budget_tokens=context_budget,
+            target_ratio=1.0,
+            origin="runner.compaction.legacy.stage2",
+        ).request_est_tokens
+        > context_budget
+    ):
         await _apply_pass(
             preserve_recent=4,
             tool_chars=120,
@@ -2076,21 +2127,20 @@ async def compact_messages_for_model_legacy(
             stage="stage_3_minimal",
         )
 
-    if compute_request_budget(
-        messages=compacted,
-        tools=tools,
-        context_budget_tokens=context_budget,
-        target_ratio=1.0,
-        origin="runner.compaction.legacy.stage3",
-    ).request_est_tokens > context_budget:
+    if (
+        compute_request_budget(
+            messages=compacted,
+            tools=tools,
+            context_budget_tokens=context_budget,
+            target_ratio=1.0,
+            origin="runner.compaction.legacy.stage3",
+        ).request_est_tokens
+        > context_budget
+    ):
         preserve_from = max(1, len(compacted) - 3)
         old_context = compacted[1:preserve_from]
         recent = compacted[preserve_from:]
-        while (
-            recent
-            and isinstance(recent[0], dict)
-            and recent[0].get("role") == "tool"
-        ):
+        while recent and isinstance(recent[0], dict) and recent[0].get("role") == "tool":
             recent = recent[1:]
 
         if old_context:
@@ -2147,39 +2197,42 @@ async def compact_messages_for_model_legacy(
         origin="runner.compaction.legacy.final",
     ).request_est_tokens
     stats = dict(getattr(runner, "_compaction_runtime_stats", {}))
-    set_compaction_diagnostics(runner, {
-        "compaction_policy_mode": mode,
-        "compaction_stage": stage_name,
-        "compaction_candidate_count": candidate_count,
-        "compaction_skipped_reason": "",
-        "compaction_est_tokens_before": estimate_before,
-        "compaction_est_tokens_after": estimate_after,
-        "compaction_deficit_tokens_before": deficit_before,
-        "compaction_protected_tail_count": len(critical_message_indices(runner, messages)),
-        "compaction_compactor_calls": int(stats.get("compactor_calls", 0)),
-        "compaction_compactor_failures": int(stats.get("compactor_failures", 0)),
-        "compaction_circuit_breaker_tripped": bool(
-            stats.get("circuit_breaker_tripped", False),
-        ),
-        "compaction_microcompact_hits": int(stats.get("microcompact_hits", 0)),
-        "compaction_microcompact_chars_reduced": int(
-            stats.get("microcompact_chars_reduced", 0),
-        ),
-        "compaction_overflow_fallback_applied": bool(
-            proactive_overflow_report
-            and proactive_overflow_report.get("overflow_fallback_applied", False),
-        ),
-        "compaction_overflow_fallback_report": proactive_overflow_report or {},
-        "compaction_terminal_state": compaction_terminal_state(
-            estimate_after=estimate_after,
-            context_budget=context_budget,
-            microcompact_hits=int(stats.get("microcompact_hits", 0)),
-            compactor_calls=int(stats.get("compactor_calls", 0)),
-            overflow_fallback_applied=bool(
+    set_compaction_diagnostics(
+        runner,
+        {
+            "compaction_policy_mode": mode,
+            "compaction_stage": stage_name,
+            "compaction_candidate_count": candidate_count,
+            "compaction_skipped_reason": "",
+            "compaction_est_tokens_before": estimate_before,
+            "compaction_est_tokens_after": estimate_after,
+            "compaction_deficit_tokens_before": deficit_before,
+            "compaction_protected_tail_count": len(critical_message_indices(runner, messages)),
+            "compaction_compactor_calls": int(stats.get("compactor_calls", 0)),
+            "compaction_compactor_failures": int(stats.get("compactor_failures", 0)),
+            "compaction_circuit_breaker_tripped": bool(
+                stats.get("circuit_breaker_tripped", False),
+            ),
+            "compaction_microcompact_hits": int(stats.get("microcompact_hits", 0)),
+            "compaction_microcompact_chars_reduced": int(
+                stats.get("microcompact_chars_reduced", 0),
+            ),
+            "compaction_overflow_fallback_applied": bool(
                 proactive_overflow_report
                 and proactive_overflow_report.get("overflow_fallback_applied", False),
             ),
-        ),
-        "compaction_skip_reasons": stats.get("skip_reasons", {}),
-    })
+            "compaction_overflow_fallback_report": proactive_overflow_report or {},
+            "compaction_terminal_state": compaction_terminal_state(
+                estimate_after=estimate_after,
+                context_budget=context_budget,
+                microcompact_hits=int(stats.get("microcompact_hits", 0)),
+                compactor_calls=int(stats.get("compactor_calls", 0)),
+                overflow_fallback_applied=bool(
+                    proactive_overflow_report
+                    and proactive_overflow_report.get("overflow_fallback_applied", False),
+                ),
+            ),
+            "compaction_skip_reasons": stats.get("skip_reasons", {}),
+        },
+    )
     return compacted

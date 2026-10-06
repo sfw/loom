@@ -11,6 +11,7 @@ Subtask execution is delegated to SubtaskRunner.  Independent subtasks
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 from collections.abc import Awaitable, Callable
 from datetime import datetime
@@ -90,11 +91,13 @@ from .budget import _RunBudget
 logger = logging.getLogger(__name__)
 
 _REMEDIATION_TERMINAL_STATES = frozenset({"resolved", "failed", "expired"})
-_VALID_CRITICAL_PATH_BEHAVIORS = frozenset({
-    "block",
-    "confirm_or_prune_then_queue",
-    "queue_follow_up",
-})
+_VALID_CRITICAL_PATH_BEHAVIORS = frozenset(
+    {
+        "block",
+        "confirm_or_prune_then_queue",
+        "queue_follow_up",
+    }
+)
 _FAILURE_RESOLUTION_METADATA_KEYS = (
     "remediation_required",
     "remediation_mode",
@@ -113,12 +116,14 @@ _FAILURE_RESOLUTION_METADATA_KEYS = (
     "parser_stage",
     "issues",
 )
-_CLAIM_TERMINAL_UNRESOLVED = frozenset({
-    "contradicted",
-    "insufficient_evidence",
-    "extracted",
-    "stale",
-})
+_CLAIM_TERMINAL_UNRESOLVED = frozenset(
+    {
+        "contradicted",
+        "insufficient_evidence",
+        "extracted",
+        "stale",
+    }
+)
 _CLAIM_REASON_CODES = {
     "supported": "claim_supported",
     "contradicted": "claim_contradicted",
@@ -126,25 +131,31 @@ _CLAIM_REASON_CODES = {
     "stale": "claim_stale_source",
     "pruned": "claim_pruned",
 }
-_CLAIM_RECOVERABLE_FAILURE_CODES = frozenset({
-    "recommendation_unconfirmed",
-    "unconfirmed_noncritical",
-    "unconfirmed_critical_path",
-    "claim_insufficient_evidence",
-    "claim_contradicted",
-    "claim_stale_source",
-    "coverage_below_threshold",
-})
-_SCOPE_ADAPTIVE_REPLAN_REASON_CODES = frozenset({
-    "insufficient_sample_size",
-    "insufficient_volume",
-    "cardinality_mismatch",
-    "incomplete_verification_pending_phase2",
-})
-_PLACEHOLDER_UNCONFIRMED_REASON_CODES = frozenset({
-    "incomplete_deliverable_placeholder",
-    "incomplete_deliverable_content",
-})
+_CLAIM_RECOVERABLE_FAILURE_CODES = frozenset(
+    {
+        "recommendation_unconfirmed",
+        "unconfirmed_noncritical",
+        "unconfirmed_critical_path",
+        "claim_insufficient_evidence",
+        "claim_contradicted",
+        "claim_stale_source",
+        "coverage_below_threshold",
+    }
+)
+_SCOPE_ADAPTIVE_REPLAN_REASON_CODES = frozenset(
+    {
+        "insufficient_sample_size",
+        "insufficient_volume",
+        "cardinality_mismatch",
+        "incomplete_verification_pending_phase2",
+    }
+)
+_PLACEHOLDER_UNCONFIRMED_REASON_CODES = frozenset(
+    {
+        "incomplete_deliverable_placeholder",
+        "incomplete_deliverable_content",
+    }
+)
 _PLACEHOLDER_PREPASS_MODE = "deterministic_placeholder_prepass"
 
 # Re-export dataclasses that existing code imports from here
@@ -174,6 +185,7 @@ class Orchestrator:
     Subtask execution (tool loop, verification, memory extraction)
     is delegated to SubtaskRunner.
     """
+
     _OUTPUT_CONFLICT_STARVATION_THRESHOLD = 3
     _OUTPUT_ROLE_WORKER = "worker"
     _OUTPUT_ROLE_PHASE_FINALIZER = "phase_finalizer"
@@ -203,7 +215,7 @@ class Orchestrator:
         self._task_event_rollup: dict[str, dict[str, int]] = {}
         self._task_verification_reason_rollup: dict[str, dict[str, int]] = {}
         self._task_correction_cycle_states: dict[str, dict[str, str]] = {}
-        self._semantic_compactor_rollup: dict[str, int] = {}
+        self._semantic_compactor_rollups_by_task: dict[str, dict[str, int]] = {}
 
         def _accumulate_runtime_event(event) -> None:
             task_id = str(getattr(event, "task_id", "") or "").strip()
@@ -242,23 +254,24 @@ class Orchestrator:
                         cycle_states[cycle_id] = "terminal"
                     else:
                         cycle_states[cycle_id] = (
-                            str(data.get("state", "") or "").strip().lower()
-                            or "active"
+                            str(data.get("state", "") or "").strip().lower() or "active"
                         )
             if (
                 event_type == "model_invocation"
                 and str(data.get("origin", "") or "") == "semantic_compactor.complete"
             ):
+                semantic_rollup = self._semantic_compactor_rollups_by_task.setdefault(
+                    task_id,
+                    {},
+                )
                 phase = str(data.get("phase", "") or "").strip().lower()
                 if phase == "done":
-                    self._semantic_compactor_rollup["model_calls"] = (
-                        int(self._semantic_compactor_rollup.get("model_calls", 0)) + 1
-                    )
+                    semantic_rollup["model_calls"] = int(semantic_rollup.get("model_calls", 0)) + 1
                     duration = float(data.get("duration_seconds", 0.0) or 0.0)
                     elapsed_ms = max(0, int(round(duration * 1000)))
-                    self._semantic_compactor_rollup["model_call_duration_ms"] = (
+                    semantic_rollup["model_call_duration_ms"] = (
                         int(
-                            self._semantic_compactor_rollup.get(
+                            semantic_rollup.get(
                                 "model_call_duration_ms",
                                 0,
                             ),
@@ -266,9 +279,9 @@ class Orchestrator:
                         + elapsed_ms
                     )
                 elif phase == "validation":
-                    self._semantic_compactor_rollup["validation_attempts"] = (
+                    semantic_rollup["validation_attempts"] = (
                         int(
-                            self._semantic_compactor_rollup.get(
+                            semantic_rollup.get(
                                 "validation_attempts",
                                 0,
                             ),
@@ -276,9 +289,9 @@ class Orchestrator:
                         + 1
                     )
                     if not bool(data.get("compactor_output_valid", False)):
-                        self._semantic_compactor_rollup["validation_failures"] = (
+                        semantic_rollup["validation_failures"] = (
                             int(
-                                self._semantic_compactor_rollup.get(
+                                semantic_rollup.get(
                                     "validation_failures",
                                     0,
                                 ),
@@ -286,9 +299,9 @@ class Orchestrator:
                             + 1
                         )
                     if int(data.get("compactor_retry_count", 0) or 0) > 0:
-                        self._semantic_compactor_rollup["retry_attempts"] = (
+                        semantic_rollup["retry_attempts"] = (
                             int(
-                                self._semantic_compactor_rollup.get(
+                                semantic_rollup.get(
                                     "retry_attempts",
                                     0,
                                 ),
@@ -296,9 +309,9 @@ class Orchestrator:
                             + 1
                         )
                     if bool(data.get("compactor_warning", False)):
-                        self._semantic_compactor_rollup["warning_outputs"] = (
+                        semantic_rollup["warning_outputs"] = (
                             int(
-                                self._semantic_compactor_rollup.get(
+                                semantic_rollup.get(
                                     "warning_outputs",
                                     0,
                                 ),
@@ -355,15 +368,26 @@ class Orchestrator:
             ),
             max_total_attempts_per_subtask=(
                 int(getattr(config.execution, "max_subtask_retries", 3) or 0)
-                + int(getattr(config.execution, "max_correction_retries", 3) or 0)
+                + min(
+                    1,
+                    int(getattr(config.execution, "max_correction_retries", 3) or 0),
+                )
             ),
         )
         self._correction_executor = CorrectionExecutor()
         self._state_lock = asyncio.Lock()
         self._changelog_cache: dict[str, ChangeLog] = {}
-        self._telemetry_rollup: dict[str, int] = self._new_telemetry_rollup()
+        self._telemetry_rollups_by_task: dict[str, dict[str, int]] = {}
         self._emitted_telemetry_summary_runs: set[str] = set()
+        self._run_budget_context: contextvars.ContextVar[_RunBudget] = contextvars.ContextVar(
+            f"loom_run_budget_{id(self)}",
+            default=_RunBudget(config),
+        )
         self._run_budget = _RunBudget(config)
+        self._active_run_id_context: contextvars.ContextVar[str] = contextvars.ContextVar(
+            f"loom_active_run_id_{id(self)}",
+            default="",
+        )
         self._active_run_id = ""
         self._iteration_enabled = bool(
             getattr(self._config.execution, "enable_process_iteration_loops", False),
@@ -374,7 +398,8 @@ class Orchestrator:
                     self._config.execution,
                     "iteration_command_exit_allowlisted_prefixes",
                     [],
-                ) or [],
+                )
+                or [],
             ),
             enable_command_exit=bool(
                 getattr(
@@ -397,23 +422,21 @@ class Orchestrator:
 
             required_tools = list(getattr(process.tools, "required", []) or [])
             if required_tools:
-                available = set(self._tools.list_tools(
-                    runnable_only=True,
-                    execution_surface=self._execution_surface,
-                ))
+                available = set(
+                    self._tools.list_tools(
+                        runnable_only=True,
+                        execution_surface=self._execution_surface,
+                    )
+                )
                 missing = sorted(
-                    tool_name
-                    for tool_name in required_tools
-                    if tool_name not in available
+                    tool_name for tool_name in required_tools if tool_name not in available
                 )
                 if missing:
                     joined = ", ".join(
                         self._format_required_tool_unavailability(tool_name)
                         for tool_name in missing
                     )
-                    raise ValueError(
-                        f"Process '{process.name}' requires missing tool(s): {joined}"
-                    )
+                    raise ValueError(f"Process '{process.name}' requires missing tool(s): {joined}")
 
         # Runner handles the inner subtask execution
         self._runner = SubtaskRunner(
@@ -455,16 +478,20 @@ class Orchestrator:
     ) -> Task:
         """Main entry point. Drives the full task lifecycle."""
         try:
-            self._telemetry_rollup = self._new_telemetry_rollup()
+            self._telemetry_rollups_by_task[task.id] = self._new_telemetry_rollup()
             self._task_event_rollup[task.id] = {}
             self._task_verification_reason_rollup[task.id] = {}
             self._task_correction_cycle_states[task.id] = {}
-            self._semantic_compactor_rollup = {}
+            self._semantic_compactor_rollups_by_task[task.id] = {}
             self._run_budget = _RunBudget(self._config)
             run_id = await self._initialize_task_run_id_async(task)
-            self._emit(TASK_RUN_ACQUIRED, task.id, {
-                "run_id": run_id,
-            })
+            self._emit(
+                TASK_RUN_ACQUIRED,
+                task.id,
+                {
+                    "run_id": run_id,
+                },
+            )
             if bool(getattr(self._config.execution, "enable_sqlite_remediation_queue", False)):
                 await self._hydrate_remediation_queue_from_db(task)
             if self._iteration_enabled:
@@ -493,30 +520,42 @@ class Orchestrator:
                 task.status = TaskStatus.EXECUTING
                 await self._save_task_state(task)
                 if not reused_plan_replanned:
-                    self._emit(TASK_PLAN_READY, task.id, {
-                        "subtask_count": len(plan.subtasks),
-                        "subtask_ids": [s.id for s in plan.subtasks],
-                        "reused": True,
-                        "run_id": run_id,
-                    })
+                    self._emit(
+                        TASK_PLAN_READY,
+                        task.id,
+                        {
+                            "subtask_count": len(plan.subtasks),
+                            "subtask_ids": [s.id for s in plan.subtasks],
+                            "reused": True,
+                            "run_id": run_id,
+                        },
+                    )
             else:
                 # 1. Planning phase
                 task.status = TaskStatus.PLANNING
                 await self._save_task_state(task)
-                self._emit(TASK_PLANNING, task.id, {
-                    "goal": task.goal,
-                    "run_id": run_id,
-                })
+                self._emit(
+                    TASK_PLANNING,
+                    task.id,
+                    {
+                        "goal": task.goal,
+                        "run_id": run_id,
+                    },
+                )
 
                 plan = await self._plan_task_with_validation(task)
                 task.plan = plan
                 task.status = TaskStatus.EXECUTING
                 await self._save_task_state(task)
-                self._emit(TASK_PLAN_READY, task.id, {
-                    "subtask_count": len(plan.subtasks),
-                    "subtask_ids": [s.id for s in plan.subtasks],
-                    "run_id": run_id,
-                })
+                self._emit(
+                    TASK_PLAN_READY,
+                    task.id,
+                    {
+                        "subtask_count": len(plan.subtasks),
+                        "subtask_ids": [s.id for s in plan.subtasks],
+                        "run_id": run_id,
+                    },
+                )
 
             await self._reconcile_subtask_policy_state(task)
 
@@ -555,17 +594,23 @@ class Orchestrator:
                         else:
                             text_reason = str(raw_reasons).strip()
                             reasons = [text_reason] if text_reason else []
-                        self._emit(SUBTASK_BLOCKED, task.id, {
-                            "subtask_id": str(blocked.get("subtask_id", "") or "").strip(),
-                            "reasons": reasons,
-                        })
-                    self._emit(TASK_STALLED, task.id, {
-                        "pending_subtasks": [
-                            item["subtask_id"] for item in blocked_subtasks
-                        ],
-                        "blocked_subtasks": blocked_subtasks,
-                        "attempt": stall_recovery_attempts + 1,
-                    })
+                        self._emit(
+                            SUBTASK_BLOCKED,
+                            task.id,
+                            {
+                                "subtask_id": str(blocked.get("subtask_id", "") or "").strip(),
+                                "reasons": reasons,
+                            },
+                        )
+                    self._emit(
+                        TASK_STALLED,
+                        task.id,
+                        {
+                            "pending_subtasks": [item["subtask_id"] for item in blocked_subtasks],
+                            "blocked_subtasks": blocked_subtasks,
+                            "attempt": stall_recovery_attempts + 1,
+                        },
+                    )
                     recovered = False
                     if (
                         task.status == TaskStatus.EXECUTING
@@ -624,31 +669,39 @@ class Orchestrator:
                     subtask_id = str(deferred.get("subtask_id", "")).strip()
                     if not subtask_id:
                         continue
-                    self._emit(SUBTASK_OUTPUT_CONFLICT_DEFERRED, task.id, {
-                        "subtask_id": subtask_id,
-                        "phase_id": str(deferred.get("phase_id", "")).strip(),
-                        "conflicting_paths": list(deferred.get("conflicting_paths", [])),
-                        "conflicting_with": list(deferred.get("conflicting_with", [])),
-                        "deferral_streak": int(deferred.get("deferral_streak", 0) or 0),
-                        "deferral_count": int(deferred.get("deferral_count", 0) or 0),
-                    })
-                    if bool(deferred.get("starvation_warning", False)):
-                        self._emit(SUBTASK_OUTPUT_CONFLICT_STARVATION_WARNING, task.id, {
+                    self._emit(
+                        SUBTASK_OUTPUT_CONFLICT_DEFERRED,
+                        task.id,
+                        {
                             "subtask_id": subtask_id,
                             "phase_id": str(deferred.get("phase_id", "")).strip(),
-                            "deferral_streak": int(
-                                deferred.get("deferral_streak", 0) or 0,
-                            ),
-                            "threshold": int(
-                                deferred.get("starvation_threshold", 0) or 0,
-                            ),
-                            "conflicting_paths": list(
-                                deferred.get("conflicting_paths", []),
-                            ),
-                            "conflicting_with": list(
-                                deferred.get("conflicting_with", []),
-                            ),
-                        })
+                            "conflicting_paths": list(deferred.get("conflicting_paths", [])),
+                            "conflicting_with": list(deferred.get("conflicting_with", [])),
+                            "deferral_streak": int(deferred.get("deferral_streak", 0) or 0),
+                            "deferral_count": int(deferred.get("deferral_count", 0) or 0),
+                        },
+                    )
+                    if bool(deferred.get("starvation_warning", False)):
+                        self._emit(
+                            SUBTASK_OUTPUT_CONFLICT_STARVATION_WARNING,
+                            task.id,
+                            {
+                                "subtask_id": subtask_id,
+                                "phase_id": str(deferred.get("phase_id", "")).strip(),
+                                "deferral_streak": int(
+                                    deferred.get("deferral_streak", 0) or 0,
+                                ),
+                                "threshold": int(
+                                    deferred.get("starvation_threshold", 0) or 0,
+                                ),
+                                "conflicting_paths": list(
+                                    deferred.get("conflicting_paths", []),
+                                ),
+                                "conflicting_with": list(
+                                    deferred.get("conflicting_with", []),
+                                ),
+                            },
+                        )
                 iteration += 1
                 batch_plan_version = task.plan.version
 
@@ -656,9 +709,13 @@ class Orchestrator:
                 if len(batch) == 1:
                     # Single subtask — no gather overhead
                     try:
-                        outcomes = [await self._dispatch_subtask(
-                            task, batch[0], attempts_by_subtask,
-                        )]
+                        outcomes = [
+                            await self._dispatch_subtask(
+                                task,
+                                batch[0],
+                                attempts_by_subtask,
+                            )
+                        ]
                     except asyncio.CancelledError:
                         raise
                     except Exception as item:
@@ -671,7 +728,9 @@ class Orchestrator:
                     raw_outcomes = await asyncio.gather(
                         *[
                             self._dispatch_subtask(
-                                task, s, attempts_by_subtask,
+                                task,
+                                s,
+                                attempts_by_subtask,
                             )
                             for s in batch
                         ],
@@ -696,7 +755,7 @@ class Orchestrator:
                 # Process outcomes (retry / replan / approve).
                 # Replanning is deferred until the whole batch is processed.
                 for subtask, result, verification in outcomes:
-                    self._accumulate_subtask_telemetry(result)
+                    self._accumulate_subtask_telemetry(task.id, result)
                     self._run_budget.observe_result(result)
                     if batch_plan_version != task.plan.version:
                         self._record_stale_outcome(
@@ -713,7 +772,10 @@ class Orchestrator:
                     )
                     if result.status == "failed":
                         replan_request = await self._handle_failure(
-                            task, subtask, result, verification,
+                            task,
+                            subtask,
+                            result,
+                            verification,
                             attempts_by_subtask,
                         )
                         if replan_request is not None and pending_replan is None:
@@ -785,12 +847,16 @@ class Orchestrator:
                     await self._save_task_state(task)
                 except Exception as save_err:
                     logger.error("Failed to save after catastrophic error: %s", save_err)
-                self._emit(TASK_FAILED, task.id, {
-                    "error": str(e),
-                    "error_type": type(e).__name__,
-                    "reason": "catastrophic_integrity_error",
-                    "outcome": "failed",
-                })
+                self._emit(
+                    TASK_FAILED,
+                    task.id,
+                    {
+                        "error": str(e),
+                        "error_type": type(e).__name__,
+                        "reason": "catastrophic_integrity_error",
+                        "outcome": "failed",
+                    },
+                )
                 self._emit_telemetry_run_summary(task)
                 self._export_evidence_ledger_csv(task)
                 await self._learn_from_task(task)
@@ -811,15 +877,19 @@ class Orchestrator:
                 await self._save_task_state(task)
             except Exception as save_err:
                 logger.error("Failed to save after fatal: %s", save_err)
-            self._emit(TASK_PAUSED, task.id, {
-                "error": str(e),
-                "error_type": type(e).__name__,
-                "reason": "orchestrator_recovery_checkpoint",
-                "outcome": "retrying" if can_retry else "paused",
-                "automatic_recovery_requested": can_retry,
-                "recovery_attempt": recovery_attempts,
-                "recovery_limit": recovery_limit,
-            })
+            self._emit(
+                TASK_PAUSED,
+                task.id,
+                {
+                    "error": str(e),
+                    "error_type": type(e).__name__,
+                    "reason": "orchestrator_recovery_checkpoint",
+                    "outcome": "retrying" if can_retry else "paused",
+                    "automatic_recovery_requested": can_retry,
+                    "recovery_attempt": recovery_attempts,
+                    "recovery_limit": recovery_limit,
+                },
+            )
             self._emit_telemetry_run_summary(task)
             self._export_evidence_ledger_csv(task)
             await self._learn_from_task(task)
@@ -1318,39 +1388,72 @@ class Orchestrator:
         """
         catastrophic = bool(task.metadata.get("catastrophic_failure"))
         if not catastrophic:
+            verification_metadata = (
+                dict(verification.metadata) if isinstance(verification.metadata, dict) else {}
+            )
+            correction_metadata = verification_metadata.get("correction", {})
+            if not isinstance(correction_metadata, dict):
+                correction_metadata = {}
+            reason_code = str(verification.reason_code or "").strip().lower()
+            if reason_code.startswith("infra_"):
+                preserved_summary = (
+                    "Infrastructure recovery could not complete this stage; "
+                    "best available checkpoint preserved for downstream synthesis."
+                )
+                terminal_reason = "infrastructure_recovery_incomplete"
+            elif bool(correction_metadata.get("stop_for_no_progress", False)):
+                preserved_summary = (
+                    "Targeted recovery stopped after repeated no-progress attempts; "
+                    "best available checkpoint preserved for downstream synthesis."
+                )
+                terminal_reason = "no_progress"
+            elif bool(correction_metadata.get("stop_for_attempt_budget", False)):
+                preserved_summary = (
+                    "Recovery attempt budget exhausted; best available checkpoint "
+                    "preserved for downstream synthesis."
+                )
+                terminal_reason = "repair_attempt_budget_exhausted"
+            else:
+                preserved_summary = (
+                    "Recoverable verification gap remains; best available checkpoint "
+                    "preserved for downstream synthesis."
+                )
+                terminal_reason = "recoverable_gap"
             async with self._state_lock:
                 subtask.status = SubtaskStatus.PARTIAL
                 subtask.active_issue = verification.feedback or subtask.active_issue
                 if not subtask.summary:
-                    subtask.summary = (
-                        "Recovery budget exhausted; best available checkpoint "
-                        "preserved for downstream synthesis."
-                    )
+                    subtask.summary = preserved_summary
                 task.update_subtask(
                     subtask.id,
                     status=SubtaskStatus.PARTIAL,
                     summary=subtask.summary,
                     active_issue=subtask.active_issue,
                 )
-                task.metadata.setdefault("recoverable_gaps", []).append({
-                    "subtask_id": subtask.id,
-                    "reason_code": verification.reason_code,
-                    "feedback": verification.feedback,
-                })
+                task.metadata.setdefault("recoverable_gaps", []).append(
+                    {
+                        "subtask_id": subtask.id,
+                        "reason_code": verification.reason_code,
+                        "feedback": verification.feedback,
+                        "terminal_reason": terminal_reason,
+                    }
+                )
                 task.status = TaskStatus.EXECUTING
                 await self._save_task_state(task)
-            self._emit(SUBTASK_COMPLETED, task.id, {
-                "subtask_id": subtask.id,
-                "status": "partial",
-                "outcome": "partial_verified",
-                "reason_code": verification.reason_code,
-                "feedback": verification.feedback,
-            })
+            self._emit(
+                SUBTASK_COMPLETED,
+                task.id,
+                {
+                    "subtask_id": subtask.id,
+                    "status": "partial",
+                    "outcome": "partial_verified",
+                    "reason_code": verification.reason_code,
+                    "feedback": verification.feedback,
+                },
+            )
             return
 
-        block_summary = (
-            f"Skipped: blocked by critical-path failure in {subtask.id}"
-        )
+        block_summary = f"Skipped: blocked by critical-path failure in {subtask.id}"
         async with self._state_lock:
             subtask.status = SubtaskStatus.FAILED
             subtask.summary = verification.feedback or "Catastrophic verification failure"
@@ -1379,14 +1482,18 @@ class Orchestrator:
                 ),
             )
             await self._save_task_state(task)
-        self._emit(SUBTASK_FAILED, task.id, {
-            "subtask_id": subtask.id,
-            "verification_tier": verification.tier,
-            "feedback": verification.feedback,
-            "verification_outcome": verification.outcome,
-            "reason_code": verification.reason_code,
-            "catastrophic": True,
-        })
+        self._emit(
+            SUBTASK_FAILED,
+            task.id,
+            {
+                "subtask_id": subtask.id,
+                "verification_tier": verification.tier,
+                "feedback": verification.feedback,
+                "verification_outcome": verification.outcome,
+                "reason_code": verification.reason_code,
+                "catastrophic": True,
+            },
+        )
 
     def _phase_mode(self) -> str:
         return orchestrator_planning.phase_mode(self)
@@ -1436,12 +1543,14 @@ class Orchestrator:
                 )
 
         fallback = Plan(
-            subtasks=[Subtask(
-                id="execute-goal",
-                description=task.goal or "Execute the task goal directly",
-                model_tier=2,
-                max_retries=self._config.execution.max_subtask_retries,
-            )],
+            subtasks=[
+                Subtask(
+                    id="execute-goal",
+                    description=task.goal or "Execute the task goal directly",
+                    model_tier=2,
+                    max_retries=self._config.execution.max_subtask_retries,
+                )
+            ],
             version=1,
         )
         metadata = task.metadata if isinstance(task.metadata, dict) else {}
@@ -1451,13 +1560,17 @@ class Orchestrator:
         metadata["planner_degraded_reason"] = reason_code
         metadata["planner_degraded_detail"] = detail
         task.metadata = metadata
-        self._emit(TASK_PLAN_DEGRADED, task.id, {
-            "run_id": self._task_run_id(task),
-            "reason_code": reason_code,
-            "detail": detail,
-            "policy_mode": mode,
-            "fallback_subtasks": ["execute-goal"],
-        })
+        self._emit(
+            TASK_PLAN_DEGRADED,
+            task.id,
+            {
+                "run_id": self._task_run_id(task),
+                "reason_code": reason_code,
+                "detail": detail,
+                "policy_mode": mode,
+                "fallback_subtasks": ["execute-goal"],
+            },
+        )
         return self._apply_process_phase_mode(fallback)
 
     async def _plan_task_with_validation(self, task: Task) -> Plan:
@@ -1521,28 +1634,48 @@ class Orchestrator:
         return orchestrator_validity.normalize_validity_contract(contract)
 
     def _default_validity_contract_for_subtask(self, subtask: Subtask) -> dict[str, object]:
-        return self._normalize_validity_contract({
-            "enabled": False,
-            "claim_extraction": {"enabled": False},
-            "critical_claim_types": ["numeric", "date", "entity_fact"],
-            "min_supported_ratio": 0.75,
-            "max_unverified_ratio": 0.25,
-            "max_contradicted_count": 0,
-            "prune_mode": "drop",
-            "require_fact_checker_for_synthesis": False,
-            "final_gate": {
-                "enforce_verified_context_only": bool(subtask.is_synthesis),
-                "synthesis_min_verification_tier": 2 if subtask.is_synthesis else 1,
-                "critical_claim_support_ratio": 1.0,
-                "temporal_consistency": {
-                    "enabled": False,
-                    "require_as_of_alignment": False,
-                    "enforce_cross_claim_date_conflict_check": False,
-                    "max_source_age_days": 0,
-                    "as_of": "",
+        synthesis_research = bool(subtask.is_synthesis) and any(
+            marker
+            in " ".join(
+                (
+                    str(getattr(subtask, "phase_id", "") or ""),
+                    str(getattr(subtask, "description", "") or ""),
+                    str(getattr(subtask, "acceptance_criteria", "") or ""),
+                )
+            ).lower()
+            for marker in (
+                "analysis",
+                "evidence",
+                "finding",
+                "report",
+                "research",
+                "source",
+            )
+        )
+        return self._normalize_validity_contract(
+            {
+                "enabled": synthesis_research,
+                "claim_extraction": {"enabled": synthesis_research},
+                "critical_claim_types": ["numeric", "date", "entity_fact"],
+                "min_supported_ratio": 0.65 if synthesis_research else 0.75,
+                "max_unverified_ratio": 0.35 if synthesis_research else 0.25,
+                "max_contradicted_count": 0,
+                "prune_mode": "rewrite_uncertainty" if synthesis_research else "drop",
+                "require_fact_checker_for_synthesis": False,
+                "final_gate": {
+                    "enforce_verified_context_only": bool(subtask.is_synthesis),
+                    "synthesis_min_verification_tier": 2 if subtask.is_synthesis else 1,
+                    "critical_claim_support_ratio": 1.0,
+                    "temporal_consistency": {
+                        "enabled": False,
+                        "require_as_of_alignment": False,
+                        "enforce_cross_claim_date_conflict_check": False,
+                        "max_source_age_days": 0,
+                        "as_of": "",
+                    },
                 },
-            },
-        })
+            }
+        )
 
     def _resolve_subtask_validity_contract(
         self,
@@ -2345,9 +2478,7 @@ class Orchestrator:
             ),
         )
         active_pending = {
-            subtask.id
-            for subtask in task.plan.subtasks
-            if subtask.status == SubtaskStatus.PENDING
+            subtask.id for subtask in task.plan.subtasks if subtask.status == SubtaskStatus.PENDING
         }
         return orchestrator_output.select_conflict_safe_batch(
             runnable=runnable,
@@ -2400,10 +2531,7 @@ class Orchestrator:
         """Build a concise, structured reason string for replanning prompts."""
         feedback = (verification.feedback or "").strip()
         reason = f"reason_code={verification.reason_code}" if verification.reason_code else ""
-        outcome = (
-            f"outcome={verification.outcome}"
-            if verification.outcome else ""
-        )
+        outcome = f"outcome={verification.outcome}" if verification.outcome else ""
         suffix = ", ".join(part for part in [outcome, reason] if part)
         suffix_text = f" ({suffix})" if suffix else ""
         if feedback:
@@ -2500,8 +2628,7 @@ class Orchestrator:
         if not isinstance(tracker, dict):
             tracker = {}
         tracker_key = (
-            f"{str(getattr(task.plan, 'version', 1) or 1)}:"
-            f"{str(getattr(subtask, 'id', '') or '')}"
+            f"{str(getattr(task.plan, 'version', 1) or 1)}:{str(getattr(subtask, 'id', '') or '')}"
         )
         prior_count = int(tracker.get(tracker_key, 0) or 0)
         if prior_count >= 1:
@@ -2529,11 +2656,15 @@ class Orchestrator:
         attempts: list[AttemptRecord],
     ) -> VerificationResult:
         """Retry verifier path only (no executor/tool rerun)."""
-        self._emit(SUBTASK_RETRYING, task.id, {
-            "subtask_id": subtask.id,
-            "mode": "verification_only",
-            "reason": "verifier_parse_error",
-        })
+        self._emit(
+            SUBTASK_RETRYING,
+            task.id,
+            {
+                "subtask_id": subtask.id,
+                "mode": "verification_only",
+                "reason": "verifier_parse_error",
+            },
+        )
         prior_calls: list[ToolCallRecord] = []
         prior_evidence = await self._evidence_for_subtask_async(task.id, subtask.id)
         for attempt in attempts:
@@ -2652,7 +2783,8 @@ class Orchestrator:
         )
 
     async def _analyze_workspace_for_process(
-        self, workspace_path: Path,
+        self,
+        workspace_path: Path,
     ) -> str:
         return await orchestrator_planning._analyze_workspace_for_process(self, workspace_path)
 
@@ -2707,11 +2839,15 @@ class Orchestrator:
         outcome_plan_version: int,
     ) -> None:
         """Emit telemetry for outcomes produced by an outdated plan version."""
-        self._emit(SUBTASK_OUTCOME_STALE, task.id, {
-            "subtask_id": subtask.id,
-            "outcome_plan_version": int(outcome_plan_version),
-            "current_plan_version": int(task.plan.version),
-        })
+        self._emit(
+            SUBTASK_OUTCOME_STALE,
+            task.id,
+            {
+                "subtask_id": subtask.id,
+                "outcome_plan_version": int(outcome_plan_version),
+                "current_plan_version": int(task.plan.version),
+            },
+        )
 
     async def _save_task_state(self, task: Task) -> None:
         await run_blocking_io(self._state.save, task)
@@ -2996,8 +3132,28 @@ class Orchestrator:
     def _new_telemetry_rollup() -> dict[str, int]:
         return orchestrator_telemetry.new_telemetry_rollup()
 
-    def _accumulate_subtask_telemetry(self, result: SubtaskResult) -> None:
-        orchestrator_telemetry.accumulate_subtask_telemetry(self, result)
+    @property
+    def _run_budget(self) -> _RunBudget:
+        return self._run_budget_context.get()
+
+    @_run_budget.setter
+    def _run_budget(self, value: _RunBudget) -> None:
+        self._run_budget_context.set(value)
+
+    @property
+    def _active_run_id(self) -> str:
+        return self._active_run_id_context.get()
+
+    @_active_run_id.setter
+    def _active_run_id(self, value: str) -> None:
+        self._active_run_id_context.set(str(value or ""))
+
+    def _accumulate_subtask_telemetry(
+        self,
+        task_id: str,
+        result: SubtaskResult,
+    ) -> None:
+        orchestrator_telemetry.accumulate_subtask_telemetry(self, task_id, result)
 
     def _task_event_counts(self, task_id: str) -> dict[str, int]:
         counts = self._task_event_rollup.get(task_id)
@@ -3024,38 +3180,54 @@ class Orchestrator:
             task.metadata = {}
         task.metadata["cancel_reason"] = "cancel_requested"
         task.status = TaskStatus.CANCELLED
-        self._emit(TASK_CANCEL_REQUESTED, task.id, {
-            "requested": True,
-            "path": "orchestrator",
-        })
+        self._emit(
+            TASK_CANCEL_REQUESTED,
+            task.id,
+            {
+                "requested": True,
+                "path": "orchestrator",
+            },
+        )
 
     def pause_task(self, task: Task) -> None:
         """Pause a running task at the next orchestration boundary."""
         if task.status not in {TaskStatus.EXECUTING, TaskStatus.PLANNING}:
-            self._emit(TASK_PAUSED, task.id, {
-                "requested": False,
-                "error": f"invalid_status:{task.status.value}",
-                "path": "orchestrator",
-            })
+            self._emit(
+                TASK_PAUSED,
+                task.id,
+                {
+                    "requested": False,
+                    "error": f"invalid_status:{task.status.value}",
+                    "path": "orchestrator",
+                },
+            )
             return
         if not isinstance(task.metadata, dict):
             task.metadata = {}
         task.metadata["paused_from_status"] = task.status.value
         task.status = TaskStatus.PAUSED
-        self._emit(TASK_PAUSED, task.id, {
-            "requested": True,
-            "status": task.status.value,
-            "path": "orchestrator",
-        })
+        self._emit(
+            TASK_PAUSED,
+            task.id,
+            {
+                "requested": True,
+                "status": task.status.value,
+                "path": "orchestrator",
+            },
+        )
 
     def resume_task(self, task: Task) -> None:
         """Resume a paused task."""
         if task.status != TaskStatus.PAUSED:
-            self._emit(TASK_RESUMED, task.id, {
-                "requested": False,
-                "error": f"invalid_status:{task.status.value}",
-                "path": "orchestrator",
-            })
+            self._emit(
+                TASK_RESUMED,
+                task.id,
+                {
+                    "requested": False,
+                    "error": f"invalid_status:{task.status.value}",
+                    "path": "orchestrator",
+                },
+            )
             return
         paused_from = ""
         if isinstance(task.metadata, dict):
@@ -3064,11 +3236,15 @@ class Orchestrator:
             task.status = TaskStatus.PLANNING
         else:
             task.status = TaskStatus.EXECUTING
-        self._emit(TASK_RESUMED, task.id, {
-            "requested": True,
-            "status": task.status.value,
-            "path": "orchestrator",
-        })
+        self._emit(
+            TASK_RESUMED,
+            task.id,
+            {
+                "requested": True,
+                "status": task.status.value,
+                "path": "orchestrator",
+            },
+        )
 
     @property
     def question_manager(self) -> QuestionManager | None:
@@ -3099,5 +3275,10 @@ def create_task(
     metadata: dict | None = None,
 ) -> Task:
     return orchestrator_task_factory.create_task(
-        goal, workspace, approval_mode, callback_url, context, metadata,
+        goal,
+        workspace,
+        approval_mode,
+        callback_url,
+        context,
+        metadata,
     )

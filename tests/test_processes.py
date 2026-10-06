@@ -258,6 +258,12 @@ tests:
         must_exist: ["out.md"]
       verification:
         forbidden_patterns: ["deliverable_.* not found"]
+      quality:
+        allowed_completion_grades: [verified, verified_with_warnings]
+        artifact_minimum_characters: {out.md: 250}
+        artifact_required_patterns:
+          out.md: ["(?im)^# Summary$"]
+        csv_minimum_rows: {metrics.csv: 5}
 phases:
   - id: phase-a
     description: Phase A
@@ -938,6 +944,50 @@ class TestProcessLoaderValidation:
         defn = self._load_yaml_str(tmp_path, MINIMAL_YAML)
         assert defn.output_coordination == OutputCoordination()
 
+    def test_quality_contract_parses_and_merges_phase_overrides(self, tmp_path):
+        yaml_content = """\
+name: quality-contract
+version: '1.0'
+quality_contract:
+  enabled: true
+  applies_to_phases: [analysis]
+  dimensions: [completeness, analytical_depth]
+  minimum_overall_score: 0.75
+  minimum_dimension_score: 0.6
+  phase_overrides:
+    analysis:
+      minimum_overall_score: 0.85
+      required_sections: [Executive Summary]
+phases:
+  - id: analysis
+    description: Analyze
+    quality_contract:
+      minimum_traceability_ratio: 0.7
+  - id: collect
+    description: Collect
+"""
+        defn = self._load_yaml_str(tmp_path, yaml_content)
+
+        analysis = defn.resolve_quality_contract_for_phase("analysis")
+        assert analysis["enabled"] is True
+        assert analysis["minimum_overall_score"] == 0.85
+        assert analysis["minimum_dimension_score"] == 0.6
+        assert analysis["minimum_traceability_ratio"] == 0.7
+        assert analysis["required_sections"] == ["Executive Summary"]
+        assert defn.resolve_quality_contract_for_phase("collect")["enabled"] is False
+
+    def test_quality_contract_rejects_out_of_range_threshold(self, tmp_path):
+        yaml_content = """\
+name: invalid-quality-contract
+version: '1.0'
+quality_contract:
+  enabled: true
+  minimum_overall_score: 1.5
+"""
+        with pytest.raises(ProcessValidationError) as exc_info:
+            self._load_yaml_str(tmp_path, yaml_content)
+        assert any("minimum_overall_score" in err for err in exc_info.value.errors)
+
     def test_output_coordination_parses_and_normalizes(self, tmp_path):
         yaml_content = """\
 name: output-coordination-normalized
@@ -1087,6 +1137,15 @@ phases:
         assert test_case.timeout_seconds == 120
         assert test_case.acceptance.phases_must_include == ["phase-a"]
         assert test_case.acceptance.deliverables_must_exist == ["out.md"]
+        assert test_case.acceptance.allowed_completion_grades == [
+            "verified",
+            "verified_with_warnings",
+        ]
+        assert test_case.acceptance.artifact_minimum_characters == {"out.md": 250}
+        assert test_case.acceptance.artifact_required_patterns == {
+            "out.md": ["(?im)^# Summary$"],
+        }
+        assert test_case.acceptance.csv_minimum_rows == {"metrics.csv": 5}
 
     def test_invalid_process_test_mode_raises(self, tmp_path):
         with pytest.raises(ProcessValidationError) as exc_info:
@@ -1376,6 +1435,31 @@ class TestExecutorPromptWithProcess:
         assert "REQUIRED OUTPUT FILES (EXACT FILENAMES)" in prompt
         assert "main.py" in prompt
         assert "Do not rename them" in prompt
+
+    def test_executor_lists_transitive_upstream_artifacts(
+        self,
+        sample_task,
+        state_manager,
+        full_process_defn,
+    ):
+        state_manager.create(sample_task)
+        assembler = PromptAssembler(process=full_process_defn)
+        subtask = Subtask(
+            id="verify",
+            phase_id="verify",
+            description="Verify",
+            depends_on=["implement"],
+        )
+
+        prompt = assembler.build_executor_prompt(
+            task=sample_task,
+            subtask=subtask,
+            state_manager=state_manager,
+        )
+
+        assert "UPSTREAM DEPENDENCY ARTIFACTS" in prompt
+        assert "main.py" in prompt
+        assert "research-notes.md" in prompt
 
     def test_fan_in_worker_prompt_suppresses_canonical_deliverable_requirements(
         self,
@@ -2420,6 +2504,48 @@ verification:
         assert "missing_targets" in metadata_fields
         assert "unverified_claim_count" in metadata_fields
         assert "verified_claim_count" in metadata_fields
+
+    def test_market_research_enforces_decision_grade_quality_contract(self):
+        defn = ProcessLoader().load("market-research")
+        contract = defn.resolve_quality_contract_for_phase(
+            "synthesize-recommendations",
+        )
+
+        assert contract["enabled"] is True
+        assert contract["minimum_overall_score"] >= 0.8
+        assert contract["minimum_traceability_ratio"] >= 0.7
+        assert "analytical_depth" in contract["dimensions"]
+        assert "Implementation Roadmap" in contract["required_sections"]
+        assert "quality" in defn.verifier_metadata_fields()
+        assert {"fact_checker", "read_artifact"}.issubset(
+            set(defn.tools.required),
+        )
+
+    @pytest.mark.parametrize(
+        ("name", "synthesis_phase"),
+        [
+            ("research-report", "quality-assurance"),
+            ("marketing-strategy", "campaign-plan"),
+            ("competitive-intel", "monitoring-plan"),
+            ("consulting-engagement", "build-presentation"),
+            ("investment-analysis", "investment-memo"),
+        ],
+    )
+    def test_research_builtins_enforce_synthesis_quality_contract(
+        self,
+        name: str,
+        synthesis_phase: str,
+    ):
+        defn = ProcessLoader().load(name)
+        contract = defn.resolve_quality_contract_for_phase(synthesis_phase)
+
+        assert contract["enabled"] is True
+        assert contract["minimum_overall_score"] >= 0.8
+        assert contract["minimum_requirement_coverage"] >= 0.9
+        assert "completeness" in contract["dimensions"]
+        assert "cross_artifact_synthesis" in contract["dimensions"]
+        assert "quality" in defn.verifier_metadata_fields()
+        assert "read_artifact" in defn.tools.required
 
     @pytest.mark.parametrize(
         "name",

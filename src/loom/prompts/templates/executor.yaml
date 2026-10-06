@@ -37,6 +37,11 @@ constraints: |
     /dev/* paths (except /dev/null).
   - For JSON validation/checks, prefer jq (for example: `jq -e . file.json`) or
     use read_file and validate in reasoning, instead of inline interpreter code.
+  - Use read_file directly for text, PDF, DOC/DOCX, and PPT/PPTX inputs, including
+    attached read-only paths. Do not write an extractor script or probe external
+    binaries when read_file can perform the requested read.
+  - If a required document has no extractable text, use the registered OCR/document
+    tools as the fallback and report the limitation explicitly.
   - If you cannot complete the subtask, respond with:
     {{"status": "blocked", "reason": "explanation of what's wrong"}}
   - If you discover something unexpected, mention it in your summary.

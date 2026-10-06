@@ -120,6 +120,35 @@ def test_process_scoped_tool_schemas_keep_declared_and_compact_discovery() -> No
     assert report["tool_count_after"] == 4
 
 
+def test_ad_hoc_tool_schemas_use_compact_phase_inference() -> None:
+    schemas = [
+        {"name": "web_search"},
+        {"name": "read_file"},
+        {"name": "write_file"},
+        {"name": "list_tools"},
+        {"name": "run_tool"},
+        {"name": "shell_execute"},
+        {"name": "unrelated_large_tool"},
+    ]
+    runner = SimpleNamespace(
+        _tools=SimpleNamespace(all_schemas=lambda **_kwargs: schemas),
+        _prompts=SimpleNamespace(process=None),
+    )
+    subtask = Subtask(id="research", description="Research and write a report")
+
+    scoped, report = runner_execution._process_scoped_tool_schemas(
+        runner,
+        auth_context=None,
+        execution_surface="process",
+        subtask=subtask,
+    )
+
+    names = {str(schema.get("name")) for schema in scoped}
+    assert names == {"web_search", "read_file", "write_file", "list_tools", "run_tool"}
+    assert report["reason"] == "ad_hoc_phase_inference"
+    assert report["tool_count_after"] < report["tool_count_before"]
+
+
 @pytest.mark.asyncio
 async def test_run_reuses_identical_read_until_a_mutation(
     monkeypatch: pytest.MonkeyPatch,
@@ -130,46 +159,50 @@ async def test_run_reuses_identical_read_until_a_mutation(
         "build_run_auth_context",
         lambda **kwargs: {},
     )
-    model_complete = AsyncMock(side_effect=[
-        ModelResponse(
-            text="",
-            tool_calls=[
-                ToolCall(
-                    id="read-1",
-                    name="read_file",
-                    arguments={"path": "notes.md"},
-                ),
-            ],
-            usage=TokenUsage(total_tokens=8),
-        ),
-        ModelResponse(
-            text="",
-            tool_calls=[
-                ToolCall(
-                    id="read-2",
-                    name="read_file",
-                    arguments={"path": "notes.md"},
-                ),
-            ],
-            usage=TokenUsage(total_tokens=8),
-        ),
-        ModelResponse(
-            text="Completed.",
-            tool_calls=None,
-            usage=TokenUsage(total_tokens=4),
-        ),
-    ])
+    model_complete = AsyncMock(
+        side_effect=[
+            ModelResponse(
+                text="",
+                tool_calls=[
+                    ToolCall(
+                        id="read-1",
+                        name="read_file",
+                        arguments={"path": "notes.md"},
+                    ),
+                ],
+                usage=TokenUsage(total_tokens=8),
+            ),
+            ModelResponse(
+                text="",
+                tool_calls=[
+                    ToolCall(
+                        id="read-2",
+                        name="read_file",
+                        arguments={"path": "notes.md"},
+                    ),
+                ],
+                usage=TokenUsage(total_tokens=8),
+            ),
+            ModelResponse(
+                text="Completed.",
+                tool_calls=None,
+                usage=TokenUsage(total_tokens=4),
+            ),
+        ]
+    )
     runner = _make_runner(
         memory_query=AsyncMock(return_value=[]),
         model_complete=model_complete,
         config=Config(execution=ExecutionConfig(enable_streaming=False)),
     )
-    runner._tools.all_schemas = MagicMock(return_value=[
-        {
-            "name": "read_file",
-            "parameters": {"type": "object", "required": ["path"]},
-        },
-    ])
+    runner._tools.all_schemas = MagicMock(
+        return_value=[
+            {
+                "name": "read_file",
+                "parameters": {"type": "object", "required": ["path"]},
+            },
+        ]
+    )
     tool_obj = MagicMock()
     tool_obj.is_mutating = False
     tool_obj.mutation_target_arg_keys = ()
@@ -377,10 +410,12 @@ async def test_run_repairs_orphan_tool_message_before_model_submission(
             ),
         ),
     )
-    runner._compact_messages_for_model = AsyncMock(return_value=[
-        {"role": "user", "content": "Do the work."},
-        {"role": "tool", "tool_call_id": "call-missing", "content": "orphaned"},
-    ])
+    runner._compact_messages_for_model = AsyncMock(
+        return_value=[
+            {"role": "user", "content": "Do the work."},
+            {"role": "tool", "tool_call_id": "call-missing", "content": "orphaned"},
+        ]
+    )
     task, subtask = _make_task(tmp_path)
 
     result, verification = await runner.run(task, subtask)
@@ -490,17 +525,10 @@ async def test_run_emergency_compacts_oversized_initial_prompt_when_policy_is_of
     sent_messages = model_complete.await_args.args[0]
     assert "EMERGENCY CONTEXT COMPACTION APPLIED" in sent_messages[0]["content"]
     assert runner._verification.verify.await_count == 1
-    assert runner._last_compaction_diagnostics["compaction_policy_mode"] == (
-        "deterministic"
-    )
-    assert (
-        runner._last_compaction_diagnostics["compaction_policy_mode_configured"]
-        == "off"
-    )
+    assert runner._last_compaction_diagnostics["compaction_policy_mode"] == ("deterministic")
+    assert runner._last_compaction_diagnostics["compaction_policy_mode_configured"] == "off"
     assert runner._last_compaction_diagnostics["compaction_emergency_rescue_attempted"]
-    assert runner._last_compaction_diagnostics["compaction_stage"] == (
-        "stage_5_initial_prompt"
-    )
+    assert runner._last_compaction_diagnostics["compaction_stage"] == ("stage_5_initial_prompt")
     assert runner._last_compaction_diagnostics["compaction_terminal_state"] != "unfit"
 
 
@@ -529,35 +557,39 @@ async def test_run_locks_to_text_completion_after_writing_expected_deliverable(
         "build_run_auth_context",
         lambda **kwargs: {},
     )
-    model_complete = AsyncMock(side_effect=[
-        ModelResponse(
-            text="",
-            tool_calls=[
-                ToolCall(
-                    id="call-1",
-                    name="write_file",
-                    arguments={"path": "report.md", "content": "draft"},
-                ),
-            ],
-            usage=TokenUsage(total_tokens=18),
-        ),
-        ModelResponse(
-            text="Completed.",
-            tool_calls=None,
-            usage=TokenUsage(total_tokens=8),
-        ),
-    ])
+    model_complete = AsyncMock(
+        side_effect=[
+            ModelResponse(
+                text="",
+                tool_calls=[
+                    ToolCall(
+                        id="call-1",
+                        name="write_file",
+                        arguments={"path": "report.md", "content": "draft"},
+                    ),
+                ],
+                usage=TokenUsage(total_tokens=18),
+            ),
+            ModelResponse(
+                text="Completed.",
+                tool_calls=None,
+                usage=TokenUsage(total_tokens=8),
+            ),
+        ]
+    )
     runner = _make_runner(
         memory_query=AsyncMock(return_value=[]),
         model_complete=model_complete,
         config=Config(execution=ExecutionConfig(enable_streaming=False)),
     )
-    runner._tools.all_schemas = MagicMock(return_value=[
-        {
-            "name": "write_file",
-            "parameters": {"type": "object", "required": ["path", "content"]},
-        },
-    ])
+    runner._tools.all_schemas = MagicMock(
+        return_value=[
+            {
+                "name": "write_file",
+                "parameters": {"type": "object", "required": ["path", "content"]},
+            },
+        ]
+    )
     tool_obj = MagicMock()
     tool_obj.is_mutating = True
     tool_obj.mutation_target_arg_keys = ()
@@ -600,46 +632,50 @@ async def test_run_does_not_refetch_access_denied_url_with_different_query_hint(
         lambda **kwargs: {},
     )
     blocked_url = "https://members.example.test/private-page"
-    model_complete = AsyncMock(side_effect=[
-        ModelResponse(
-            text="",
-            tool_calls=[
-                ToolCall(
-                    id="call-1",
-                    name="web_fetch",
-                    arguments={"url": blocked_url, "query": "local units"},
-                ),
-            ],
-            usage=TokenUsage(total_tokens=10),
-        ),
-        ModelResponse(
-            text="",
-            tool_calls=[
-                ToolCall(
-                    id="call-2",
-                    name="web_fetch",
-                    arguments={"url": blocked_url, "query": "regions and chapters"},
-                ),
-            ],
-            usage=TokenUsage(total_tokens=10),
-        ),
-        ModelResponse(
-            text="Completed using alternate public evidence.",
-            tool_calls=None,
-            usage=TokenUsage(total_tokens=8),
-        ),
-    ])
+    model_complete = AsyncMock(
+        side_effect=[
+            ModelResponse(
+                text="",
+                tool_calls=[
+                    ToolCall(
+                        id="call-1",
+                        name="web_fetch",
+                        arguments={"url": blocked_url, "query": "local units"},
+                    ),
+                ],
+                usage=TokenUsage(total_tokens=10),
+            ),
+            ModelResponse(
+                text="",
+                tool_calls=[
+                    ToolCall(
+                        id="call-2",
+                        name="web_fetch",
+                        arguments={"url": blocked_url, "query": "regions and chapters"},
+                    ),
+                ],
+                usage=TokenUsage(total_tokens=10),
+            ),
+            ModelResponse(
+                text="Completed using alternate public evidence.",
+                tool_calls=None,
+                usage=TokenUsage(total_tokens=8),
+            ),
+        ]
+    )
     runner = _make_runner(
         memory_query=AsyncMock(return_value=[]),
         model_complete=model_complete,
         config=Config(execution=ExecutionConfig(enable_streaming=False)),
     )
-    runner._tools.all_schemas = MagicMock(return_value=[
-        {
-            "name": "web_fetch",
-            "parameters": {"type": "object", "required": ["url"]},
-        },
-    ])
+    runner._tools.all_schemas = MagicMock(
+        return_value=[
+            {
+                "name": "web_fetch",
+                "parameters": {"type": "object", "required": ["url"]},
+            },
+        ]
+    )
     fetch_tool = MagicMock()
     fetch_tool.is_mutating = False
     fetch_tool.mutation_target_arg_keys = ()
@@ -669,30 +705,32 @@ async def test_tool_budget_exhaustion_returns_canonical_checkpoint_signal(
         "build_run_auth_context",
         lambda **kwargs: {},
     )
-    model_complete = AsyncMock(side_effect=[
-        ModelResponse(
-            text="",
-            tool_calls=[
-                ToolCall(
-                    id="call-1",
-                    name="web_search",
-                    arguments={"query": "synthetic market evidence"},
-                ),
-            ],
-            usage=TokenUsage(total_tokens=10),
-        ),
-        ModelResponse(
-            text="",
-            tool_calls=[
-                ToolCall(
-                    id="call-2",
-                    name="web_search",
-                    arguments={"query": "synthetic market geography"},
-                ),
-            ],
-            usage=TokenUsage(total_tokens=10),
-        ),
-    ])
+    model_complete = AsyncMock(
+        side_effect=[
+            ModelResponse(
+                text="",
+                tool_calls=[
+                    ToolCall(
+                        id="call-1",
+                        name="web_search",
+                        arguments={"query": "synthetic market evidence"},
+                    ),
+                ],
+                usage=TokenUsage(total_tokens=10),
+            ),
+            ModelResponse(
+                text="",
+                tool_calls=[
+                    ToolCall(
+                        id="call-2",
+                        name="web_search",
+                        arguments={"query": "synthetic market geography"},
+                    ),
+                ],
+                usage=TokenUsage(total_tokens=10),
+            ),
+        ]
+    )
     runner = _make_runner(
         memory_query=AsyncMock(return_value=[]),
         model_complete=model_complete,
@@ -704,12 +742,14 @@ async def test_tool_budget_exhaustion_returns_canonical_checkpoint_signal(
             limits=LimitsConfig(runner=RunnerLimitsConfig(max_tool_iterations=2)),
         ),
     )
-    runner._tools.all_schemas = MagicMock(return_value=[
-        {
-            "name": "web_search",
-            "parameters": {"type": "object", "required": ["query"]},
-        },
-    ])
+    runner._tools.all_schemas = MagicMock(
+        return_value=[
+            {
+                "name": "web_search",
+                "parameters": {"type": "object", "required": ["query"]},
+            },
+        ]
+    )
     search_tool = MagicMock()
     search_tool.is_mutating = False
     search_tool.mutation_target_arg_keys = ()
@@ -791,61 +831,69 @@ async def test_run_allows_same_response_non_mutating_tools_after_canonical_write
         "build_run_auth_context",
         lambda **kwargs: {},
     )
-    model_complete = AsyncMock(side_effect=[
-        ModelResponse(
-            text="",
-            tool_calls=[
-                ToolCall(
-                    id="call-1",
-                    name="write_file",
-                    arguments={"path": "report.md", "content": "draft"},
-                ),
-                ToolCall(
-                    id="call-2",
-                    name="fact_checker",
-                    arguments={
-                        "claims": ["draft"],
-                        "sources": ["report.md"],
-                    },
-                ),
-            ],
-            usage=TokenUsage(total_tokens=22),
-        ),
-        ModelResponse(
-            text="Completed.",
-            tool_calls=None,
-            usage=TokenUsage(total_tokens=8),
-        ),
-    ])
+    model_complete = AsyncMock(
+        side_effect=[
+            ModelResponse(
+                text="",
+                tool_calls=[
+                    ToolCall(
+                        id="call-1",
+                        name="write_file",
+                        arguments={"path": "report.md", "content": "draft"},
+                    ),
+                    ToolCall(
+                        id="call-2",
+                        name="fact_checker",
+                        arguments={
+                            "claims": ["draft"],
+                            "sources": ["report.md"],
+                        },
+                    ),
+                ],
+                usage=TokenUsage(total_tokens=22),
+            ),
+            ModelResponse(
+                text="Completed.",
+                tool_calls=None,
+                usage=TokenUsage(total_tokens=8),
+            ),
+        ]
+    )
     runner = _make_runner(
         memory_query=AsyncMock(return_value=[]),
         model_complete=model_complete,
         config=Config(execution=ExecutionConfig(enable_streaming=False)),
     )
-    runner._tools.all_schemas = MagicMock(return_value=[
-        {
-            "name": "write_file",
-            "parameters": {"type": "object", "required": ["path", "content"]},
-        },
-        {
-            "name": "fact_checker",
-            "parameters": {"type": "object", "required": ["claims"]},
-        },
-    ])
+    runner._tools.all_schemas = MagicMock(
+        return_value=[
+            {
+                "name": "write_file",
+                "parameters": {"type": "object", "required": ["path", "content"]},
+            },
+            {
+                "name": "fact_checker",
+                "parameters": {"type": "object", "required": ["claims"]},
+            },
+        ]
+    )
     write_tool = MagicMock()
     write_tool.is_mutating = True
     write_tool.mutation_target_arg_keys = ()
     fact_checker_tool = MagicMock()
     fact_checker_tool.is_mutating = True
     fact_checker_tool.mutation_target_arg_keys = ()
-    runner._tools.get = MagicMock(side_effect=lambda name: {
-        "write_file": write_tool,
-        "fact_checker": fact_checker_tool,
-    }[name])
-    runner._tools.execute = AsyncMock(side_effect=[
-        ToolResult.ok("ok", files_changed=["report.md"]),
-        ToolResult.ok("supported", data={"verdicts": [{"claim": "draft"}]}),
-    ])
+    runner._tools.get = MagicMock(
+        side_effect=lambda name: {
+            "write_file": write_tool,
+            "fact_checker": fact_checker_tool,
+        }[name]
+    )
+    runner._tools.execute = AsyncMock(
+        side_effect=[
+            ToolResult.ok("ok", files_changed=["report.md"]),
+            ToolResult.ok("supported", data={"verdicts": [{"claim": "draft"}]}),
+        ]
+    )
 
     task, subtask = _make_task(tmp_path)
 
@@ -874,50 +922,54 @@ async def test_run_suppresses_optional_fact_checker_reports_outside_canonical_ou
         "build_run_auth_context",
         lambda **kwargs: {},
     )
-    model_complete = AsyncMock(side_effect=[
-        ModelResponse(
-            text="",
-            tool_calls=[
-                ToolCall(
-                    id="call-1",
-                    name="write_file",
-                    arguments={"path": "report.md", "content": "draft"},
-                ),
-                ToolCall(
-                    id="call-2",
-                    name="fact_checker",
-                    arguments={
-                        "claims": ["A claim"],
-                        "sources": ["source.md"],
-                        "write_reports": True,
-                        "output_path": "fact-check-report.md",
-                        "output_csv_path": "fact-check-report.csv",
-                    },
-                ),
-            ],
-            usage=TokenUsage(total_tokens=20),
-        ),
-        ModelResponse(
-            text="Completed.",
-            tool_calls=None,
-            usage=TokenUsage(total_tokens=8),
-        ),
-    ])
+    model_complete = AsyncMock(
+        side_effect=[
+            ModelResponse(
+                text="",
+                tool_calls=[
+                    ToolCall(
+                        id="call-1",
+                        name="write_file",
+                        arguments={"path": "report.md", "content": "draft"},
+                    ),
+                    ToolCall(
+                        id="call-2",
+                        name="fact_checker",
+                        arguments={
+                            "claims": ["A claim"],
+                            "sources": ["source.md"],
+                            "write_reports": True,
+                            "output_path": "fact-check-report.md",
+                            "output_csv_path": "fact-check-report.csv",
+                        },
+                    ),
+                ],
+                usage=TokenUsage(total_tokens=20),
+            ),
+            ModelResponse(
+                text="Completed.",
+                tool_calls=None,
+                usage=TokenUsage(total_tokens=8),
+            ),
+        ]
+    )
     runner = _make_runner(
         memory_query=AsyncMock(return_value=[]),
         model_complete=model_complete,
         config=Config(execution=ExecutionConfig(enable_streaming=False)),
     )
-    runner._tools.all_schemas = MagicMock(return_value=[
-        {
-            "name": "write_file",
-            "parameters": {"type": "object", "required": ["path", "content"]},
-        },
-        {
-            "name": "fact_checker",
-            "parameters": {"type": "object", "required": ["claims"]},
-        },
-    ])
+    runner._tools.all_schemas = MagicMock(
+        return_value=[
+            {
+                "name": "write_file",
+                "parameters": {"type": "object", "required": ["path", "content"]},
+            },
+            {
+                "name": "fact_checker",
+                "parameters": {"type": "object", "required": ["claims"]},
+            },
+        ]
+    )
     write_tool = MagicMock()
     write_tool.is_mutating = True
     write_tool.mutation_target_arg_keys = ()
@@ -927,17 +979,21 @@ async def test_run_suppresses_optional_fact_checker_reports_outside_canonical_ou
         "output_path",
         "output_csv_path",
     )
-    runner._tools.get = MagicMock(side_effect=lambda name: {
-        "write_file": write_tool,
-        "fact_checker": fact_checker_tool,
-    }[name])
-    runner._tools.execute = AsyncMock(side_effect=[
-        ToolResult.ok("written", files_changed=["report.md"]),
-        ToolResult.ok(
-            "supported",
-            data={"verdicts": [{"claim": "A claim", "verdict": "supported"}]},
-        ),
-    ])
+    runner._tools.get = MagicMock(
+        side_effect=lambda name: {
+            "write_file": write_tool,
+            "fact_checker": fact_checker_tool,
+        }[name]
+    )
+    runner._tools.execute = AsyncMock(
+        side_effect=[
+            ToolResult.ok("written", files_changed=["report.md"]),
+            ToolResult.ok(
+                "supported",
+                data={"verdicts": [{"claim": "A claim", "verdict": "supported"}]},
+            ),
+        ]
+    )
 
     task, subtask = _make_task(tmp_path)
     result, verification = await runner.run(
@@ -972,40 +1028,44 @@ async def test_run_blocks_same_response_mutation_after_canonical_write(
         "build_run_auth_context",
         lambda **kwargs: {},
     )
-    model_complete = AsyncMock(side_effect=[
-        ModelResponse(
-            text="",
-            tool_calls=[
-                ToolCall(
-                    id="call-1",
-                    name="write_file",
-                    arguments={"path": "report.md", "content": "draft"},
-                ),
-                ToolCall(
-                    id="call-2",
-                    name="write_file",
-                    arguments={"path": "notes.md", "content": "extra"},
-                ),
-            ],
-            usage=TokenUsage(total_tokens=20),
-        ),
-        ModelResponse(
-            text="Completed.",
-            tool_calls=None,
-            usage=TokenUsage(total_tokens=8),
-        ),
-    ])
+    model_complete = AsyncMock(
+        side_effect=[
+            ModelResponse(
+                text="",
+                tool_calls=[
+                    ToolCall(
+                        id="call-1",
+                        name="write_file",
+                        arguments={"path": "report.md", "content": "draft"},
+                    ),
+                    ToolCall(
+                        id="call-2",
+                        name="write_file",
+                        arguments={"path": "notes.md", "content": "extra"},
+                    ),
+                ],
+                usage=TokenUsage(total_tokens=20),
+            ),
+            ModelResponse(
+                text="Completed.",
+                tool_calls=None,
+                usage=TokenUsage(total_tokens=8),
+            ),
+        ]
+    )
     runner = _make_runner(
         memory_query=AsyncMock(return_value=[]),
         model_complete=model_complete,
         config=Config(execution=ExecutionConfig(enable_streaming=False)),
     )
-    runner._tools.all_schemas = MagicMock(return_value=[
-        {
-            "name": "write_file",
-            "parameters": {"type": "object", "required": ["path", "content"]},
-        },
-    ])
+    runner._tools.all_schemas = MagicMock(
+        return_value=[
+            {
+                "name": "write_file",
+                "parameters": {"type": "object", "required": ["path", "content"]},
+            },
+        ]
+    )
     tool_obj = MagicMock()
     tool_obj.is_mutating = True
     tool_obj.mutation_target_arg_keys = ()

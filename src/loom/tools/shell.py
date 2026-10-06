@@ -38,6 +38,13 @@ BLOCKED_PATTERNS = [
 
 BLOCKED_RE = [re.compile(p, re.IGNORECASE) for p in BLOCKED_PATTERNS]
 
+_RECOVERABLE_POLICY_PATTERNS = frozenset({
+    r"\bpython[23]?\s+-c\s",
+    r"\bperl\s+-e\s",
+    r"\bruby\s+-e\s",
+    r">\s*/dev/(?!null\b)",
+})
+
 
 def check_command_safety(command: str) -> str | None:
     """Check if a shell command matches any blocked patterns.
@@ -59,6 +66,23 @@ def check_command_safety(command: str) -> str | None:
                     + " (Redirection to /dev/* is blocked except /dev/null.)"
                 )
             return message
+    return None
+
+
+def command_safety_metadata(command: str) -> dict[str, object] | None:
+    """Return structured policy metadata for a blocked shell command."""
+    for pattern in BLOCKED_RE:
+        if not pattern.search(command):
+            continue
+        recoverable = pattern.pattern in _RECOVERABLE_POLICY_PATTERNS
+        return {
+            "reason_code": (
+                "command_policy_rejected" if recoverable else "dangerous_command_blocked"
+            ),
+            "policy_rule": pattern.pattern,
+            "repairability": "automatic" if recoverable else "terminal",
+            "executed": False,
+        }
     return None
 
 
@@ -129,7 +153,14 @@ class ShellExecuteTool(Tool):
         # Safety check
         violation = check_command_safety(command)
         if violation:
-            raise ToolSafetyError(violation)
+            metadata = command_safety_metadata(command) or {}
+            raise ToolSafetyError(
+                violation,
+                reason_code=str(metadata.get("reason_code", "safety_violation")),
+                policy_rule=str(metadata.get("policy_rule", "")),
+                repairability=str(metadata.get("repairability", "terminal")),
+                executed=False,
+            )
 
         cwd = str(ctx.workspace) if ctx.workspace else None
 

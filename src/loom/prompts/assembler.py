@@ -121,11 +121,7 @@ class PromptAssembler:
             planner_examples = self._format_planner_examples()
 
         # PROCESS: workspace analysis from process guidance
-        if (
-            self._process
-            and self._process.workspace_guidance
-            and not workspace_analysis
-        ):
+        if self._process and self._process.workspace_guidance and not workspace_analysis:
             workspace_analysis = self._process.workspace_guidance
 
         # Use manual replacement to prevent KeyError from user braces
@@ -133,10 +129,7 @@ class PromptAssembler:
         replacements = {
             "goal": task.goal,
             "workspace_path": task.workspace,
-            "user_context": (
-                json.dumps(task.context) if task.context
-                else "None provided."
-            ),
+            "user_context": (json.dumps(task.context) if task.context else "None provided."),
             "workspace_listing": workspace_listing or "Not yet inspected.",
             "code_analysis": code_analysis or "Not analyzed.",
             "workspace_analysis": workspace_analysis or "",
@@ -146,7 +139,8 @@ class PromptAssembler:
         instructions = raw
         for key, value in replacements.items():
             instructions = instructions.replace(
-                "{" + key + "}", str(value),
+                "{" + key + "}",
+                str(value),
             )
         instructions = instructions.strip()
         constraints = template.get("constraints", "").strip()
@@ -177,22 +171,27 @@ class PromptAssembler:
 
         # 2. TASK STATE
         task_state_yaml = state_manager.to_compact_yaml(task)
-        task_state = template.get(
-            "task_state",
-            "CURRENT TASK STATE:\n{task_state_yaml}",
-        ).format(
-            task_state_yaml=task_state_yaml,
-        ).strip()
+        task_state = (
+            template.get(
+                "task_state",
+                "CURRENT TASK STATE:\n{task_state_yaml}",
+            )
+            .format(
+                task_state_yaml=task_state_yaml,
+            )
+            .strip()
+        )
 
         # 3. CURRENT SUBTASK
-        subtask_section = template.get("subtask", "").format(
-            subtask_id=subtask.id,
-            subtask_description=subtask.description,
-            acceptance_criteria=(
-                subtask.acceptance_criteria
-                or "Complete the described task."
-            ),
-        ).strip()
+        subtask_section = (
+            template.get("subtask", "")
+            .format(
+                subtask_id=subtask.id,
+                subtask_description=subtask.description,
+                acceptance_criteria=(subtask.acceptance_criteria or "Complete the described task."),
+            )
+            .strip()
+        )
         # PROCESS: enforce exact deliverable filenames for active phase/subtask.
         if self._process:
             phase_id = str(getattr(subtask, "phase_id", "") or "").strip()
@@ -200,25 +199,38 @@ class PromptAssembler:
             phase_strategy = ""
             strategy_resolver = getattr(self._process, "phase_output_strategy", None)
             if callable(strategy_resolver):
-                phase_strategy = str(
-                    strategy_resolver(phase_id or subtask.id),
-                ).strip().lower()
-            publish_mode = str(
-                getattr(
-                    getattr(self._process, "output_coordination", None),
-                    "publish_mode",
-                    "transactional",
-                ) or "transactional",
-            ).strip().lower()
-
-            if phase_strategy == "fan_in" and output_role != "phase_finalizer":
-                intermediate_root = str(
+                phase_strategy = (
+                    str(
+                        strategy_resolver(phase_id or subtask.id),
+                    )
+                    .strip()
+                    .lower()
+                )
+            publish_mode = (
+                str(
                     getattr(
                         getattr(self._process, "output_coordination", None),
-                        "intermediate_root",
-                        ".loom/phase-artifacts",
-                    ) or ".loom/phase-artifacts",
-                ).strip() or ".loom/phase-artifacts"
+                        "publish_mode",
+                        "transactional",
+                    )
+                    or "transactional",
+                )
+                .strip()
+                .lower()
+            )
+
+            if phase_strategy == "fan_in" and output_role != "phase_finalizer":
+                intermediate_root = (
+                    str(
+                        getattr(
+                            getattr(self._process, "output_coordination", None),
+                            "intermediate_root",
+                            ".loom/phase-artifacts",
+                        )
+                        or ".loom/phase-artifacts",
+                    ).strip()
+                    or ".loom/phase-artifacts"
+                )
                 phase_hint = phase_id or subtask.id
                 subtask_section += (
                     "\n\nOUTPUT COORDINATION (FAN-IN WORKER MODE):\n"
@@ -232,13 +244,17 @@ class PromptAssembler:
                 and output_role == "phase_finalizer"
                 and publish_mode == "transactional"
             ):
-                intermediate_root = str(
-                    getattr(
-                        getattr(self._process, "output_coordination", None),
-                        "intermediate_root",
-                        ".loom/phase-artifacts",
-                    ) or ".loom/phase-artifacts",
-                ).strip() or ".loom/phase-artifacts"
+                intermediate_root = (
+                    str(
+                        getattr(
+                            getattr(self._process, "output_coordination", None),
+                            "intermediate_root",
+                            ".loom/phase-artifacts",
+                        )
+                        or ".loom/phase-artifacts",
+                    ).strip()
+                    or ".loom/phase-artifacts"
+                )
                 phase_hint = phase_id or subtask.id
                 subtask_section += (
                     "\n\nOUTPUT COORDINATION (FAN-IN FINALIZER TRANSACTIONAL MODE):\n"
@@ -273,6 +289,90 @@ class PromptAssembler:
                         "finishing this subtask. Do not rename them."
                     )
 
+            dependency_artifacts: list[str] = []
+            deliverables_by_phase = self._process.get_deliverables()
+            phase_by_id = {
+                str(phase.id or "").strip(): phase
+                for phase in self._process.phases
+                if str(phase.id or "").strip()
+            }
+            dependency_ids: list[str] = []
+            pending_dependency_ids = [
+                str(item or "").strip()
+                for item in list(getattr(subtask, "depends_on", []) or [])
+                if str(item or "").strip()
+            ]
+            while pending_dependency_ids:
+                dependency_id = pending_dependency_ids.pop(0)
+                if dependency_id in dependency_ids:
+                    continue
+                dependency_ids.append(dependency_id)
+                phase = phase_by_id.get(dependency_id)
+                if phase is not None:
+                    pending_dependency_ids.extend(
+                        str(item or "").strip()
+                        for item in list(phase.depends_on or [])
+                        if str(item or "").strip()
+                    )
+            for dependency_id in dependency_ids:
+                for artifact in deliverables_by_phase.get(str(dependency_id), []):
+                    name = str(artifact or "").strip()
+                    if name and name not in dependency_artifacts:
+                        dependency_artifacts.append(name)
+            if dependency_artifacts:
+                names = "\n".join(f"- {name}" for name in dependency_artifacts)
+                subtask_section += (
+                    "\n\nUPSTREAM DEPENDENCY ARTIFACTS:\n"
+                    f"{names}\n"
+                    "Read these artifacts before drafting. Preserve their supported "
+                    "findings, evidence links, uncertainty, and unresolved gaps; do not "
+                    "rely only on short task-state summaries."
+                )
+
+            quality_resolver = getattr(
+                self._process,
+                "resolve_quality_contract_for_phase",
+                None,
+            )
+            quality_contract = (
+                quality_resolver(phase_id or subtask.id) if callable(quality_resolver) else {}
+            )
+            if isinstance(quality_contract, dict) and bool(
+                quality_contract.get("enabled", False),
+            ):
+                dimensions = [
+                    str(item or "").strip()
+                    for item in quality_contract.get("dimensions", [])
+                    if str(item or "").strip()
+                ]
+                required_sections = [
+                    str(item or "").strip()
+                    for item in quality_contract.get("required_sections", [])
+                    if str(item or "").strip()
+                ]
+                lines = [
+                    "OUTPUT QUALITY CONTRACT:",
+                    "- Build a requirement-coverage checklist before the first canonical write.",
+                    (
+                        "- Optimize for thorough, decision-useful coverage rather than "
+                        "minimum length or minimum tool calls."
+                    ),
+                    (
+                        "- Every material conclusion must connect evidence, analysis, "
+                        "implication, and uncertainty."
+                    ),
+                    (
+                        "- Before finishing, audit every required component and explicitly "
+                        "preserve unresolved gaps."
+                    ),
+                ]
+                if dimensions:
+                    lines.append("- Quality dimensions: " + ", ".join(dimensions))
+                if required_sections:
+                    lines.append("- Required components:")
+                    lines.extend(f"  - {item}" for item in required_sections)
+                subtask_section += "\n\n" + "\n".join(lines)
+
         if self._requires_evidence_contract(subtask):
             subtask_section += (
                 "\n\nEVIDENCE CONTRACT:\n"
@@ -291,17 +391,18 @@ class PromptAssembler:
             memory_text = self._format_memory(memory_entries)
         else:
             memory_text = "No relevant prior context."
-        memory_section = template.get(
-            "memory",
-            "RELEVANT CONTEXT FROM PRIOR WORK:\n{memory_entries_formatted}",
-        ).format(memory_entries_formatted=memory_text).strip()
+        memory_section = (
+            template.get(
+                "memory",
+                "RELEVANT CONTEXT FROM PRIOR WORK:\n{memory_entries_formatted}",
+            )
+            .format(memory_entries_formatted=memory_text)
+            .strip()
+        )
         evidence_section = ""
         evidence_summary = str(evidence_ledger_summary or "").strip()
         if evidence_summary:
-            evidence_section = (
-                "EVIDENCE LEDGER SNAPSHOT (PERSISTED):\n"
-                + evidence_summary
-            )
+            evidence_section = "EVIDENCE LEDGER SNAPSHOT (PERSISTED):\n" + evidence_summary
 
         # 5. AVAILABLE TOOLS
         tools_section = ""
@@ -317,17 +418,14 @@ class PromptAssembler:
         # PROCESS: inject tool guidance into constraints
         if self._process and self._process.tool_guidance:
             tool_guidance = (
-                "\n\nDOMAIN-SPECIFIC TOOL GUIDANCE:\n"
-                + self._process.tool_guidance.strip()
+                "\n\nDOMAIN-SPECIFIC TOOL GUIDANCE:\n" + self._process.tool_guidance.strip()
             )
             constraints = constraints + tool_guidance
         if self._process:
             executor_constraints = self._process.prompt_executor_constraints()
             if executor_constraints:
                 constraints = (
-                    constraints
-                    + "\n\nPROCESS EXECUTION CONSTRAINTS:\n"
-                    + executor_constraints
+                    constraints + "\n\nPROCESS EXECUTION CONSTRAINTS:\n" + executor_constraints
                 )
             if self._process.verifier_tool_success_policy() == "development_balanced":
                 from loom.engine.verification.development import (
@@ -375,9 +473,7 @@ class PromptAssembler:
                 "filenames (for example, `brief-normalized.md`).\n"
             )
             if workspace_name:
-                constraints += (
-                    f"- Do NOT prefix write paths with `{workspace_name}/`.\n"
-                )
+                constraints += f"- Do NOT prefix write paths with `{workspace_name}/`.\n"
             constraints += (
                 "- Read scope: you may inspect these additional reference roots using "
                 "read-only tools when needed:\n"
@@ -458,28 +554,26 @@ class PromptAssembler:
             plan_lines.append(
                 f"- [{s.status.value}] {s.id}: {s.description}",
             )
-        original_plan_formatted = (
-            "\n".join(plan_lines) if plan_lines else "No prior plan."
-        )
+        original_plan_formatted = "\n".join(plan_lines) if plan_lines else "No prior plan."
         process_replanning_triggers = "None provided."
         if self._process and self._process.replanning_triggers.strip():
             process_replanning_triggers = self._process.replanning_triggers.strip()
 
-        instructions = template.get("instructions", "").format(
-            goal=goal,
-            current_state_yaml=current_state_yaml,
-            replan_reason=replan_reason or "subtask failures",
-            process_replanning_triggers=process_replanning_triggers,
-            discoveries_formatted=(
-                "\n".join(f"- {d}" for d in discoveries) if discoveries
-                else "None."
-            ),
-            errors_formatted=(
-                "\n".join(f"- {e}" for e in errors) if errors
-                else "None."
-            ),
-            original_plan_formatted=original_plan_formatted,
-        ).strip()
+        instructions = (
+            template.get("instructions", "")
+            .format(
+                goal=goal,
+                current_state_yaml=current_state_yaml,
+                replan_reason=replan_reason or "subtask failures",
+                process_replanning_triggers=process_replanning_triggers,
+                discoveries_formatted=(
+                    "\n".join(f"- {d}" for d in discoveries) if discoveries else "None."
+                ),
+                errors_formatted=("\n".join(f"- {e}" for e in errors) if errors else "None."),
+                original_plan_formatted=original_plan_formatted,
+            )
+            .strip()
+        )
 
         constraints = template.get("constraints", "").strip()
 
@@ -504,11 +598,15 @@ class PromptAssembler:
         template = self.get_template("extractor")
 
         role = template.get("role", "").strip()
-        instructions = template.get("instructions", "").format(
-            subtask_id=subtask_id,
-            tool_calls_formatted=tool_calls_formatted,
-            model_output=model_output,
-        ).strip()
+        instructions = (
+            template.get("instructions", "")
+            .format(
+                subtask_id=subtask_id,
+                tool_calls_formatted=tool_calls_formatted,
+                model_output=model_output,
+            )
+            .strip()
+        )
         constraints = template.get("constraints", "").strip()
 
         # PROCESS: inject extraction guidance and memory types
@@ -516,21 +614,15 @@ class PromptAssembler:
             extra_parts = []
             if self._process.memory_types:
                 types_text = ", ".join(
-                    f"{m.type} ({m.description})"
-                    for m in self._process.memory_types
+                    f"{m.type} ({m.description})" for m in self._process.memory_types
                 )
-                extra_parts.append(
-                    f"DOMAIN-SPECIFIC MEMORY TYPES: {types_text}"
-                )
+                extra_parts.append(f"DOMAIN-SPECIFIC MEMORY TYPES: {types_text}")
             if self._process.extraction_guidance:
                 extra_parts.append(
-                    "EXTRACTION GUIDANCE:\n"
-                    + self._process.extraction_guidance.strip()
+                    "EXTRACTION GUIDANCE:\n" + self._process.extraction_guidance.strip()
                 )
             if extra_parts:
-                constraints = (
-                    constraints + "\n\n" + "\n\n".join(extra_parts)
-                )
+                constraints = constraints + "\n\n" + "\n\n".join(extra_parts)
 
         sections = [role, instructions, constraints]
         return self.SECTION_SEPARATOR.join(s for s in sections if s)
@@ -548,16 +640,17 @@ class PromptAssembler:
         template = self.get_template("verifier")
 
         role = template.get("role", "").strip()
-        instructions = template.get("instructions", "").format(
-            subtask_id=subtask.id,
-            subtask_description=subtask.description,
-            acceptance_criteria=(
-                subtask.acceptance_criteria
-                or "Complete the described task."
-            ),
-            result_summary=result_summary,
-            tool_calls_formatted=tool_calls_formatted,
-        ).strip()
+        instructions = (
+            template.get("instructions", "")
+            .format(
+                subtask_id=subtask.id,
+                subtask_description=subtask.description,
+                acceptance_criteria=(subtask.acceptance_criteria or "Complete the described task."),
+                result_summary=result_summary,
+                tool_calls_formatted=tool_calls_formatted,
+            )
+            .strip()
+        )
         constraints = template.get("constraints", "").strip()
 
         # PROCESS: inject LLM verification rules
@@ -577,17 +670,11 @@ class PromptAssembler:
                     )
                     for r in selected_rules
                 )
-                instructions += (
-                    "\n\nADDITIONAL DOMAIN-SPECIFIC CHECKS:\n"
-                    + rules_text
-                )
+                instructions += "\n\nADDITIONAL DOMAIN-SPECIFIC CHECKS:\n" + rules_text
         if self._process:
             verifier_constraints = self._process.prompt_verifier_constraints()
             if verifier_constraints:
-                instructions += (
-                    "\n\nPROCESS VERIFIER CONSTRAINTS:\n"
-                    + verifier_constraints
-                )
+                instructions += "\n\nPROCESS VERIFIER CONSTRAINTS:\n" + verifier_constraints
             if self._process.verifier_tool_success_policy() == "development_balanced":
                 from loom.engine.verification.development import (
                     development_helper_tool_guidance,
@@ -608,9 +695,7 @@ class PromptAssembler:
                         if not label:
                             continue
                         optionality = (
-                            "optional"
-                            if bool(item.get("optional", False))
-                            else "required"
+                            "optional" if bool(item.get("optional", False)) else "required"
                         )
                         detail_parts = [optionality]
                         helper = str(item.get("helper", "") or "").strip()
@@ -619,13 +704,10 @@ class PromptAssembler:
                         name = str(item.get("name", "") or "").strip()
                         if name:
                             detail_parts.append(name)
-                        capability_lines.append(
-                            f"- {label}: {', '.join(detail_parts)}"
-                        )
+                        capability_lines.append(f"- {label}: {', '.join(detail_parts)}")
                     if capability_lines:
-                        instructions += (
-                            "\n\nDEVELOPMENT VERIFICATION CAPABILITIES:\n"
-                            + "\n".join(capability_lines)
+                        instructions += "\n\nDEVELOPMENT VERIFICATION CAPABILITIES:\n" + "\n".join(
+                            capability_lines
                         )
                 helper_specs = self._process.verifier_helper_specs()
                 if helper_specs:
@@ -645,24 +727,71 @@ class PromptAssembler:
                             line += f": {description}"
                         helper_lines.append(line)
                     if helper_lines:
-                        instructions += (
-                            "\n\nDEVELOPMENT HELPER REGISTRY:\n"
-                            + "\n".join(helper_lines)
+                        instructions += "\n\nDEVELOPMENT HELPER REGISTRY:\n" + "\n".join(
+                            helper_lines
                         )
             output_contract = self._process.verifier_output_contract()
             metadata_fields = output_contract.get("metadata_fields", [])
             if isinstance(metadata_fields, list) and metadata_fields:
                 metadata_list = "\n".join(
-                    f"- {str(item).strip()}"
-                    for item in metadata_fields
-                    if str(item).strip()
+                    f"- {str(item).strip()}" for item in metadata_fields if str(item).strip()
                 )
                 if metadata_list:
                     instructions += (
                         "\n\nPROCESS OUTPUT METADATA FIELDS:\n"
-                        "Include these keys under `metadata` when inferable:\n"
-                        + metadata_list
+                        "Include these keys under `metadata` when inferable:\n" + metadata_list
                     )
+            quality_resolver = getattr(
+                self._process,
+                "resolve_quality_contract_for_phase",
+                None,
+            )
+            phase_id = str(getattr(subtask, "phase_id", "") or "").strip()
+            quality_contract = (
+                quality_resolver(phase_id or subtask.id) if callable(quality_resolver) else {}
+            )
+            if isinstance(quality_contract, dict) and bool(
+                quality_contract.get("enabled", False),
+            ):
+                dimensions = [
+                    str(item or "").strip()
+                    for item in quality_contract.get("dimensions", [])
+                    if str(item or "").strip()
+                ]
+                required_sections = [
+                    str(item or "").strip()
+                    for item in quality_contract.get("required_sections", [])
+                    if str(item or "").strip()
+                ]
+                quality_lines = [
+                    "OUTPUT QUALITY AUDIT CONTRACT:",
+                    "Assess the complete artifact set, not merely whether files exist.",
+                    (
+                        "Judge requirement coverage, specificity, evidence linkage, "
+                        "analytical depth, cross-artifact synthesis, actionability, "
+                        "uncertainty handling, and internal consistency."
+                    ),
+                    "Do not use document length as a quality proxy.",
+                ]
+                if dimensions:
+                    quality_lines.append("Required dimensions: " + ", ".join(dimensions))
+                if required_sections:
+                    quality_lines.append("Required components:")
+                    quality_lines.extend(f"- {item}" for item in required_sections)
+                quality_lines.extend(
+                    [
+                        "Return metadata.quality as:",
+                        '{"overall": 0.0, "dimensions": {"dimension_name": 0.0}, '
+                        '"requirement_coverage": 0.0, '
+                        '"missing_targets": ["specific repair target"]}',
+                        (
+                            "Scores must be between 0 and 1. Missing or unevaluable "
+                            "requirements reduce coverage; do not infer absent content from "
+                            "filenames or summaries."
+                        ),
+                    ]
+                )
+                instructions += "\n\n" + "\n".join(quality_lines)
 
         sections = [role, instructions, constraints]
         return self.SECTION_SEPARATOR.join(s for s in sections if s)
@@ -685,8 +814,7 @@ class PromptAssembler:
                 "goal, but explain any deviations."
             ),
             "suggestive": (
-                "These phases are suggestions only. Decompose the goal "
-                "however you see fit."
+                "These phases are suggestions only. Decompose the goal however you see fit."
             ),
         }
 
@@ -697,18 +825,14 @@ class PromptAssembler:
         ]
 
         for phase in self._process.phases:
-            deps = (
-                ", ".join(phase.depends_on) if phase.depends_on
-                else "none"
-            )
+            deps = ", ".join(phase.depends_on) if phase.depends_on else "none"
             flags = []
             if phase.is_critical_path:
                 flags.append("critical")
             if phase.is_synthesis:
                 flags.append("synthesis")
             flags_text = f", flags: {', '.join(flags)}" if flags else ""
-            lines.append(f"- {phase.id} (depends: {deps}, "
-                         f"tier: {phase.model_tier}{flags_text})")
+            lines.append(f"- {phase.id} (depends: {deps}, tier: {phase.model_tier}{flags_text})")
             lines.append(f"  {phase.description.strip()}")
             if phase.acceptance_criteria:
                 lines.append(
@@ -800,12 +924,12 @@ class PromptAssembler:
         ]
         if "list_tools" in tool_names:
             lines.append(
-                '- When the needed capability is not obvious, call '
+                "- When the needed capability is not obvious, call "
                 '`list_tools` with `{"detail":"compact"}` first to discover '
                 "candidate tool names."
             )
             lines.append(
-                '- If you still need argument details, call `list_tools` with '
+                "- If you still need argument details, call `list_tools` with "
                 '`{"detail":"schema","query":"<tool name>"}` and keep that '
                 "lookup narrowly scoped to the specific tool(s) you plan to use."
             )
@@ -830,10 +954,13 @@ class PromptAssembler:
     def estimate_tokens(text: str) -> int:
         """Rough token estimate: ~4 chars per token for English."""
         from loom.utils.tokens import estimate_tokens
+
         return estimate_tokens(text)
 
     def _trim_to_budget(
-        self, prompt: str, max_tokens: int = 8000,
+        self,
+        prompt: str,
+        max_tokens: int = 8000,
     ) -> str:
         """Return prompt as-is.
 

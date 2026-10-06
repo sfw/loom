@@ -195,6 +195,39 @@ describe("RunsTab", () => {
     expect(screen.queryByText("Why This Failed")).not.toBeInTheDocument();
   });
 
+  it("shows the output quality scorecard and repair targets", () => {
+    mockApp.selectedRunId = "run-quality";
+    mockApp.runDetail = {
+      id: "run-quality",
+      goal: "Build a synthetic research brief",
+      status: "completed",
+      process_name: "research-report",
+      completion_grade: "degraded",
+      plan_subtasks: [],
+      quality_scorecard: {
+        synthesis: {
+          overall: 0.74,
+          requirement_coverage: 0.81,
+          dimensions: {
+            completeness: 0.68,
+            analytical_depth: 0.77,
+          },
+          meets_floor: false,
+          reason_code: "quality_below_threshold",
+          missing_targets: ["implementation roadmap", "source traceability"],
+        },
+      },
+    };
+
+    render(<RunsTab />);
+
+    expect(screen.getByText("Output quality scorecard")).toBeInTheDocument();
+    expect(screen.getByText("quality floor missed")).toBeInTheDocument();
+    expect(screen.getByText("74% overall")).toBeInTheDocument();
+    expect(screen.getByText("81% requirements")).toBeInTheDocument();
+    expect(screen.getByText(/implementation roadmap, source traceability/i)).toBeInTheDocument();
+  });
+
   it("does not mount tool-call payloads until the row is expanded", async () => {
     const user = userEvent.setup();
     mockApp.selectedRunId = "run-abc";

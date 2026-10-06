@@ -1508,6 +1508,24 @@ function RunDetailView({
   );
   const hasVerificationWarnings = runStatus === "completed"
     && runDetail.completion_grade === "verified_with_warnings";
+  const qualityEntries = useMemo(() => Object.entries(
+    runDetail.quality_scorecard ?? {},
+  ).map(([subtaskId, quality]) => ({
+    subtaskId,
+    overall: typeof quality.overall === "number" ? quality.overall : null,
+    requirementCoverage: typeof quality.requirement_coverage === "number"
+      ? quality.requirement_coverage
+      : null,
+    dimensions: quality.dimensions && typeof quality.dimensions === "object"
+      ? Object.entries(quality.dimensions).filter((entry): entry is [string, number] => (
+        typeof entry[1] === "number"
+      ))
+      : [],
+    meetsFloor: quality.meets_floor !== false,
+    missingTargets: Array.isArray(quality.missing_targets)
+      ? quality.missing_targets.filter((item): item is string => typeof item === "string")
+      : [],
+  })), [runDetail.quality_scorecard]);
 
   // --- Activity category filters ---
   type ActivityCategory = "tool" | "subtask" | "verify" | "model" | "task" | "other";
@@ -1774,6 +1792,70 @@ function RunDetailView({
                   evidence, verifier warnings, or an explicitly recovered executor
                   failure. Review the validity scorecard before relying on material claims.
                 </p>
+              </div>
+            </div>
+          </section>
+        )}
+        {qualityEntries.length > 0 && (
+          <section className="rounded-2xl border border-zinc-700/70 bg-zinc-900/60 p-4">
+            <div className="flex items-start gap-3">
+              <div className="mt-0.5 rounded-xl bg-sky-500/10 p-2 text-sky-300">
+                <Shield size={16} />
+              </div>
+              <div className="min-w-0 flex-1">
+                <h3 className="text-sm font-semibold text-zinc-100">
+                  Output quality scorecard
+                </h3>
+                <p className="mt-1 text-xs leading-5 text-zinc-400">
+                  Completeness and decision-usefulness checks across audited artifacts.
+                </p>
+                <div className="mt-3 space-y-3">
+                  {qualityEntries.map((entry) => (
+                    <div
+                      key={entry.subtaskId}
+                      className="rounded-xl border border-zinc-800 bg-black/20 px-3 py-2.5"
+                    >
+                      <div className="flex flex-wrap items-center gap-2 text-xs">
+                        <span className="font-medium text-zinc-200">{entry.subtaskId}</span>
+                        <span className={cn(
+                          "rounded-full px-2 py-0.5 font-medium",
+                          entry.meetsFloor
+                            ? "bg-emerald-500/10 text-emerald-300"
+                            : "bg-amber-500/10 text-amber-300",
+                        )}>
+                          {entry.meetsFloor ? "quality floor met" : "quality floor missed"}
+                        </span>
+                        {entry.overall !== null && (
+                          <span className="text-zinc-400">
+                            {Math.round(entry.overall * 100)}% overall
+                          </span>
+                        )}
+                        {entry.requirementCoverage !== null && (
+                          <span className="text-zinc-400">
+                            {Math.round(entry.requirementCoverage * 100)}% requirements
+                          </span>
+                        )}
+                      </div>
+                      {entry.dimensions.length > 0 && (
+                        <div className="mt-2 flex flex-wrap gap-1.5">
+                          {entry.dimensions.map(([name, score]) => (
+                            <span
+                              key={name}
+                              className="rounded-md bg-zinc-800 px-1.5 py-0.5 text-[10px] text-zinc-400"
+                            >
+                              {name.replace(/_/g, " ")} {Math.round(score * 100)}%
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                      {entry.missingTargets.length > 0 && (
+                        <p className="mt-2 text-xs leading-5 text-amber-200/80">
+                          Needs work: {entry.missingTargets.join(", ")}
+                        </p>
+                      )}
+                    </div>
+                  ))}
+                </div>
               </div>
             </div>
           </section>

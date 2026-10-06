@@ -43,8 +43,8 @@ from . import tool_routing as runner_tool_routing
 from .types import SubtaskResult, SubtaskResultStatus, ToolCallRecord
 
 logger = logging.getLogger(__name__)
-compactor_event_context: contextvars.ContextVar[tuple[str, str] | None] = (
-    contextvars.ContextVar("runner_compactor_event_context", default=None)
+compactor_event_context: contextvars.ContextVar[tuple[str, str] | None] = contextvars.ContextVar(
+    "runner_compactor_event_context", default=None
 )
 INFRA_MESSAGE_CONTRACT_VIOLATION = "infra_message_contract_violation"
 _INFRA_MODEL_REASON_CODES = {
@@ -66,6 +66,34 @@ _TERMINAL_WEB_SOURCE_MARKERS = (
     "invalid object in /pages",
 )
 _PROCESS_TOOL_DISCOVERY_NAMES = frozenset({"list_tools", "run_tool"})
+_AD_HOC_CORE_TOOL_NAMES = frozenset(
+    {
+        "document_write",
+        "fact_checker",
+        "glob_find",
+        "list_directory",
+        "read_artifact",
+        "read_file",
+        "ripgrep_search",
+        "web_fetch",
+        "web_fetch_html",
+        "web_search",
+        "write_file",
+    }
+)
+_AD_HOC_DEVELOPMENT_TOOL_NAMES = frozenset(
+    {
+        "apply_patch",
+        "shell_execute",
+    }
+)
+_MISSING_ARTIFACT_MARKERS = (
+    "does not exist",
+    "file not found",
+    "missing artifact",
+    "no such file",
+    "not found",
+)
 
 # Backwards-compatible name used by runner internals.
 _COMPACTOR_EVENT_CONTEXT = compactor_event_context
@@ -89,10 +117,7 @@ def _web_target_key(arguments: dict[str, Any]) -> str:
 def _is_terminal_web_source_failure(error: object) -> bool:
     """Return whether retrying the same URL with the same fetch method is futile."""
     normalized = " ".join(str(error or "").strip().lower().split())
-    return bool(
-        normalized
-        and any(marker in normalized for marker in _TERMINAL_WEB_SOURCE_MARKERS)
-    )
+    return bool(normalized and any(marker in normalized for marker in _TERMINAL_WEB_SOURCE_MARKERS))
 
 
 def _exhausted_web_target_result(*, url: str, prior_error: str) -> ToolResult:
@@ -109,6 +134,7 @@ def _process_scoped_tool_schemas(
     *,
     auth_context: Any,
     execution_surface: str,
+    subtask: Subtask | None = None,
 ) -> tuple[list[dict], dict[str, Any]]:
     """Expose declared process tools plus compact long-tail discovery."""
     schemas = runner._tools.all_schemas(
@@ -124,25 +150,44 @@ def _process_scoped_tool_schemas(
         if str(name or "").strip()
     }
     if process is None or not required:
-        return schemas, {
-            "applied": False,
-            "reason": "no_process_requirements",
+        subtask_text = " ".join(
+            (
+                str(getattr(subtask, "phase_id", "") or ""),
+                str(getattr(subtask, "description", "") or ""),
+                str(getattr(subtask, "acceptance_criteria", "") or ""),
+            )
+        ).lower()
+        development_markers = (
+            "build",
+            "code",
+            "debug",
+            "implement",
+            "patch",
+            "software",
+            "test",
+        )
+        inferred = set(_AD_HOC_CORE_TOOL_NAMES)
+        if any(marker in subtask_text for marker in development_markers):
+            inferred.update(_AD_HOC_DEVELOPMENT_TOOL_NAMES)
+        allowed = inferred | _PROCESS_TOOL_DISCOVERY_NAMES
+        scoped = [
+            schema for schema in schemas if str(schema.get("name", "") or "").strip() in allowed
+        ]
+        available_names = {str(schema.get("name", "") or "").strip() for schema in scoped}
+        return scoped, {
+            "applied": len(scoped) < len(schemas),
+            "reason": "ad_hoc_phase_inference",
             "tool_count_before": len(schemas),
-            "tool_count_after": len(schemas),
-            "direct_tools": [],
-            "discovery_tools": [],
+            "tool_count_after": len(scoped),
+            "direct_tools": sorted(inferred & available_names),
+            "discovery_tools": sorted(
+                _PROCESS_TOOL_DISCOVERY_NAMES & available_names,
+            ),
         }
 
     allowed = required | _PROCESS_TOOL_DISCOVERY_NAMES
-    scoped = [
-        schema
-        for schema in schemas
-        if str(schema.get("name", "") or "").strip() in allowed
-    ]
-    available_names = {
-        str(schema.get("name", "") or "").strip()
-        for schema in scoped
-    }
+    scoped = [schema for schema in schemas if str(schema.get("name", "") or "").strip() in allowed]
+    available_names = {str(schema.get("name", "") or "").strip() for schema in scoped}
     return scoped, {
         "applied": len(scoped) < len(schemas),
         "reason": "process_required_tools",
@@ -153,6 +198,45 @@ def _process_scoped_tool_schemas(
             _PROCESS_TOOL_DISCOVERY_NAMES & available_names,
         ),
     }
+
+
+def _is_missing_artifact_failure(error: object) -> bool:
+    normalized = " ".join(str(error or "").strip().lower().split())
+    return bool(normalized and any(marker in normalized for marker in _MISSING_ARTIFACT_MARKERS))
+
+
+def _artifact_manifest_prompt(task: Task, workspace: Path | None) -> str:
+    """Return a bounded manifest of sealed artifacts known to exist."""
+    if workspace is None or not isinstance(task.metadata, dict):
+        return ""
+    seals = task.metadata.get("artifact_seals", {})
+    if not isinstance(seals, dict):
+        return ""
+    workspace_resolved = workspace.resolve()
+    present: list[str] = []
+    for value in seals.values():
+        if not isinstance(value, dict):
+            continue
+        raw_path = str(value.get("path", "") or "").strip()
+        if not raw_path:
+            continue
+        candidate = (workspace / raw_path).resolve()
+        try:
+            rel = candidate.relative_to(workspace_resolved).as_posix()
+        except ValueError:
+            continue
+        if candidate.is_file() and rel not in present:
+            present.append(rel)
+    if not present:
+        return ""
+    lines = [
+        "PRESENT ARTIFACT MANIFEST:",
+        "Only the following sealed artifacts are known to exist. Do not repeatedly "
+        "read an expected artifact that is absent from this list; use available "
+        "checkpoints or create the declared missing output once.",
+    ]
+    lines.extend(f"- {path}" for path in sorted(present)[:40])
+    return "\n".join(lines)
 
 
 def _response_raw_dict(response: ModelResponse) -> dict[str, Any]:
@@ -187,13 +271,14 @@ def _empty_response_metadata(
     if not stream_close_reason:
         stream_close_reason = "not_streaming" if operation != "stream" else "unknown"
     reason_code = (
-        "model_stream_empty"
-        if operation == "stream"
-        else ModelEmptyResponseError.reason_code
+        "model_stream_empty" if operation == "stream" else ModelEmptyResponseError.reason_code
     )
-    provider_status = str(
-        raw.get("provider_status", raw.get("http_status", "")) or "",
-    ).strip() or "unknown"
+    provider_status = (
+        str(
+            raw.get("provider_status", raw.get("http_status", "")) or "",
+        ).strip()
+        or "unknown"
+    )
     return {
         "reason_code": reason_code,
         "failure_class": reason_code,
@@ -389,9 +474,7 @@ def _validate_model_message_contract(
             if isinstance(tool_calls, list) and tool_calls:
                 assistant_idx = idx
                 call_ids = _tool_call_ids(tool_calls)
-                missing_id_positions = [
-                    pos for pos, call_id in enumerate(call_ids) if not call_id
-                ]
+                missing_id_positions = [pos for pos, call_id in enumerate(call_ids) if not call_id]
                 if missing_id_positions:
                     _raise(
                         "Assistant tool call history contains a blank tool_call id.",
@@ -529,8 +612,7 @@ def _repair_model_message_contract(
                 recovered_tool_messages += 1
                 call_id = str(message.get("tool_call_id", "") or "").strip()
                 lines.append(
-                    f"Tool result [{call_id or 'missing-id'}]: "
-                    f"{message.get('content', '')}"
+                    f"Tool result [{call_id or 'missing-id'}]: {message.get('content', '')}"
                 )
             else:
                 lines.append(f"{role or 'message'}: {message.get('content', '')}")
@@ -559,10 +641,7 @@ def _repair_model_message_contract(
                 cursor += 1
 
             call_ids = _tool_call_ids(tool_calls)
-            response_ids = [
-                str(item.get("tool_call_id", "") or "").strip()
-                for item in group[1:]
-            ]
+            response_ids = [str(item.get("tool_call_id", "") or "").strip() for item in group[1:]]
             well_formed = (
                 all(call_ids)
                 and len(set(call_ids)) == len(call_ids)
@@ -603,9 +682,7 @@ def _repair_model_message_contract(
     unique_violations = list(dict.fromkeys(violations))
     return repaired, {
         "message_contract_repair_applied": bool(unique_violations),
-        "message_contract_repair_status": (
-            "recovered" if unique_violations else "not_needed"
-        ),
+        "message_contract_repair_status": ("recovered" if unique_violations else "not_needed"),
         "message_contract_repair_violations": unique_violations,
         "message_contract_repair_messages_rewritten": rewritten_messages,
         "message_contract_repair_tool_messages_recovered": recovered_tool_messages,
@@ -636,14 +713,18 @@ async def _try_emergency_context_rescue(
     tool_schemas: list[dict],
     remaining_seconds: float,
 ) -> tuple[list[dict], list[dict], dict[str, Any]]:
-    configured_mode = str(
-        getattr(
-            runner,
-            "_runner_compaction_policy_mode",
-            runner.RUNNER_COMPACTION_POLICY_MODE,
+    configured_mode = (
+        str(
+            getattr(
+                runner,
+                "_runner_compaction_policy_mode",
+                runner.RUNNER_COMPACTION_POLICY_MODE,
+            )
+            or "",
         )
-        or "",
-    ).strip().lower()
+        .strip()
+        .lower()
+    )
     original_mode = getattr(runner, "_runner_compaction_policy_mode", configured_mode)
     runner._reset_compaction_runtime_stats()
     try:
@@ -655,20 +736,20 @@ async def _try_emergency_context_rescue(
         )
         rescued_tools = tool_schemas
         if rescued_tools:
-            rescued_tools, tool_schema_prune_report = (
-                runner._prune_tool_schemas_for_request_fit(
-                    rescued_messages,
-                    rescued_tools,
-                )
+            rescued_tools, tool_schema_prune_report = runner._prune_tool_schemas_for_request_fit(
+                rescued_messages,
+                rescued_tools,
             )
             if isinstance(tool_schema_prune_report, dict):
                 diagnostics = dict(getattr(runner, "_last_compaction_diagnostics", {}))
-                diagnostics.update({
-                    "compaction_tool_schema_pruned": bool(
-                        tool_schema_prune_report.get("applied", False),
-                    ),
-                    "compaction_tool_schema_prune_report": tool_schema_prune_report,
-                })
+                diagnostics.update(
+                    {
+                        "compaction_tool_schema_pruned": bool(
+                            tool_schema_prune_report.get("applied", False),
+                        ),
+                        "compaction_tool_schema_prune_report": tool_schema_prune_report,
+                    }
+                )
                 if bool(tool_schema_prune_report.get("applied", False)):
                     applied_stages = list(
                         diagnostics.get("compaction_applied_stages", []),
@@ -691,8 +772,7 @@ async def _try_emergency_context_rescue(
                         ),
                     )
                     diagnostics["compaction_pressure_ratio_after"] = round(
-                        int(diagnostics["compaction_est_tokens_after"])
-                        / max(1, context_budget),
+                        int(diagnostics["compaction_est_tokens_after"]) / max(1, context_budget),
                         4,
                     )
                     diagnostics["compaction_terminal_state"] = (
@@ -705,11 +785,13 @@ async def _try_emergency_context_rescue(
         runner._runner_compaction_policy_mode = original_mode
 
     diagnostics = dict(getattr(runner, "_last_compaction_diagnostics", {}))
-    diagnostics.update({
-        "compaction_emergency_rescue_attempted": True,
-        "compaction_emergency_rescue_mode": "deterministic",
-        "compaction_policy_mode_configured": configured_mode or "off",
-    })
+    diagnostics.update(
+        {
+            "compaction_emergency_rescue_attempted": True,
+            "compaction_emergency_rescue_mode": "deterministic",
+            "compaction_policy_mode_configured": configured_mode or "off",
+        }
+    )
     runner._last_compaction_diagnostics = diagnostics
     return rescued_messages, rescued_tools, diagnostics
 
@@ -738,9 +820,7 @@ async def run_subtask(
     Memory extraction is fire-and-forget — it does not block the return.
     """
     start_time = time.monotonic()
-    runner._subtask_deadline_monotonic = (
-        start_time + runner._max_subtask_wall_clock_seconds
-    )
+    runner._subtask_deadline_monotonic = start_time + runner._max_subtask_wall_clock_seconds
     runner._reset_compaction_runtime_stats()
     runner._last_compaction_diagnostics = {
         "compaction_policy_mode": str(
@@ -796,12 +876,11 @@ async def run_subtask(
             max_entries=10,
         )
         execution_surface = runner._execution_surface_for_task(task)
-        process_tool_schemas, process_tool_scope_report = (
-            _process_scoped_tool_schemas(
-                runner,
-                auth_context=auth_context,
-                execution_surface=execution_surface,
-            )
+        process_tool_schemas, process_tool_scope_report = _process_scoped_tool_schemas(
+            runner,
+            auth_context=auth_context,
+            execution_surface=execution_surface,
+            subtask=subtask,
         )
         prompt = runner._prompts.build_executor_prompt(
             task=task,
@@ -813,6 +892,9 @@ async def run_subtask(
         )
         if retry_context:
             prompt = prompt + "\n\n" + retry_context
+        artifact_manifest = _artifact_manifest_prompt(task, workspace)
+        if artifact_manifest:
+            prompt = prompt + "\n\n" + artifact_manifest
 
         # 2. Select model
         effective_tier = model_tier if model_tier is not None else subtask.model_tier
@@ -853,12 +935,15 @@ async def run_subtask(
         )
         canonical_deliverable_set = set(canonical_deliverables)
         one_shot_direct_deliverable_mode = (
-            bool(canonical_deliverables)
-            and not normalized_allowed_output_prefixes
+            bool(canonical_deliverables) and not normalized_allowed_output_prefixes
         )
-        normalized_retry_strategy = str(
-            getattr(retry_strategy, "value", retry_strategy) or "",
-        ).strip().lower()
+        normalized_retry_strategy = (
+            str(
+                getattr(retry_strategy, "value", retry_strategy) or "",
+            )
+            .strip()
+            .lower()
+        )
         completion_lock_enabled = bool(canonical_deliverables) and (
             one_shot_direct_deliverable_mode
             or normalized_retry_strategy
@@ -881,6 +966,7 @@ async def run_subtask(
         last_model_failure_metadata: dict[str, Any] = {}
         last_model_failure_reason_code = ""
         checkpoint_instruction_sent = False
+        convergence_instruction_sent = False
         emergency_degraded_fit_count = 0
 
         for iteration in range(iteration_budget):
@@ -910,33 +996,80 @@ async def run_subtask(
                 ),
                 iteration_budget,
             )
+            raw_acceptance_criteria = getattr(subtask, "acceptance_criteria", []) or []
+            acceptance_text = (
+                str(raw_acceptance_criteria)
+                if isinstance(raw_acceptance_criteria, str)
+                else " ".join(str(item or "") for item in raw_acceptance_criteria)
+            )
+            subtask_scope_text = " ".join(
+                [
+                    str(getattr(subtask, "description", "") or ""),
+                    acceptance_text,
+                ]
+            ).lower()
+            exploration_heavy = any(
+                marker in subtask_scope_text
+                for marker in (
+                    "research",
+                    "evidence",
+                    "analyze",
+                    "investigate",
+                    "compare",
+                    "source",
+                )
+            )
+            convergence_iteration = max(2, int(iteration_budget * 0.6))
+            if (
+                exploration_heavy
+                and iteration >= convergence_iteration
+                and not convergence_instruction_sent
+                and not completion_only_after_deliverables
+            ):
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "RESEARCH CONVERGENCE CHECKPOINT: inventory the acceptance "
+                            "criteria and evidence already collected. Stop broad discovery. "
+                            "Use another tool only for a specific uncovered requirement; "
+                            "otherwise synthesize the strongest supported result now, with "
+                            "uncertainty and remaining gaps stated explicitly."
+                        ),
+                    }
+                )
+                convergence_instruction_sent = True
             if (
                 remaining_iterations <= checkpoint_reserve
                 and not checkpoint_instruction_sent
                 and not completion_only_after_deliverables
             ):
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        "EXECUTION BUDGET CHECKPOINT: only "
-                        f"{remaining_iterations} model/tool turn(s) remain in this pass. "
-                        "Stop broad exploration. Reuse current evidence and artifacts. "
-                        "Either complete the smallest remaining deliverable work now, or "
-                        "return a concise partial completion contract that names exact "
-                        "remaining targets so Loom can continue from this checkpoint."
-                    ),
-                })
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "EXECUTION BUDGET CHECKPOINT: only "
+                            f"{remaining_iterations} model/tool turn(s) remain in this pass. "
+                            "Stop broad exploration. Reuse current evidence and artifacts. "
+                            "Either complete the smallest remaining deliverable work now, or "
+                            "return a concise partial completion contract that names exact "
+                            "remaining targets so Loom can continue from this checkpoint."
+                        ),
+                    }
+                )
                 checkpoint_instruction_sent = True
             if completion_only_after_deliverables and not completion_only_instruction_sent:
-                session.messages.append({
-                    "role": "user",
-                    "content": (
-                        "CANONICAL DELIVERABLE WRITE COMPLETE: all required deliverables "
-                        "for this subtask have already been written once. Do not call "
-                        "more tools or modify files. Respond with your final completion "
-                        "message only."
-                    ),
-                })
+                session.messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "CANONICAL DELIVERABLE WRITE COMPLETE: all required deliverables "
+                            "for this subtask have already been written once. Do not call "
+                            "more tools or modify files. Respond with your final completion "
+                            "message only."
+                        ),
+                    }
+                )
                 completion_only_instruction_sent = True
             if completion_only_after_deliverables:
                 tool_schemas = []
@@ -955,20 +1088,20 @@ async def run_subtask(
             )
             runner._last_compaction_diagnostics = compaction_diagnostics
             if tool_schemas and runner._runner_compaction_mode() != "off":
-                tool_schemas, tool_schema_prune_report = (
-                    runner._prune_tool_schemas_for_request_fit(
-                        session.messages,
-                        tool_schemas,
-                    )
+                tool_schemas, tool_schema_prune_report = runner._prune_tool_schemas_for_request_fit(
+                    session.messages,
+                    tool_schemas,
                 )
                 if isinstance(tool_schema_prune_report, dict):
                     diagnostics = dict(getattr(runner, "_last_compaction_diagnostics", {}))
-                    diagnostics.update({
-                        "compaction_tool_schema_pruned": bool(
-                            tool_schema_prune_report.get("applied", False),
-                        ),
-                        "compaction_tool_schema_prune_report": tool_schema_prune_report,
-                    })
+                    diagnostics.update(
+                        {
+                            "compaction_tool_schema_pruned": bool(
+                                tool_schema_prune_report.get("applied", False),
+                            ),
+                            "compaction_tool_schema_prune_report": tool_schema_prune_report,
+                        }
+                    )
                     if bool(tool_schema_prune_report.get("applied", False)):
                         applied_stages = list(
                             diagnostics.get("compaction_applied_stages", []),
@@ -1009,13 +1142,12 @@ async def run_subtask(
             terminal_state = _context_terminal_state(
                 dict(getattr(runner, "_last_compaction_diagnostics", {})),
             )
-            if (
-                terminal_state == "degraded_fit"
-                and bool(process_tool_scope_report.get("applied", False))
+            if terminal_state == "degraded_fit" and bool(
+                process_tool_scope_report.get("applied", False)
             ):
                 emergency_degraded_fit_count += 1
-            if emergency_degraded_fit_count >= 2:
-                last_model_failure_reason_code = "runner_repeated_degraded_fit"
+            if emergency_degraded_fit_count >= 1:
+                last_model_failure_reason_code = "runner_degraded_fit_checkpoint_required"
                 last_model_failure_metadata = {
                     "checkpoint_required": True,
                     "degraded_fit_count": emergency_degraded_fit_count,
@@ -1025,7 +1157,7 @@ async def run_subtask(
                     "recovery_action": "checkpoint_continue_with_fresh_context",
                 }
                 session.interruption_reason = (
-                    "Context entered emergency degraded-fit more than once. "
+                    "Context entered emergency degraded-fit. "
                     "Preserve the current artifacts and evidence, then continue the "
                     "smallest unfinished work from a fresh semantic checkpoint."
                 )
@@ -1043,17 +1175,18 @@ async def run_subtask(
             compaction_diagnostics = dict(
                 getattr(runner, "_last_compaction_diagnostics", {}),
             )
-            if (
-                _model_enforces_context_window(model)
-                and _is_disabled_unfit_context(compaction_diagnostics)
+            if _model_enforces_context_window(model) and _is_disabled_unfit_context(
+                compaction_diagnostics
             ):
-                session.messages, tool_schemas, compaction_diagnostics = (
-                    await _try_emergency_context_rescue(
-                        runner,
-                        messages=session.messages,
-                        tool_schemas=tool_schemas,
-                        remaining_seconds=remaining_seconds,
-                    )
+                (
+                    session.messages,
+                    tool_schemas,
+                    compaction_diagnostics,
+                ) = await _try_emergency_context_rescue(
+                    runner,
+                    messages=session.messages,
+                    tool_schemas=tool_schemas,
+                    remaining_seconds=remaining_seconds,
                 )
                 messages = session.messages
                 runner._emit_compaction_policy_decision_from_diagnostics(
@@ -1089,8 +1222,7 @@ async def run_subtask(
                         "message_count": int(request_payload.get("message_count", 0) or 0),
                         "tool_count": int(request_payload.get("tool_count", 0) or 0),
                         "compaction_policy_mode": str(
-                            compaction_diagnostics.get("compaction_policy_mode", "")
-                            or "",
+                            compaction_diagnostics.get("compaction_policy_mode", "") or "",
                         ),
                         "compaction_policy_mode_configured": str(
                             compaction_diagnostics.get(
@@ -1101,8 +1233,7 @@ async def run_subtask(
                         ),
                         "compaction_terminal_state": "unfit",
                         "compaction_pressure_ratio": float(
-                            compaction_diagnostics.get("compaction_pressure_ratio", 0.0)
-                            or 0.0,
+                            compaction_diagnostics.get("compaction_pressure_ratio", 0.0) or 0.0,
                         ),
                         "compaction_skipped_reason": str(
                             compaction_diagnostics.get(
@@ -1332,9 +1463,7 @@ async def run_subtask(
                         "retry_queue_remaining": remaining,
                         "error_type": type(error).__name__,
                         "error": str(error),
-                        "overflow_error_detected": (
-                            runner._is_model_request_overflow_error(error)
-                        ),
+                        "overflow_error_detected": (runner._is_model_request_overflow_error(error)),
                         "overflow_fallback_attempted": overflow_fallback_attempted,
                         **error_metadata,
                         **build_model_retry_event_payload(
@@ -1387,9 +1516,7 @@ async def run_subtask(
             if session.interruption_reason:
                 break
             if session.response is None:
-                session.interruption_reason = (
-                    "Execution ended before receiving a model response."
-                )
+                session.interruption_reason = "Execution ended before receiving a model response."
                 break
 
             if session.response.has_tool_calls():
@@ -1406,29 +1533,35 @@ async def run_subtask(
                     ),
                 )
                 if not validation.valid:
-                    messages.append({
-                        "role": "assistant",
-                        "content": session.response.text or "",
-                    })
-                    messages.append({
-                        "role": "system",
-                        "content": (
-                            f"TOOL CALL ERROR: {validation.error}\n"
-                            f"{validation.suggestion}\n"
-                            "Please retry with valid tool calls."
-                        ),
-                    })
+                    messages.append(
+                        {
+                            "role": "assistant",
+                            "content": session.response.text or "",
+                        }
+                    )
+                    messages.append(
+                        {
+                            "role": "system",
+                            "content": (
+                                f"TOOL CALL ERROR: {validation.error}\n"
+                                f"{validation.suggestion}\n"
+                                "Please retry with valid tool calls."
+                            ),
+                        }
+                    )
                     continue
 
                 # Process validated tool calls
                 compact_tool_calls = await runner._serialize_tool_calls_for_message(
                     session.response.tool_calls or []
                 )
-                messages.append({
-                    "role": "assistant",
-                    "content": session.response.text or "",
-                    "tool_calls": compact_tool_calls,
-                })
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": session.response.text or "",
+                        "tool_calls": compact_tool_calls,
+                    }
+                )
 
                 for tc in session.response.tool_calls:
                     if not await runner._wait_for_task_control_window(task):
@@ -1445,8 +1578,11 @@ async def run_subtask(
                         )
                     )
                     runner._emit_tool_event(
-                        TOOL_CALL_STARTED, task.id, subtask.id,
-                        resolved_tool_name, resolved_tool_args,
+                        TOOL_CALL_STARTED,
+                        task.id,
+                        subtask.id,
+                        resolved_tool_name,
+                        resolved_tool_args,
                     )
                     tool_call_id = str(getattr(tc, "id", "") or "")
                     tool_obj = runner._tools.get(resolved_tool_name)
@@ -1464,11 +1600,7 @@ async def run_subtask(
                     runner._increment_subtask_counter("tool_calls")
                     if is_mutating_tool:
                         runner._increment_subtask_counter("mutating_tool_calls")
-                    if (
-                        completion_only_after_deliverables
-                        and is_mutating_tool
-                        and attempted_paths
-                    ):
+                    if completion_only_after_deliverables and is_mutating_tool and attempted_paths:
                         policy_error = (
                             "reason_code=forbidden_output_path; "
                             "Canonical deliverable completion violation: "
@@ -1495,10 +1627,7 @@ async def run_subtask(
                                 else None
                             ),
                         )
-                    if (
-                        policy_error
-                        and runner._is_forbidden_output_path_error(policy_error)
-                    ):
+                    if policy_error and runner._is_forbidden_output_path_error(policy_error):
                         sanitized_args, suppressed_keys = (
                             runner_tool_routing.suppress_optional_output_side_effects(
                                 tool_name=resolved_tool_name,
@@ -1532,11 +1661,13 @@ async def run_subtask(
                                     is_mutating_tool=is_mutating_tool,
                                     mutation_target_arg_keys=mutation_target_arg_keys,
                                 )
-                                route_metadata.update({
-                                    "optional_output_side_effects_suppressed": True,
-                                    "suppressed_argument_keys": suppressed_keys,
-                                    "suppression_reason": "canonical_output_policy",
-                                })
+                                route_metadata.update(
+                                    {
+                                        "optional_output_side_effects_suppressed": True,
+                                        "suppressed_argument_keys": suppressed_keys,
+                                        "suppression_reason": "canonical_output_policy",
+                                    }
+                                )
                                 policy_error = None
                     if not policy_error:
                         policy_error = runner._validate_sealed_artifact_mutation_policy(
@@ -1598,47 +1729,38 @@ async def run_subtask(
                                 ledger_entry = None
                             if (
                                 isinstance(ledger_entry, dict)
-                                and str(ledger_entry.get("status", "")).strip().lower()
-                                == "success"
+                                and str(ledger_entry.get("status", "")).strip().lower() == "success"
                             ):
                                 tool_result = ToolResult.from_json(
                                     str(ledger_entry.get("result_json", "") or ""),
                                 )
                                 deduped = True
                                 runner._emit_telemetry_event(
-                                        event_type=TOOL_CALL_DEDUPLICATED,
-                                        task_id=task.id,
-                                        data={
-                                            "subtask_id": subtask.id,
-                                            "tool": resolved_tool_name,
-                                            "tool_call_id": tool_call_id,
-                                            "idempotency_key": idempotency_key,
-                                            "run_id": runner._normalize_run_id(task),
+                                    event_type=TOOL_CALL_DEDUPLICATED,
+                                    task_id=task.id,
+                                    data={
+                                        "subtask_id": subtask.id,
+                                        "tool": resolved_tool_name,
+                                        "tool_call_id": tool_call_id,
+                                        "idempotency_key": idempotency_key,
+                                        "run_id": runner._normalize_run_id(task),
                                     },
                                 )
-                        if (
-                            is_mutating_tool
-                            and not deduped
-                            and guard_mode != "off"
-                        ):
+                        if is_mutating_tool and not deduped and guard_mode != "off":
                             pre_call_seal_hashes = runner._snapshot_tracked_artifact_hashes(
                                 task=task,
                                 workspace=workspace,
                             )
                         execute_args = dict(resolved_tool_args)
-                        if (
-                            resolved_tool_name == "ask_user"
-                            and not runner._tools.has(
-                                "ask_user",
-                                execution_surface=execution_surface,
-                            )
+                        if resolved_tool_name == "ask_user" and not runner._tools.has(
+                            "ask_user",
+                            execution_surface=execution_surface,
                         ):
                             tool_result = runner._ask_user_limit_error(
                                 "ask_user is unavailable for this execution surface.",
                             )
                         elif (
-                            resolved_tool_name == "ask_user"
-                            and runner._ask_user_runtime_enabled()
+                            resolved_tool_name == "ask_user" and runner._ask_user_runtime_enabled()
                         ):
                             now = time.monotonic()
                             if (
@@ -1651,13 +1773,11 @@ async def run_subtask(
                             elif (
                                 session.last_ask_user_requested_at > 0
                                 and runner._ask_user_min_seconds_between_questions > 0
-                                and (
-                                    now - session.last_ask_user_requested_at
-                                ) < runner._ask_user_min_seconds_between_questions
+                                and (now - session.last_ask_user_requested_at)
+                                < runner._ask_user_min_seconds_between_questions
                             ):
-                                wait_seconds = (
-                                    runner._ask_user_min_seconds_between_questions
-                                    - (now - session.last_ask_user_requested_at)
+                                wait_seconds = runner._ask_user_min_seconds_between_questions - (
+                                    now - session.last_ask_user_requested_at
                                 )
                                 tool_result = runner._ask_user_limit_error(
                                     "ask_user called too quickly "
@@ -1709,8 +1829,7 @@ async def run_subtask(
                                         if isinstance(row, dict)
                                     }
                                     has_same_pending_question = bool(
-                                        request.question_id
-                                        and request.question_id in pending_ids
+                                        request.question_id and request.question_id in pending_ids
                                     )
                                     if (
                                         runner._ask_user_max_pending_per_task > 0
@@ -1728,6 +1847,7 @@ async def run_subtask(
                                             subtask=subtask,
                                             request=request,
                                         )
+
                                         def _check_task_control() -> str:
                                             return runner._task_status_text(task)
 
@@ -1744,9 +1864,13 @@ async def run_subtask(
                                                 question_id=request.question_id,
                                             )
                                         answer_payload = answer.to_payload()
-                                        answer_status = str(
-                                            getattr(answer.status, "value", answer.status),
-                                        ).strip().lower()
+                                        answer_status = (
+                                            str(
+                                                getattr(answer.status, "value", answer.status),
+                                            )
+                                            .strip()
+                                            .lower()
+                                        )
                                         if (
                                             answer_status == "timeout"
                                             and runner._ask_user_policy == "fail_closed"
@@ -1788,7 +1912,7 @@ async def run_subtask(
                                         )
                         elif not deduped:
                             read_cache_key = ""
-                            if resolved_tool_name == "read_file":
+                            if resolved_tool_name in {"read_artifact", "read_file"}:
                                 read_cache_key = (
                                     f"{resolved_tool_name}:"
                                     f"{runner._stable_json_digest(resolved_tool_args)}"
@@ -1840,7 +1964,8 @@ async def run_subtask(
                                 )
                             if not deduped:
                                 tool_result = await runner._tools.execute(
-                                    resolved_tool_name, execute_args,
+                                    resolved_tool_name,
+                                    execute_args,
                                     workspace=workspace,
                                     read_roots=read_roots,
                                     read_path_map=read_path_map,
@@ -1852,8 +1977,11 @@ async def run_subtask(
                                 )
                                 if (
                                     read_cache_key
-                                    and resolved_tool_name == "read_file"
-                                    and tool_result.success
+                                    and resolved_tool_name in {"read_artifact", "read_file"}
+                                    and (
+                                        tool_result.success
+                                        or _is_missing_artifact_failure(tool_result.error)
+                                    )
                                 ):
                                     session.read_only_result_cache[read_cache_key] = (
                                         ToolResult.from_json(tool_result.to_json())
@@ -1866,23 +1994,15 @@ async def run_subtask(
                                     terminal_error = str(
                                         tool_result.error or "access denied",
                                     )
-                                    session.exhausted_web_targets[web_target_key] = (
-                                        terminal_error
-                                    )
+                                    session.exhausted_web_targets[web_target_key] = terminal_error
                                     task_exhausted_targets[web_target_key] = terminal_error
                         if route_metadata:
                             route_data = (
-                                dict(tool_result.data)
-                                if isinstance(tool_result.data, dict)
-                                else {}
+                                dict(tool_result.data) if isinstance(tool_result.data, dict) else {}
                             )
                             route_data.update(route_metadata)
                             tool_result.data = route_data
-                        if (
-                            is_mutating_tool
-                            and not deduped
-                            and tool_result.success
-                        ):
+                        if is_mutating_tool and not deduped and tool_result.success:
                             session.read_only_result_cache.clear()
                             unexpected_paths: list[str] = []
                             if guard_mode != "off":
@@ -1946,12 +2066,14 @@ async def run_subtask(
                                     if isinstance(tool_result.data, dict)
                                     else {}
                                 )
-                                guard_data.update({
-                                    "sealed_unexpected_mutation_detected": True,
-                                    "unexpected_paths": list(unexpected_paths),
-                                    "guard_mode": guard_mode,
-                                    "event_type": SEALED_UNEXPECTED_MUTATION_DETECTED,
-                                })
+                                guard_data.update(
+                                    {
+                                        "sealed_unexpected_mutation_detected": True,
+                                        "unexpected_paths": list(unexpected_paths),
+                                        "guard_mode": guard_mode,
+                                        "event_type": SEALED_UNEXPECTED_MUTATION_DETECTED,
+                                    }
+                                )
                                 tool_result = ToolResult(
                                     success=False,
                                     output="",
@@ -2019,9 +2141,7 @@ async def run_subtask(
                             tool_result.data = data
                     if completion_lock_enabled and is_mutating_tool and tool_result.success:
                         touched_paths = [
-                            path
-                            for path in attempted_paths
-                            if path in canonical_deliverable_set
+                            path for path in attempted_paths if path in canonical_deliverable_set
                         ]
                         if touched_paths:
                             touched_canonical_deliverables.update(touched_paths)
@@ -2032,8 +2152,11 @@ async def run_subtask(
                     if not tool_result.success:
                         runner._increment_subtask_counter("tool_failures")
                     runner._emit_tool_event(
-                        TOOL_CALL_COMPLETED, task.id, subtask.id,
-                        resolved_tool_name, resolved_tool_args,
+                        TOOL_CALL_COMPLETED,
+                        task.id,
+                        subtask.id,
+                        resolved_tool_name,
+                        resolved_tool_args,
                         result=tool_result,
                         workspace=workspace,
                     )
@@ -2051,52 +2174,65 @@ async def run_subtask(
                         tool_args=resolved_tool_args,
                         result=tool_result,
                     )
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tc.id,
-                        "content": await runner._serialize_tool_result_for_model(
-                            resolved_tool_name, tool_result,
-                        ),
-                    })
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": await runner._serialize_tool_result_for_model(
+                                resolved_tool_name,
+                                tool_result,
+                            ),
+                        }
+                    )
                 if session.interruption_reason:
                     break
 
                 # Anti-amnesia reminder
                 if not completion_only_after_deliverables:
-                    messages.append({
-                        # Some OpenAI-compatible providers reject repeated in-thread
-                        # system messages during tool-call loops.
-                        "role": "user",
-                        "content": runner._build_todo_reminder(task, subtask),
-                    })
+                    messages.append(
+                        {
+                            # Some OpenAI-compatible providers reject repeated in-thread
+                            # system messages during tool-call loops.
+                            "role": "user",
+                            "content": runner._build_todo_reminder(task, subtask),
+                        }
+                    )
             else:
                 # Text-only response. Depending on configured mode, require
                 # explicit completion contract payload before termination.
-                mode = str(
-                    getattr(
-                        runner,
-                        "_executor_completion_contract_mode",
-                        runner.EXECUTOR_COMPLETION_CONTRACT_MODE,
-                    ),
-                ).strip().lower()
+                mode = (
+                    str(
+                        getattr(
+                            runner,
+                            "_executor_completion_contract_mode",
+                            runner.EXECUTOR_COMPLETION_CONTRACT_MODE,
+                        ),
+                    )
+                    .strip()
+                    .lower()
+                )
                 if mode in {"warn", "enforce"}:
                     valid_contract, contract_error = runner._validate_completion_contract(
                         session.response.text or "",
                     )
                     if not valid_contract and mode == "enforce":
-                        messages.append({
-                            "role": "assistant",
-                            "content": session.response.text or "",
-                        })
-                        messages.append({
-                            "role": "system",
-                            "content": (
-                                "COMPLETION CONTRACT ERROR: "
-                                f"{contract_error}\n"
-                                "Respond with a JSON object containing keys: "
-                                "status, deliverables_touched, verification_notes."
-                            ),
-                        })
+                        messages.append(
+                            {
+                                "role": "assistant",
+                                "content": session.response.text or "",
+                            }
+                        )
+                        messages.append(
+                            {
+                                "role": "system",
+                                "content": (
+                                    "COMPLETION CONTRACT ERROR: "
+                                    f"{contract_error}\n"
+                                    "Respond with a JSON object containing keys: "
+                                    "status, deliverables_touched, verification_notes."
+                                ),
+                            }
+                        )
                         continue
                     if not valid_contract and mode == "warn":
                         runner._emit_model_event(
@@ -2121,16 +2257,10 @@ async def run_subtask(
 
         if session.interruption_reason is None and not session.completed_normally:
             if session.response is None:
-                session.interruption_reason = (
-                    "Execution ended before receiving a model response."
-                )
+                session.interruption_reason = "Execution ended before receiving a model response."
 
         elapsed = time.monotonic() - start_time
-        model_output = (
-            session.response.text
-            if session.response and session.response.text
-            else ""
-        )
+        model_output = session.response.text if session.response and session.response.text else ""
         model_output_clean = runner._strip_tool_call_placeholders(model_output)
         if session.interruption_reason:
             if model_output_clean:
@@ -2151,9 +2281,7 @@ async def run_subtask(
                     model_output = session.budget_exhaustion_note
             contract_mismatch = runner._completion_contract_mutation_mismatch(
                 response_text=(
-                    session.response.text
-                    if session.response and session.response.text
-                    else ""
+                    session.response.text if session.response and session.response.text else ""
                 ),
                 tool_calls=tool_calls_record,
                 workspace=workspace,
@@ -2191,10 +2319,7 @@ async def run_subtask(
         )
 
         if session.interruption_reason:
-            reason_code = (
-                last_model_failure_reason_code
-                or "model_invocation_failed"
-            )
+            reason_code = last_model_failure_reason_code or "model_invocation_failed"
             metadata = dict(last_model_failure_metadata)
             if reason_code in {
                 ModelEmptyResponseError.reason_code,
@@ -2209,19 +2334,17 @@ async def run_subtask(
                 tier=1,
                 passed=False,
                 confidence=0.0,
-                checks=[Check(
-                    name="execution_completed",
-                    passed=False,
-                    detail=session.interruption_reason,
-                )],
+                checks=[
+                    Check(
+                        name="execution_completed",
+                        passed=False,
+                        detail=session.interruption_reason,
+                    )
+                ],
                 feedback=session.interruption_reason,
                 outcome="fail",
                 reason_code=reason_code,
-                severity_class=(
-                    "infra"
-                    if reason_code in _INFRA_MODEL_REASON_CODES
-                    else ""
-                ),
+                severity_class=("infra" if reason_code in _INFRA_MODEL_REASON_CODES else ""),
                 metadata=metadata,
             )
             runner._spawn_memory_extraction(task.id, subtask.id, result)
@@ -2233,11 +2356,13 @@ async def run_subtask(
                 tier=1,
                 passed=False,
                 confidence=0.0,
-                checks=[Check(
-                    name="runner_budget_checkpoint",
-                    passed=False,
-                    detail=session.budget_exhaustion_note,
-                )],
+                checks=[
+                    Check(
+                        name="runner_budget_checkpoint",
+                        passed=False,
+                        detail=session.budget_exhaustion_note,
+                    )
+                ],
                 feedback=(
                     f"{session.budget_exhaustion_note} Preserve existing artifacts and "
                     "continue only the exact unfinished work from this checkpoint."

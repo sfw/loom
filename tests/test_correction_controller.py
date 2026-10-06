@@ -99,6 +99,62 @@ class TestHistoricalFailureReplay:
         assert decision.handler == CorrectionHandler.RETRY_VERIFICATION
         assert decision.actions[0].action_type == "rerun_verifier"
 
+    async def test_missing_quality_assessment_retries_only_verification(
+        self,
+        correction_runtime,
+    ):
+        _database, _memory, controller, _events = correction_runtime
+        verification = VerificationResult(
+            tier=2,
+            passed=False,
+            outcome="fail",
+            reason_code="quality_assessment_missing",
+            severity_class="infra",
+            feedback="Verifier omitted the structured quality assessment.",
+        )
+
+        decision = await controller.record_failure(
+            task_id="task-1",
+            run_id="run-1",
+            subtask_id="synthesis",
+            result=_result(),
+            verification=verification,
+        )
+
+        assert decision.repairability == Repairability.AUTOMATIC
+        assert decision.handler == CorrectionHandler.RETRY_VERIFICATION
+        assert decision.actions[0].action_type == "rerun_verifier"
+
+    async def test_missing_fact_checker_verdicts_reroute_to_execution_source_lane(
+        self,
+        correction_runtime,
+    ):
+        _database, _memory, controller, _events = correction_runtime
+        verification = VerificationResult(
+            tier=2,
+            passed=False,
+            outcome="fail",
+            reason_code="required_verifier_empty",
+            severity_class="semantic",
+            feedback="Required claim-level verdicts were not produced.",
+            metadata={
+                "required_tool": "fact_checker",
+                "missing_targets": ["claim verdicts"],
+            },
+        )
+
+        decision = await controller.record_failure(
+            task_id="task-1",
+            run_id="run-1",
+            subtask_id="synthesis",
+            result=_result(),
+            verification=verification,
+        )
+
+        assert decision.handler == CorrectionHandler.SOURCE_FALLBACK
+        assert decision.actions[0].action_type == "change_tool_or_source_method"
+        assert decision.blockers[0].code == "required_fact_checker_empty"
+
     async def test_csv_mismatch_routes_to_bounded_schema_repair(
         self,
         correction_runtime,
@@ -144,6 +200,33 @@ class TestHistoricalFailureReplay:
         assert "edit the existing structured output in place" in (
             decision.actions[0].arguments["guardrails"]
         )
+
+    async def test_quality_floor_miss_routes_to_bounded_contract_repair(
+        self,
+        correction_runtime,
+    ):
+        _database, _memory, controller, _events = correction_runtime
+        verification = VerificationResult(
+            tier=2,
+            passed=False,
+            outcome="fail",
+            reason_code="quality_below_threshold",
+            severity_class="semantic",
+            feedback="The synthesis lacks analytical depth.",
+            metadata={"missing_targets": ["analytical depth"]},
+        )
+
+        decision = await controller.record_failure(
+            task_id="task-1",
+            run_id="run-1",
+            subtask_id="synthesis",
+            result=_result(),
+            verification=verification,
+        )
+
+        assert decision.repairability == Repairability.AUTOMATIC
+        assert decision.handler == CorrectionHandler.CONTRACT_REPAIR
+        assert decision.blockers[0].code == "quality_below_threshold"
 
     async def test_mixed_failed_checks_are_classified_in_one_pass(
         self,

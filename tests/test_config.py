@@ -110,6 +110,7 @@ class TestDefaultConfig:
         assert config.verification.resilience_policy_mode == "enforce"
         assert config.verification.resilience_profile_confidence_threshold == 0.65
         assert config.verification.resilience_no_progress_attempts == 2
+        assert config.verification.quality_policy_mode == "enforce"
 
     def test_default_telemetry(self):
         config = Config()
@@ -524,6 +525,7 @@ contradiction_scan_min_files_for_sufficiency = 4
 resilience_policy_mode = "shadow"
 resilience_profile_confidence_threshold = 0.72
 resilience_no_progress_attempts = 3
+quality_policy_mode = "assist"
 """)
         config = load_config(toml_file)
         assert config.verification.policy_engine_enabled is False
@@ -549,6 +551,7 @@ resilience_no_progress_attempts = 3
         assert config.verification.resilience_policy_mode == "shadow"
         assert config.verification.resilience_profile_confidence_threshold == 0.72
         assert config.verification.resilience_no_progress_attempts == 3
+        assert config.verification.quality_policy_mode == "assist"
 
     def test_verification_contradiction_scan_values_are_clamped_and_safe(self, tmp_path: Path):
         toml_file = tmp_path / "loom.toml"
@@ -563,6 +566,7 @@ contradiction_scan_min_files_for_sufficiency = 999
 resilience_policy_mode = "invalid"
 resilience_profile_confidence_threshold = 5
 resilience_no_progress_attempts = 1
+quality_policy_mode = "invalid"
 """)
         config = load_config(toml_file)
         assert config.verification.contradiction_guard_strict_coverage is True
@@ -578,6 +582,7 @@ resilience_no_progress_attempts = 1
         assert config.verification.resilience_policy_mode == "enforce"
         assert config.verification.resilience_profile_confidence_threshold == 1.0
         assert config.verification.resilience_no_progress_attempts == 2
+        assert config.verification.quality_policy_mode == "enforce"
 
     def test_process_flags_loaded(self, tmp_path: Path):
         toml_file = tmp_path / "loom.toml"
@@ -899,3 +904,14 @@ enable_artifact_telemetry_events = false
 """)
         config = load_config(toml_file)
         assert config.limits.runner.enable_artifact_telemetry_events is False
+
+    def test_loads_global_model_backpressure_controls(self, tmp_path: Path):
+        toml_file = tmp_path / "loom.toml"
+        toml_file.write_text("""\
+[execution]
+model_call_global_max_concurrency = 2
+model_call_backpressure_cooldown_seconds = 7.5
+""")
+        config = load_config(toml_file)
+        assert config.execution.model_call_global_max_concurrency == 2
+        assert config.execution.model_call_backpressure_cooldown_seconds == 7.5

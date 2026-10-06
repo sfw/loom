@@ -406,6 +406,41 @@ class TestRetryManager:
         assert "TARGETED RETRY PLAN" in context
         assert "Resolve verification findings" in context
 
+    def test_build_retry_context_targets_missing_fact_checker_verdicts(self):
+        context = RetryManager().build_retry_context([
+            AttemptRecord(
+                attempt=1,
+                tier=2,
+                feedback="Required claim verdicts are missing.",
+                retry_strategy=RetryStrategy.UNCONFIRMED_DATA,
+                reason_code="required_verifier_empty",
+                missing_targets=["material claim verdicts"],
+            ),
+        ])
+
+        assert "TARGETED CLAIM-GROUNDING RETRY" in context
+        assert "required fact-check tool" in context
+        assert "material claim verdicts" in context
+        assert "do not restart broad research" in context.lower()
+
+    def test_build_retry_context_targets_quality_gaps_without_restarting(self):
+        context = RetryManager().build_retry_context([
+            AttemptRecord(
+                attempt=1,
+                tier=2,
+                feedback="Quality floor missed.",
+                retry_strategy=RetryStrategy.CONTRACT_REPAIR,
+                reason_code="quality_below_threshold",
+                missing_targets=["analytical depth", "implementation roadmap"],
+            ),
+        ])
+
+        assert "TARGETED QUALITY REVISION" in context
+        assert "analytical depth" in context
+        assert "implementation roadmap" in context
+        assert "do not compress" in context.lower()
+        assert "re-audit all required components" in context.lower()
+
     def test_build_retry_context_includes_capability_unavailable_plan(self):
         mgr = RetryManager()
         attempts = [

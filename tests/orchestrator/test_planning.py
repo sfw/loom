@@ -9,6 +9,11 @@ import pytest
 
 from loom.config import Config, ExecutionConfig, LimitsConfig, RunnerLimitsConfig
 from loom.engine.orchestrator import Orchestrator, SubtaskResult
+from loom.engine.orchestrator.planning import (
+    _format_input_capability_manifest,
+    _normalize_native_reader_probe_subtasks,
+    _preflight_attached_inputs,
+)
 from loom.engine.verification import VerificationResult
 from loom.events.types import (
     ASK_USER_ANSWERED,
@@ -36,6 +41,7 @@ from loom.events.types import (
 from loom.models.base import ModelResponse, TokenUsage
 from loom.models.router import ModelRouter
 from loom.state.task_state import Plan, Subtask, SubtaskStatus, TaskStatus
+from loom.tools.registry import ToolResult
 from tests.orchestrator.conftest import (
     _make_config,
     _make_event_bus,
@@ -50,6 +56,69 @@ from tests.orchestrator.conftest import (
 
 class TestOrchestratorPlan:
     """Tests for the planning phase."""
+
+    @pytest.mark.asyncio
+    async def test_attached_input_preflight_uses_native_read_file(self, tmp_path):
+        source = tmp_path / "resume.pdf"
+        source.write_bytes(b"%PDF-test")
+        tools = _make_mock_tools()
+        tools.execute.return_value = ToolResult.ok(
+            "resume text",
+            data={"type": "pdf", "pages": 2},
+        )
+        orchestrator = MagicMock()
+        orchestrator._tools = tools
+
+        entries = await _preflight_attached_inputs(
+            orchestrator,
+            workspace_path=tmp_path,
+            read_roots=[tmp_path],
+            read_path_map={"resume.pdf": source},
+            auth_context=None,
+        )
+
+        assert entries == [{
+            "path": "resume.pdf",
+            "extension": ".pdf",
+            "exists": True,
+            "readable": True,
+            "reader": "read_file",
+            "size_bytes": len(b"%PDF-test"),
+            "text_extractable": True,
+            "extracted_chars": len("resume text"),
+            "pages": 2,
+        }]
+        manifest = _format_input_capability_manifest(entries)
+        assert "do not create a capability-probe subtask" in manifest
+        assert "resume.pdf: readable, reader=read_file, text_extractable=true" in manifest
+        tools.execute.assert_awaited_once()
+
+    def test_native_reader_manifest_rewrites_redundant_capability_probe(self):
+        task = _make_task(goal="Prepare Tim for the interview")
+        task.metadata["input_capability_manifest"] = [{
+            "path": "resume.pdf",
+            "readable": True,
+            "reader": "read_file",
+        }]
+        plan = Plan(subtasks=[
+            Subtask(
+                id="inspect-capabilities",
+                description="Probe execution capabilities with pypdf and pdftotext.",
+                acceptance_criteria="Confirm PDF extraction commands.",
+                is_critical_path=True,
+            ),
+        ])
+
+        normalized_plan, changes = _normalize_native_reader_probe_subtasks(
+            task=task,
+            plan=plan,
+        )
+
+        assert changes[0]["normalization"] == "native_attachment_reader"
+        description = normalized_plan.subtasks[0].description
+        assert "Use `read_file` directly" in description
+        assert "resume.pdf" in description
+        assert "Do not probe shell binaries" in description
 
     @pytest.mark.asyncio
     async def test_plan_with_valid_json(self, tmp_path):

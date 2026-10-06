@@ -39,6 +39,28 @@ from tests.orchestrator.conftest import (
 
 
 class TestOrchestratorValidityPolicy:
+    def test_ad_hoc_research_synthesis_gets_validity_contract(self, tmp_path):
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text='{"subtasks": []}'),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=_make_state_manager(tmp_path),
+            event_bus=_make_event_bus(),
+            config=_make_config(),
+        )
+        subtask = Subtask(
+            id="final",
+            description="Synthesize research findings into a report",
+            is_synthesis=True,
+        )
+
+        contract = orch._default_validity_contract_for_subtask(subtask)
+
+        assert contract["enabled"] is True
+        assert contract["claim_extraction"]["enabled"] is True
+        assert contract["prune_mode"] == "rewrite_uncertainty"
+
     @pytest.mark.asyncio
     async def test_resume_reconciles_policy_and_prevents_silent_tier_downgrade(self, tmp_path):
         bus = _make_event_bus()
@@ -122,10 +144,7 @@ class TestOrchestratorValidityPolicy:
         assert restored.verification_tier == 3
         assert restored.model_tier == 2
         assert restored.validity_contract_hash
-        assert any(
-            event.event_type == SUBTASK_POLICY_RECONCILED
-            for event in events
-        )
+        assert any(event.event_type == SUBTASK_POLICY_RECONCILED for event in events)
 
     @pytest.mark.asyncio
     async def test_regression_guardrail_chain_degrades_invalid_final_synthesis(
@@ -159,10 +178,12 @@ class TestOrchestratorValidityPolicy:
             config=Config(execution=ExecutionConfig(max_subtask_retries=0)),
             process=process,
         )
-        orch._runner.run = AsyncMock(return_value=(
-            SubtaskResult(status="success", summary="should never run"),
-            VerificationResult(tier=3, passed=True, outcome="pass"),
-        ))
+        orch._runner.run = AsyncMock(
+            return_value=(
+                SubtaskResult(status="success", summary="should never run"),
+                VerificationResult(tier=3, passed=True, outcome="pass"),
+            )
+        )
 
         task = _make_task(goal="Resume regression guard")
         task.status = TaskStatus.FAILED
@@ -204,16 +225,12 @@ class TestOrchestratorValidityPolicy:
         assert result.get_subtask("final").status == SubtaskStatus.PARTIAL
         orch._runner.run.assert_not_awaited()
         gate_events = [
-            event for event in events
-            if event.event_type == SYNTHESIS_INPUT_GATE_DECISION
+            event for event in events if event.event_type == SYNTHESIS_INPUT_GATE_DECISION
         ]
         assert gate_events
         assert gate_events[-1].data.get("passed") is False
         assert gate_events[-1].data.get("unresolved_claim_count") == 1
-        assert any(
-            event.event_type == SUBTASK_POLICY_RECONCILED
-            for event in events
-        )
+        assert any(event.event_type == SUBTASK_POLICY_RECONCILED for event in events)
 
     @pytest.mark.asyncio
     async def test_synthesis_input_gate_blocks_when_only_unresolved_claims_exist(self, tmp_path):
@@ -258,10 +275,12 @@ class TestOrchestratorValidityPolicy:
             },
         )
         task.plan = Plan(subtasks=[subtask])
-        orch._runner.run = AsyncMock(return_value=(
-            SubtaskResult(status="success", summary="unexpected"),
-            VerificationResult(tier=2, passed=True, outcome="pass"),
-        ))
+        orch._runner.run = AsyncMock(
+            return_value=(
+                SubtaskResult(status="success", summary="unexpected"),
+                VerificationResult(tier=2, passed=True, outcome="pass"),
+            )
+        )
 
         _, result, verification = await orch._dispatch_subtask(task, subtask, {})
 
@@ -270,8 +289,7 @@ class TestOrchestratorValidityPolicy:
         assert verification.reason_code == "coverage_below_threshold"
         orch._runner.run.assert_not_awaited()
         gate_events = [
-            event for event in events
-            if event.event_type == SYNTHESIS_INPUT_GATE_DECISION
+            event for event in events if event.event_type == SYNTHESIS_INPUT_GATE_DECISION
         ]
         assert gate_events
         assert gate_events[-1].data.get("passed") is False
@@ -323,18 +341,19 @@ class TestOrchestratorValidityPolicy:
             },
         )
         task.plan = Plan(subtasks=[subtask])
-        orch._runner.run = AsyncMock(return_value=(
-            SubtaskResult(status="success", summary="synthesis completed"),
-            VerificationResult(tier=2, passed=True, outcome="pass"),
-        ))
+        orch._runner.run = AsyncMock(
+            return_value=(
+                SubtaskResult(status="success", summary="synthesis completed"),
+                VerificationResult(tier=2, passed=True, outcome="pass"),
+            )
+        )
 
         _, result, verification = await orch._dispatch_subtask(task, subtask, {})
 
         assert result.status == SubtaskResultStatus.SUCCESS
         assert verification.passed is True
         gate_events = [
-            event for event in events
-            if event.event_type == SYNTHESIS_INPUT_GATE_DECISION
+            event for event in events if event.event_type == SYNTHESIS_INPUT_GATE_DECISION
         ]
         assert gate_events
         assert gate_events[-1].data.get("policy_action") == "pass_with_warnings"
@@ -379,10 +398,12 @@ class TestOrchestratorValidityPolicy:
             },
         )
         task.plan = Plan(subtasks=[subtask])
-        orch._runner.run = AsyncMock(return_value=(
-            SubtaskResult(status="success", summary="unexpected"),
-            VerificationResult(tier=2, passed=True, outcome="pass"),
-        ))
+        orch._runner.run = AsyncMock(
+            return_value=(
+                SubtaskResult(status="success", summary="unexpected"),
+                VerificationResult(tier=2, passed=True, outcome="pass"),
+            )
+        )
 
         _, result, verification = await orch._dispatch_subtask(task, subtask, {})
 
@@ -391,8 +412,7 @@ class TestOrchestratorValidityPolicy:
         assert verification.reason_code == "required_verifier_missing"
         orch._runner.run.assert_awaited_once()
         gate_events = [
-            event for event in events
-            if event.event_type == SYNTHESIS_INPUT_GATE_DECISION
+            event for event in events if event.event_type == SYNTHESIS_INPUT_GATE_DECISION
         ]
         assert gate_events[-1].data.get("missing_required_claims") is True
         assert gate_events[-1].data.get("evidence_preflight_required") is True
@@ -447,18 +467,19 @@ class TestOrchestratorValidityPolicy:
             },
         )
         task.plan = Plan(subtasks=[subtask])
-        orch._runner.run = AsyncMock(return_value=(
-            SubtaskResult(status="success", summary="unexpected"),
-            VerificationResult(tier=2, passed=True, outcome="pass"),
-        ))
+        orch._runner.run = AsyncMock(
+            return_value=(
+                SubtaskResult(status="success", summary="unexpected"),
+                VerificationResult(tier=2, passed=True, outcome="pass"),
+            )
+        )
 
         _, result, verification = await orch._dispatch_subtask(task, subtask, {})
 
         assert result.status == SubtaskResultStatus.FAILED
         assert verification.passed is False
         gate_events = [
-            event for event in events
-            if event.event_type == SYNTHESIS_INPUT_GATE_DECISION
+            event for event in events if event.event_type == SYNTHESIS_INPUT_GATE_DECISION
         ]
         assert gate_events
         assert gate_events[-1].data.get("policy_action") == "retry_semantic"
@@ -511,10 +532,12 @@ class TestOrchestratorValidityPolicy:
             },
         )
         task.plan = Plan(subtasks=[subtask])
-        orch._runner.run = AsyncMock(return_value=(
-            SubtaskResult(status="success", summary="unexpected"),
-            VerificationResult(tier=2, passed=True, outcome="pass"),
-        ))
+        orch._runner.run = AsyncMock(
+            return_value=(
+                SubtaskResult(status="success", summary="unexpected"),
+                VerificationResult(tier=2, passed=True, outcome="pass"),
+            )
+        )
 
         _, result, verification = await orch._dispatch_subtask(task, subtask, {})
 
@@ -522,8 +545,7 @@ class TestOrchestratorValidityPolicy:
         assert verification.passed is False
         assert verification.reason_code == "coverage_below_threshold"
         gate_events = [
-            event for event in events
-            if event.event_type == SYNTHESIS_INPUT_GATE_DECISION
+            event for event in events if event.event_type == SYNTHESIS_INPUT_GATE_DECISION
         ]
         assert gate_events
         assert gate_events[-1].data.get("policy_action") == "block"
@@ -573,10 +595,12 @@ class TestOrchestratorValidityPolicy:
             },
         )
         task.plan = Plan(subtasks=[subtask])
-        orch._runner.run = AsyncMock(return_value=(
-            SubtaskResult(status="success", summary="synthesis completed"),
-            VerificationResult(tier=2, passed=True, outcome="pass"),
-        ))
+        orch._runner.run = AsyncMock(
+            return_value=(
+                SubtaskResult(status="success", summary="synthesis completed"),
+                VerificationResult(tier=2, passed=True, outcome="pass"),
+            )
+        )
 
         _, result, verification = await orch._dispatch_subtask(task, subtask, {})
 
@@ -584,8 +608,7 @@ class TestOrchestratorValidityPolicy:
         assert verification.passed is True
         orch._runner.run.assert_awaited_once()
         gate_events = [
-            event for event in events
-            if event.event_type == SYNTHESIS_INPUT_GATE_DECISION
+            event for event in events if event.event_type == SYNTHESIS_INPUT_GATE_DECISION
         ]
         assert gate_events
         assert gate_events[-1].data.get("passed") is True
@@ -849,10 +872,12 @@ class TestOrchestratorValidityPolicy:
             },
         )
         task.plan = Plan(subtasks=[subtask])
-        orch._runner.run = AsyncMock(return_value=(
-            SubtaskResult(status="success", summary="ok"),
-            VerificationResult(tier=2, passed=True, outcome="pass"),
-        ))
+        orch._runner.run = AsyncMock(
+            return_value=(
+                SubtaskResult(status="success", summary="ok"),
+                VerificationResult(tier=2, passed=True, outcome="pass"),
+            )
+        )
 
         await orch._dispatch_subtask(task, subtask, {})
         retry_context = str(orch._runner.run.await_args.kwargs.get("retry_context", ""))
@@ -888,14 +913,16 @@ class TestOrchestratorValidityPolicy:
             },
         )
         task.plan = Plan(subtasks=[subtask])
-        orch._runner.run = AsyncMock(return_value=(
-            SubtaskResult(
-                status="success",
-                summary="Synthesized without grounding",
-                tool_calls=[],
-            ),
-            VerificationResult(tier=2, passed=True, outcome="pass"),
-        ))
+        orch._runner.run = AsyncMock(
+            return_value=(
+                SubtaskResult(
+                    status="success",
+                    summary="Synthesized without grounding",
+                    tool_calls=[],
+                ),
+                VerificationResult(tier=2, passed=True, outcome="pass"),
+            )
+        )
 
         _, result, verification = await orch._dispatch_subtask(task, subtask, {})
 
@@ -935,20 +962,22 @@ class TestOrchestratorValidityPolicy:
             },
         )
         task.plan = Plan(subtasks=[subtask])
-        orch._runner.run = AsyncMock(return_value=(
-            SubtaskResult(
-                status="success",
-                summary="Synthesized with empty fact checker",
-                tool_calls=[
-                    ToolCallRecord(
-                        tool="fact_checker",
-                        args={"claims": ["A claim"]},
-                        result=ToolResult.ok("ok", data={"verdicts": []}),
-                    ),
-                ],
-            ),
-            VerificationResult(tier=2, passed=True, outcome="pass"),
-        ))
+        orch._runner.run = AsyncMock(
+            return_value=(
+                SubtaskResult(
+                    status="success",
+                    summary="Synthesized with empty fact checker",
+                    tool_calls=[
+                        ToolCallRecord(
+                            tool="fact_checker",
+                            args={"claims": ["A claim"]},
+                            result=ToolResult.ok("ok", data={"verdicts": []}),
+                        ),
+                    ],
+                ),
+                VerificationResult(tier=2, passed=True, outcome="pass"),
+            )
+        )
 
         _, result, verification = await orch._dispatch_subtask(task, subtask, {})
 
@@ -984,38 +1013,40 @@ class TestOrchestratorValidityPolicy:
             },
         )
         task.plan = Plan(subtasks=[subtask])
-        orch._runner.run = AsyncMock(return_value=(
-            SubtaskResult(
-                status="success",
-                summary="Numeric recommendation complete",
-                tool_calls=[
-                    ToolCallRecord(
-                        tool="fact_checker",
-                        args={"claims": ["EPS grows 20%"]},
-                        result=ToolResult.ok("grounded"),
-                    ),
-                ],
-            ),
-            VerificationResult(
-                tier=2,
-                passed=True,
-                outcome="pass",
-                metadata={
-                    "claim_lifecycle": [
-                        {
-                            "claim_id": "CLM-NUM-1",
-                            "text": "EPS grows 20% in FY2027.",
-                            "claim_type": "numeric",
-                            "criticality": "critical",
-                            "status": "supported",
-                            "reason_code": "claim_supported",
-                            "evidence_refs": [],
-                            "lifecycle": ["extracted", "supported"],
-                        },
+        orch._runner.run = AsyncMock(
+            return_value=(
+                SubtaskResult(
+                    status="success",
+                    summary="Numeric recommendation complete",
+                    tool_calls=[
+                        ToolCallRecord(
+                            tool="fact_checker",
+                            args={"claims": ["EPS grows 20%"]},
+                            result=ToolResult.ok("grounded"),
+                        ),
                     ],
-                },
-            ),
-        ))
+                ),
+                VerificationResult(
+                    tier=2,
+                    passed=True,
+                    outcome="pass",
+                    metadata={
+                        "claim_lifecycle": [
+                            {
+                                "claim_id": "CLM-NUM-1",
+                                "text": "EPS grows 20% in FY2027.",
+                                "claim_type": "numeric",
+                                "criticality": "critical",
+                                "status": "supported",
+                                "reason_code": "claim_supported",
+                                "evidence_refs": [],
+                                "lifecycle": ["extracted", "supported"],
+                            },
+                        ],
+                    },
+                ),
+            )
+        )
 
         _, result, verification = await orch._dispatch_subtask(task, subtask, {})
 
@@ -1058,29 +1089,31 @@ class TestOrchestratorValidityPolicy:
             },
         )
         task.plan = Plan(subtasks=[subtask])
-        orch._runner.run = AsyncMock(return_value=(
-            SubtaskResult(status="success", summary="Temporal synthesis"),
-            VerificationResult(
-                tier=2,
-                passed=True,
-                outcome="pass",
-                metadata={
-                    "claim_lifecycle": [
-                        {
-                            "claim_id": "CLM-DATE-1",
-                            "text": "Revenue is stable.",
-                            "claim_type": "date",
-                            "criticality": "critical",
-                            "status": "supported",
-                            "reason_code": "claim_supported",
-                            "as_of": "2025-01-01",
-                            "evidence_refs": ["EV-1"],
-                            "lifecycle": ["extracted", "supported"],
-                        },
-                    ],
-                },
-            ),
-        ))
+        orch._runner.run = AsyncMock(
+            return_value=(
+                SubtaskResult(status="success", summary="Temporal synthesis"),
+                VerificationResult(
+                    tier=2,
+                    passed=True,
+                    outcome="pass",
+                    metadata={
+                        "claim_lifecycle": [
+                            {
+                                "claim_id": "CLM-DATE-1",
+                                "text": "Revenue is stable.",
+                                "claim_type": "date",
+                                "criticality": "critical",
+                                "status": "supported",
+                                "reason_code": "claim_supported",
+                                "as_of": "2025-01-01",
+                                "evidence_refs": ["EV-1"],
+                                "lifecycle": ["extracted", "supported"],
+                            },
+                        ],
+                    },
+                ),
+            )
+        )
 
         _, result, verification = await orch._dispatch_subtask(task, subtask, {})
 
@@ -1119,28 +1152,30 @@ class TestOrchestratorValidityPolicy:
             },
         )
         task.plan = Plan(subtasks=[subtask])
-        orch._runner.run = AsyncMock(return_value=(
-            SubtaskResult(status="success", summary="Synthesis draft"),
-            VerificationResult(
-                tier=2,
-                passed=True,
-                outcome="pass",
-                metadata={
-                    "claim_lifecycle": [
-                        {
-                            "claim_id": "CLM-INC-1",
-                            "text": "Source confidence is inconclusive.",
-                            "claim_type": "qualitative",
-                            "criticality": "important",
-                            "status": "insufficient_evidence",
-                            "reason_code": "claim_inconclusive",
-                            "evidence_refs": [],
-                            "lifecycle": ["extracted", "insufficient_evidence"],
-                        },
-                    ],
-                },
-            ),
-        ))
+        orch._runner.run = AsyncMock(
+            return_value=(
+                SubtaskResult(status="success", summary="Synthesis draft"),
+                VerificationResult(
+                    tier=2,
+                    passed=True,
+                    outcome="pass",
+                    metadata={
+                        "claim_lifecycle": [
+                            {
+                                "claim_id": "CLM-INC-1",
+                                "text": "Source confidence is inconclusive.",
+                                "claim_type": "qualitative",
+                                "criticality": "important",
+                                "status": "insufficient_evidence",
+                                "reason_code": "claim_inconclusive",
+                                "evidence_refs": [],
+                                "lifecycle": ["extracted", "insufficient_evidence"],
+                            },
+                        ],
+                    },
+                ),
+            )
+        )
 
         _, result, verification = await orch._dispatch_subtask(task, subtask, {})
 
@@ -1184,40 +1219,42 @@ class TestOrchestratorValidityPolicy:
             },
         )
         task.plan = Plan(subtasks=[subtask])
-        orch._runner.run = AsyncMock(return_value=(
-            SubtaskResult(status="success", summary="Temporal synthesis"),
-            VerificationResult(
-                tier=2,
-                passed=True,
-                outcome="pass",
-                metadata={
-                    "claim_lifecycle": [
-                        {
-                            "claim_id": "CLM-DATE-A",
-                            "text": "Guidance as of 2026-01-15 indicates growth.",
-                            "claim_type": "date",
-                            "criticality": "critical",
-                            "status": "supported",
-                            "reason_code": "claim_supported",
-                            "as_of": "2026-01-15",
-                            "evidence_refs": ["EV-A"],
-                            "lifecycle": ["extracted", "supported"],
-                        },
-                        {
-                            "claim_id": "CLM-DATE-B",
-                            "text": "Guidance as of 2026-02-20 indicates growth.",
-                            "claim_type": "date",
-                            "criticality": "critical",
-                            "status": "supported",
-                            "reason_code": "claim_supported",
-                            "as_of": "2026-02-20",
-                            "evidence_refs": ["EV-B"],
-                            "lifecycle": ["extracted", "supported"],
-                        },
-                    ],
-                },
-            ),
-        ))
+        orch._runner.run = AsyncMock(
+            return_value=(
+                SubtaskResult(status="success", summary="Temporal synthesis"),
+                VerificationResult(
+                    tier=2,
+                    passed=True,
+                    outcome="pass",
+                    metadata={
+                        "claim_lifecycle": [
+                            {
+                                "claim_id": "CLM-DATE-A",
+                                "text": "Guidance as of 2026-01-15 indicates growth.",
+                                "claim_type": "date",
+                                "criticality": "critical",
+                                "status": "supported",
+                                "reason_code": "claim_supported",
+                                "as_of": "2026-01-15",
+                                "evidence_refs": ["EV-A"],
+                                "lifecycle": ["extracted", "supported"],
+                            },
+                            {
+                                "claim_id": "CLM-DATE-B",
+                                "text": "Guidance as of 2026-02-20 indicates growth.",
+                                "claim_type": "date",
+                                "criticality": "critical",
+                                "status": "supported",
+                                "reason_code": "claim_supported",
+                                "as_of": "2026-02-20",
+                                "evidence_refs": ["EV-B"],
+                                "lifecycle": ["extracted", "supported"],
+                            },
+                        ],
+                    },
+                ),
+            )
+        )
 
         _, result, verification = await orch._dispatch_subtask(task, subtask, {})
 
@@ -1253,43 +1290,45 @@ class TestOrchestratorValidityPolicy:
             },
         )
         task.plan = Plan(subtasks=[subtask])
-        orch._runner.run = AsyncMock(return_value=(
-            SubtaskResult(
-                status="failed",
-                summary="Contains unsupported claim",
-            ),
-            VerificationResult(
-                tier=2,
-                passed=False,
-                outcome="fail",
-                reason_code="claim_insufficient_evidence",
-                feedback="Unsupported claims remain.",
-                metadata={
-                    "claim_lifecycle": [
-                        {
-                            "claim_id": "CLM-SUPPORTED",
-                            "text": "Supported claim",
-                            "claim_type": "qualitative",
-                            "criticality": "important",
-                            "status": "supported",
-                            "reason_code": "claim_supported",
-                            "evidence_refs": [],
-                            "lifecycle": ["extracted", "supported"],
-                        },
-                        {
-                            "claim_id": "CLM-UNSUPPORTED",
-                            "text": "Unsupported claim",
-                            "claim_type": "qualitative",
-                            "criticality": "important",
-                            "status": "insufficient_evidence",
-                            "reason_code": "claim_insufficient_evidence",
-                            "evidence_refs": [],
-                            "lifecycle": ["extracted", "insufficient_evidence"],
-                        },
-                    ],
-                },
-            ),
-        ))
+        orch._runner.run = AsyncMock(
+            return_value=(
+                SubtaskResult(
+                    status="failed",
+                    summary="Contains unsupported claim",
+                ),
+                VerificationResult(
+                    tier=2,
+                    passed=False,
+                    outcome="fail",
+                    reason_code="claim_insufficient_evidence",
+                    feedback="Unsupported claims remain.",
+                    metadata={
+                        "claim_lifecycle": [
+                            {
+                                "claim_id": "CLM-SUPPORTED",
+                                "text": "Supported claim",
+                                "claim_type": "qualitative",
+                                "criticality": "important",
+                                "status": "supported",
+                                "reason_code": "claim_supported",
+                                "evidence_refs": [],
+                                "lifecycle": ["extracted", "supported"],
+                            },
+                            {
+                                "claim_id": "CLM-UNSUPPORTED",
+                                "text": "Unsupported claim",
+                                "claim_type": "qualitative",
+                                "criticality": "important",
+                                "status": "insufficient_evidence",
+                                "reason_code": "claim_insufficient_evidence",
+                                "evidence_refs": [],
+                                "lifecycle": ["extracted", "insufficient_evidence"],
+                            },
+                        ],
+                    },
+                ),
+            )
+        )
 
         _, result, verification = await orch._dispatch_subtask(task, subtask, {})
 
@@ -1298,10 +1337,7 @@ class TestOrchestratorValidityPolicy:
         assert verification.reason_code == "claim_pruned"
         assert verification.metadata.get("claim_pruned") is True
         assert verification.metadata.get("claim_pruned_count") == 1
-        assert any(
-            event.event_type == CLAIMS_PRUNED
-            for event in events
-        )
+        assert any(event.event_type == CLAIMS_PRUNED for event in events)
 
     @pytest.mark.asyncio
     async def test_intermediate_claim_pruning_fails_when_post_prune_thresholds_fail(self, tmp_path):
@@ -1328,33 +1364,35 @@ class TestOrchestratorValidityPolicy:
             },
         )
         task.plan = Plan(subtasks=[subtask])
-        orch._runner.run = AsyncMock(return_value=(
-            SubtaskResult(
-                status="failed",
-                summary="Contains unsupported claim",
-            ),
-            VerificationResult(
-                tier=2,
-                passed=False,
-                outcome="fail",
-                reason_code="claim_insufficient_evidence",
-                feedback="Unsupported claims remain.",
-                metadata={
-                    "claim_lifecycle": [
-                        {
-                            "claim_id": "CLM-UNSUPPORTED",
-                            "text": "Unsupported claim",
-                            "claim_type": "qualitative",
-                            "criticality": "important",
-                            "status": "insufficient_evidence",
-                            "reason_code": "claim_insufficient_evidence",
-                            "evidence_refs": [],
-                            "lifecycle": ["extracted", "insufficient_evidence"],
-                        },
-                    ],
-                },
-            ),
-        ))
+        orch._runner.run = AsyncMock(
+            return_value=(
+                SubtaskResult(
+                    status="failed",
+                    summary="Contains unsupported claim",
+                ),
+                VerificationResult(
+                    tier=2,
+                    passed=False,
+                    outcome="fail",
+                    reason_code="claim_insufficient_evidence",
+                    feedback="Unsupported claims remain.",
+                    metadata={
+                        "claim_lifecycle": [
+                            {
+                                "claim_id": "CLM-UNSUPPORTED",
+                                "text": "Unsupported claim",
+                                "claim_type": "qualitative",
+                                "criticality": "important",
+                                "status": "insufficient_evidence",
+                                "reason_code": "claim_insufficient_evidence",
+                                "evidence_refs": [],
+                                "lifecycle": ["extracted", "insufficient_evidence"],
+                            },
+                        ],
+                    },
+                ),
+            )
+        )
 
         _, result, verification = await orch._dispatch_subtask(task, subtask, {})
 
@@ -1389,39 +1427,41 @@ class TestOrchestratorValidityPolicy:
             },
         )
         task.plan = Plan(subtasks=[subtask])
-        orch._runner.run = AsyncMock(return_value=(
-            SubtaskResult(
-                status="success",
-                summary="ok",
-                tool_calls=[
-                    ToolCallRecord(
-                        tool="write_file",
-                        args={"path": "analysis.md", "content": "Evidence-backed analysis"},
-                        result=ToolResult.ok("ok", files_changed=["analysis.md"]),
-                    ),
-                ],
-                evidence_records=[],
-            ),
-            VerificationResult(
-                tier=2,
-                passed=True,
-                outcome="pass",
-                metadata={
-                    "claim_lifecycle": [
-                        {
-                            "claim_id": "CLM-001",
-                            "text": "Revenue increased year over year.",
-                            "claim_type": "numeric",
-                            "criticality": "critical",
-                            "status": "supported",
-                            "reason_code": "claim_supported",
-                            "evidence_refs": ["analysis.md"],
-                            "lifecycle": ["extracted", "supported"],
-                        },
+        orch._runner.run = AsyncMock(
+            return_value=(
+                SubtaskResult(
+                    status="success",
+                    summary="ok",
+                    tool_calls=[
+                        ToolCallRecord(
+                            tool="write_file",
+                            args={"path": "analysis.md", "content": "Evidence-backed analysis"},
+                            result=ToolResult.ok("ok", files_changed=["analysis.md"]),
+                        ),
                     ],
-                },
-            ),
-        ))
+                    evidence_records=[],
+                ),
+                VerificationResult(
+                    tier=2,
+                    passed=True,
+                    outcome="pass",
+                    metadata={
+                        "claim_lifecycle": [
+                            {
+                                "claim_id": "CLM-001",
+                                "text": "Revenue increased year over year.",
+                                "claim_type": "numeric",
+                                "criticality": "critical",
+                                "status": "supported",
+                                "reason_code": "claim_supported",
+                                "evidence_refs": ["analysis.md"],
+                                "lifecycle": ["extracted", "supported"],
+                            },
+                        ],
+                    },
+                ),
+            )
+        )
 
         await orch._dispatch_subtask(task, subtask, {})
 
@@ -1462,7 +1502,8 @@ class TestOrchestratorValidityPolicy:
         )
         records = state_manager.load_evidence_records(task.id)
         write_records = [
-            record for record in records
+            record
+            for record in records
             if str(record.get("tool", "")).strip().lower() == "write_file"
         ]
 
@@ -1470,9 +1511,12 @@ class TestOrchestratorValidityPolicy:
         record = write_records[0]
         assert record.get("artifact_workspace_relpath") == "reports/final.md"
         assert record.get("artifact_size_bytes") == len(content.encode("utf-8"))
-        assert record.get("artifact_sha256") == hashlib.sha256(
-            content.encode("utf-8"),
-        ).hexdigest()
+        assert (
+            record.get("artifact_sha256")
+            == hashlib.sha256(
+                content.encode("utf-8"),
+            ).hexdigest()
+        )
 
     @pytest.mark.asyncio
     async def test_synthesis_gate_blocks_on_artifact_seal_mismatch(self, tmp_path):
@@ -1515,10 +1559,12 @@ class TestOrchestratorValidityPolicy:
             },
         )
         task.plan = Plan(subtasks=[subtask])
-        orch._runner.run = AsyncMock(return_value=(
-            SubtaskResult(status="success", summary="unexpected"),
-            VerificationResult(tier=2, passed=True, outcome="pass"),
-        ))
+        orch._runner.run = AsyncMock(
+            return_value=(
+                SubtaskResult(status="success", summary="unexpected"),
+                VerificationResult(tier=2, passed=True, outcome="pass"),
+            )
+        )
 
         _, result, verification = await orch._dispatch_subtask(task, subtask, {})
 
@@ -1526,10 +1572,7 @@ class TestOrchestratorValidityPolicy:
         assert verification.passed is False
         assert verification.reason_code == "artifact_seal_invalid"
         orch._runner.run.assert_not_awaited()
-        seal_events = [
-            event for event in events
-            if event.event_type == ARTIFACT_SEAL_VALIDATION
-        ]
+        seal_events = [event for event in events if event.event_type == ARTIFACT_SEAL_VALIDATION]
         assert seal_events
         assert seal_events[-1].data.get("passed") is False
         assert seal_events[-1].data.get("mismatch_count", 0) >= 1
@@ -1581,10 +1624,12 @@ class TestOrchestratorValidityPolicy:
             },
         )
         task.plan = Plan(subtasks=[subtask])
-        orch._runner.run = AsyncMock(return_value=(
-            SubtaskResult(status="success", summary="ok"),
-            VerificationResult(tier=2, passed=True, outcome="pass"),
-        ))
+        orch._runner.run = AsyncMock(
+            return_value=(
+                SubtaskResult(status="success", summary="ok"),
+                VerificationResult(tier=2, passed=True, outcome="pass"),
+            )
+        )
 
         _, result, verification = await orch._dispatch_subtask(task, subtask, {})
 

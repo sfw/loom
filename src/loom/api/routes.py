@@ -312,9 +312,7 @@ def _required_auth_resources_for_process(
 def _prepare_task_for_restart_from_failure(task: Task) -> tuple[Task | None, str | None]:
     """Reset a terminal task for another execution pass, preserving completed work."""
     if not task.plan or not task.plan.subtasks:
-        return None, (
-            f"Cannot restart task '{task.id}': no saved subtask plan available."
-        )
+        return None, (f"Cannot restart task '{task.id}': no saved subtask plan available.")
 
     needs_work = False
     for subtask in task.plan.subtasks:
@@ -357,41 +355,43 @@ def _plan_from_json_dict(plan_data: dict[str, Any]) -> Plan:
             best_score = float(best_score_raw) if best_score_raw is not None else None
         except (TypeError, ValueError):
             best_score = None
-        subtasks.append(Subtask(
-            id=str(raw.get("id", "") or ""),
-            description=str(raw.get("description", "") or ""),
-            status=SubtaskStatus(str(raw.get("status", "pending") or "pending")),
-            summary=str(raw.get("summary", "") or ""),
-            active_issue=str(raw.get("active_issue", "") or ""),
-            depends_on=[
-                str(item).strip()
-                for item in (raw.get("depends_on", []) or [])
-                if str(item).strip()
-            ],
-            phase_id=str(raw.get("phase_id", "") or ""),
-            output_role=str(raw.get("output_role", "") or ""),
-            output_strategy=str(raw.get("output_strategy", "") or ""),
-            model_tier=int(raw.get("model_tier", 1) or 1),
-            verification_tier=int(raw.get("verification_tier", 1) or 1),
-            is_critical_path=bool(raw.get("is_critical_path", False)),
-            is_synthesis=bool(raw.get("is_synthesis", False)),
-            acceptance_criteria=str(raw.get("acceptance_criteria", "") or ""),
-            validity_contract_snapshot=dict(validity_snapshot_raw),
-            validity_contract_hash=str(raw.get("validity_contract_hash", "") or ""),
-            retry_count=int(raw.get("retry_count", 0) or 0),
-            max_retries=int(raw.get("max_retries", 3) or 3),
-            iteration_attempt=int(raw.get("iteration_attempt", 0) or 0),
-            iteration_runner_invocations=int(raw.get("iteration_runner_invocations", 0) or 0),
-            iteration_max_attempts=int(raw.get("iteration_max_attempts", 0) or 0),
-            iteration_no_improvement_count=int(
-                raw.get("iteration_no_improvement_count", 0) or 0,
-            ),
-            iteration_best_score=best_score,
-            iteration_terminal_reason=str(raw.get("iteration_terminal_reason", "") or ""),
-            iteration_loop_run_id=str(raw.get("iteration_loop_run_id", "") or ""),
-            iteration_replan_count=int(raw.get("iteration_replan_count", 0) or 0),
-            iteration_last_gate_summary=str(raw.get("iteration_last_gate_summary", "") or ""),
-        ))
+        subtasks.append(
+            Subtask(
+                id=str(raw.get("id", "") or ""),
+                description=str(raw.get("description", "") or ""),
+                status=SubtaskStatus(str(raw.get("status", "pending") or "pending")),
+                summary=str(raw.get("summary", "") or ""),
+                active_issue=str(raw.get("active_issue", "") or ""),
+                depends_on=[
+                    str(item).strip()
+                    for item in (raw.get("depends_on", []) or [])
+                    if str(item).strip()
+                ],
+                phase_id=str(raw.get("phase_id", "") or ""),
+                output_role=str(raw.get("output_role", "") or ""),
+                output_strategy=str(raw.get("output_strategy", "") or ""),
+                model_tier=int(raw.get("model_tier", 1) or 1),
+                verification_tier=int(raw.get("verification_tier", 1) or 1),
+                is_critical_path=bool(raw.get("is_critical_path", False)),
+                is_synthesis=bool(raw.get("is_synthesis", False)),
+                acceptance_criteria=str(raw.get("acceptance_criteria", "") or ""),
+                validity_contract_snapshot=dict(validity_snapshot_raw),
+                validity_contract_hash=str(raw.get("validity_contract_hash", "") or ""),
+                retry_count=int(raw.get("retry_count", 0) or 0),
+                max_retries=int(raw.get("max_retries", 3) or 3),
+                iteration_attempt=int(raw.get("iteration_attempt", 0) or 0),
+                iteration_runner_invocations=int(raw.get("iteration_runner_invocations", 0) or 0),
+                iteration_max_attempts=int(raw.get("iteration_max_attempts", 0) or 0),
+                iteration_no_improvement_count=int(
+                    raw.get("iteration_no_improvement_count", 0) or 0,
+                ),
+                iteration_best_score=best_score,
+                iteration_terminal_reason=str(raw.get("iteration_terminal_reason", "") or ""),
+                iteration_loop_run_id=str(raw.get("iteration_loop_run_id", "") or ""),
+                iteration_replan_count=int(raw.get("iteration_replan_count", 0) or 0),
+                iteration_last_gate_summary=str(raw.get("iteration_last_gate_summary", "") or ""),
+            )
+        )
     return Plan(
         subtasks=subtasks,
         version=int(plan_data.get("version", 1) or 1),
@@ -421,7 +421,7 @@ def _normalize_host(raw_host: str) -> str:
     if not host:
         return ""
     if host.startswith("[") and "]" in host:
-        host = host[1:host.index("]")]
+        host = host[1 : host.index("]")]
     elif host.count(":") == 1:
         candidate, maybe_port = host.rsplit(":", 1)
         if maybe_port.isdigit():
@@ -510,9 +510,7 @@ def _serialize_task_question(row: dict) -> TaskQuestionResponse:
             else {}
         ),
         answer_payload=(
-            payload.get("answer_payload")
-            if isinstance(payload.get("answer_payload"), dict)
-            else {}
+            payload.get("answer_payload") if isinstance(payload.get("answer_payload"), dict) else {}
         ),
         created_at=str(payload.get("created_at", "") or ""),
         updated_at=str(payload.get("updated_at", "") or ""),
@@ -633,9 +631,7 @@ def _normalize_attachment_source_path(
     except Exception:
         return ""
     allowed_roots = [
-        root.resolve(strict=False)
-        for root in (workspace_root, scratch_root)
-        if root is not None
+        root.resolve(strict=False) for root in (workspace_root, scratch_root) if root is not None
     ]
     if not allowed_roots:
         return ""
@@ -901,15 +897,9 @@ def _resolve_artifact_locator(
         if source_workspace
         else ""
     )
-    run_exists = (
-        _artifact_exists_on_disk(run_workspace, run_relpath)
-        if run_relpath
-        else False
-    )
+    run_exists = _artifact_exists_on_disk(run_workspace, run_relpath) if run_relpath else False
     source_exists = (
-        _artifact_exists_on_disk(source_workspace, source_relpath)
-        if source_relpath
-        else False
+        _artifact_exists_on_disk(source_workspace, source_relpath) if source_relpath else False
     )
 
     if prefer_run_workspace and run_relpath:
@@ -1129,14 +1119,12 @@ def _latest_unsent_runner_preflight_failure_event(
             "infra_runner_context_unfit",
             "infra_message_contract_violation",
         } or (
-            failure_class in {
+            failure_class
+            in {
                 "context_unfit",
                 "message_contract_violation",
             }
-            and (
-                provider_status == "not_sent"
-                or stream_close_reason == "not_started"
-            )
+            and (provider_status == "not_sent" or stream_close_reason == "not_started")
         ):
             return event
     return None
@@ -1241,8 +1229,7 @@ def _build_run_failure_analysis(
         return RunFailureAnalysisResponse(
             headline="Run failed.",
             summary=(
-                "The run ended in a failed state, but no persisted failure events "
-                "were available."
+                "The run ended in a failed state, but no persisted failure events were available."
             ),
             reason_family="runtime",
             remediation=RunFailureRemediationResponse(),
@@ -1250,9 +1237,7 @@ def _build_run_failure_analysis(
 
     task_failed = _latest_event(events, event_types={"task_failed"}) or {}
     task_failed_data = (
-        dict(task_failed.get("data", {}))
-        if isinstance(task_failed.get("data"), dict)
-        else {}
+        dict(task_failed.get("data", {})) if isinstance(task_failed.get("data"), dict) else {}
     )
     telemetry_summary = _latest_event(events, event_types={"telemetry_run_summary"}) or {}
     telemetry_data = (
@@ -1273,9 +1258,8 @@ def _build_run_failure_analysis(
         for item in blocked_subtasks
         if isinstance(item, dict) and str(item.get("subtask_id", "") or "").strip()
     ]
-    latest_subtask_failed = (
-        _latest_unresolved_subtask_failed_event(events)
-        or _latest_event(events, event_types={"subtask_failed"})
+    latest_subtask_failed = _latest_unresolved_subtask_failed_event(events) or _latest_event(
+        events, event_types={"subtask_failed"}
     )
     latest_subtask_failed_data = (
         dict(latest_subtask_failed.get("data", {}))
@@ -1300,26 +1284,32 @@ def _build_run_failure_analysis(
     )
     if runner_preflight_data:
         failing_subtask_id = (
-            str(runner_preflight_data.get("subtask_id", "") or "").strip()
-            or failing_subtask_id
+            str(runner_preflight_data.get("subtask_id", "") or "").strip() or failing_subtask_id
         )
     failing_subtask_label = label_lookup.get(failing_subtask_id, failing_subtask_id)
 
-    verification_terminal = _latest_event(
-        events,
-        event_types={"verification_failed", "verification_outcome"},
-        subtask_id=failing_subtask_id,
-    ) or {}
+    verification_terminal = (
+        _latest_event(
+            events,
+            event_types={"verification_failed", "verification_outcome"},
+            subtask_id=failing_subtask_id,
+        )
+        or {}
+    )
     verification_data = (
         dict(verification_terminal.get("data", {}))
         if isinstance(verification_terminal.get("data"), dict)
         else {}
     )
-    subtask_failed_event = _latest_event(
-        events,
-        event_types={"subtask_failed"},
-        subtask_id=failing_subtask_id,
-    ) or latest_subtask_failed or {}
+    subtask_failed_event = (
+        _latest_event(
+            events,
+            event_types={"subtask_failed"},
+            subtask_id=failing_subtask_id,
+        )
+        or latest_subtask_failed
+        or {}
+    )
     subtask_failed_data = (
         dict(subtask_failed_event.get("data", {}))
         if isinstance(subtask_failed_event.get("data"), dict)
@@ -1419,8 +1409,8 @@ def _build_run_failure_analysis(
         )
     elif primary_reason_code == "hard_invariant_failed":
         why_not_remedied = (
-            "This was treated as a hard invariant verification failure, so Loom did not "
-            "queue follow-up remediation and the run stopped after retries were exhausted."
+            "This was classified as a terminal hard-invariant failure, so Loom stopped "
+            "without queuing automatic remediation. No retry exhaustion is implied."
         )
     elif primary_reason_code in {
         "iteration_budget_exceeded",
@@ -1433,8 +1423,7 @@ def _build_run_failure_analysis(
         )
     elif resolved_count > 0:
         why_not_remedied = (
-            "Remediation recovered some failures, but the final blocking issue "
-            "remained unresolved."
+            "Remediation recovered some failures, but the final blocking issue remained unresolved."
         )
     elif queued_count > 0 and not resolved_count:
         why_not_remedied = (
@@ -1450,8 +1439,7 @@ def _build_run_failure_analysis(
         )
     elif task_reason == "blocking_remediation_unresolved":
         why_not_remedied = (
-            "A blocking remediation item remained unresolved, so the run was "
-            "terminated."
+            "A blocking remediation item remained unresolved, so the run was terminated."
         )
     elif task_reason == "uncaught_exception":
         why_not_remedied = "The orchestrator hit an uncaught exception and stopped the run."
@@ -1565,8 +1553,7 @@ def _recent_conversation_search_text(
 def _artifact_is_intermediate(relpath: object) -> bool:
     text = str(relpath or "").strip()
     return bool(
-        text.startswith(".loom/phase-artifacts/")
-        or text.startswith("loom/phase-artifacts/")
+        text.startswith(".loom/phase-artifacts/") or text.startswith("loom/phase-artifacts/")
     )
 
 
@@ -1623,11 +1610,50 @@ _WORKSPACE_FILE_MAX_PDF_PAGES = 20
 _WORKSPACE_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}
 _WORKSPACE_DOC_EXTS = {".docx", ".pptx"}
 _WORKSPACE_TEXT_EXTS = {
-    ".txt", ".log", ".rst", ".md", ".mdx", ".py", ".pyi", ".js", ".jsx", ".ts", ".tsx",
-    ".css", ".scss", ".less", ".go", ".rs", ".java", ".kt", ".swift", ".rb", ".php",
-    ".sh", ".bash", ".zsh", ".toml", ".ini", ".cfg", ".conf", ".yaml", ".yml", ".xml",
-    ".sql", ".c", ".h", ".cc", ".cpp", ".hpp", ".hh", ".json", ".jsonl", ".html", ".htm",
-    ".diff", ".patch",
+    ".txt",
+    ".log",
+    ".rst",
+    ".md",
+    ".mdx",
+    ".py",
+    ".pyi",
+    ".js",
+    ".jsx",
+    ".ts",
+    ".tsx",
+    ".css",
+    ".scss",
+    ".less",
+    ".go",
+    ".rs",
+    ".java",
+    ".kt",
+    ".swift",
+    ".rb",
+    ".php",
+    ".sh",
+    ".bash",
+    ".zsh",
+    ".toml",
+    ".ini",
+    ".cfg",
+    ".conf",
+    ".yaml",
+    ".yml",
+    ".xml",
+    ".sql",
+    ".c",
+    ".h",
+    ".cc",
+    ".cpp",
+    ".hpp",
+    ".hh",
+    ".json",
+    ".jsonl",
+    ".html",
+    ".htm",
+    ".diff",
+    ".patch",
 }
 _WORKSPACE_LANGUAGE_BY_EXT = {
     ".txt": "text",
@@ -1740,10 +1766,7 @@ def _is_probably_binary(data: bytes) -> bool:
     if b"\x00" in data:
         return True
     sample = data[:2048]
-    non_text = sum(
-        1 for byte in sample
-        if byte < 9 or (13 < byte < 32) or byte == 127
-    )
+    non_text = sum(1 for byte in sample if byte < 9 or (13 < byte < 32) or byte == 127)
     return non_text > max(8, len(sample) // 10)
 
 
@@ -1832,20 +1855,22 @@ def _search_workspace_paths(
         else:
             rank = 4
 
-        candidates.append((
-            rank,
-            0 if is_dir else 1,
-            relpath.count("/"),
-            relpath,
-            WorkspaceFileEntryResponse(
-                path=relpath,
-                name=name,
-                is_dir=is_dir,
-                size_bytes=0 if is_dir else int(stat.st_size or 0),
-                modified_at=datetime.fromtimestamp(stat.st_mtime, UTC).isoformat(),
-                extension="" if is_dir else path.suffix.lower(),
-            ),
-        ))
+        candidates.append(
+            (
+                rank,
+                0 if is_dir else 1,
+                relpath.count("/"),
+                relpath,
+                WorkspaceFileEntryResponse(
+                    path=relpath,
+                    name=name,
+                    is_dir=is_dir,
+                    size_bytes=0 if is_dir else int(stat.st_size or 0),
+                    modified_at=datetime.fromtimestamp(stat.st_mtime, UTC).isoformat(),
+                    extension="" if is_dir else path.suffix.lower(),
+                ),
+            )
+        )
 
     for root, dirnames, filenames in os.walk(workspace_root):
         dirnames[:] = [dirname for dirname in dirnames if not dirname.startswith(".")]
@@ -1950,17 +1975,12 @@ def _preview_table_file(path: Path) -> WorkspaceFilePreviewTableResponse:
     body = rows[1:]
     columns = [
         _truncate_table_cell(
-            header[index]
-            if index < len(header) and header[index]
-            else f"col{index + 1}",
+            header[index] if index < len(header) and header[index] else f"col{index + 1}",
         )
         for index in range(max_cols)
     ]
     body_rows = [
-        [
-            _truncate_table_cell(row[index] if index < len(row) else "")
-            for index in range(max_cols)
-        ]
+        [_truncate_table_cell(row[index] if index < len(row) else "") for index in range(max_cols)]
         for row in body
     ]
     if any(len(row) > max_cols for row in rows):
@@ -2239,28 +2259,31 @@ def _task_row_projection_from_task(
     )
     plan_json = (
         json.dumps(asdict(task.plan), ensure_ascii=False)
-        if task.plan and (
+        if task.plan
+        and (
             task.plan.subtasks
             or int(getattr(task.plan, "version", 1) or 1) != 1
             or str(getattr(task.plan, "last_replanned", "") or "").strip()
         )
         else None
     )
-    row.update({
-        "id": task.id,
-        "goal": task.goal,
-        "context": json.dumps(task.context, ensure_ascii=False) if task.context else None,
-        "workspace_path": task.workspace,
-        "status": status_value,
-        "plan": plan_json,
-        "created_at": task.created_at,
-        "updated_at": task.updated_at,
-        "state_snapshot_updated_at": task.updated_at,
-        "completed_at": str(task.completed_at or "").strip() or None,
-        "approval_mode": task.approval_mode,
-        "callback_url": task.callback_url or None,
-        "metadata": json.dumps(task.metadata, ensure_ascii=False) if task.metadata else None,
-    })
+    row.update(
+        {
+            "id": task.id,
+            "goal": task.goal,
+            "context": json.dumps(task.context, ensure_ascii=False) if task.context else None,
+            "workspace_path": task.workspace,
+            "status": status_value,
+            "plan": plan_json,
+            "created_at": task.created_at,
+            "updated_at": task.updated_at,
+            "state_snapshot_updated_at": task.updated_at,
+            "completed_at": str(task.completed_at or "").strip() or None,
+            "approval_mode": task.approval_mode,
+            "callback_url": task.callback_url or None,
+            "metadata": json.dumps(task.metadata, ensure_ascii=False) if task.metadata else None,
+        }
+    )
     return row
 
 
@@ -2436,11 +2459,7 @@ async def _build_run_artifacts(
                 for item in list(row.get("phase_ids", []) or [])
                 if str(item or "").strip()
             ],
-            facets=(
-                row.get("facets")
-                if isinstance(row.get("facets"), dict)
-                else {}
-            ),
+            facets=(row.get("facets") if isinstance(row.get("facets"), dict) else {}),
         )
         for row in artifact_rows.values()
         if str(row.get("path", "") or "").strip()
@@ -2570,11 +2589,13 @@ async def _build_workspace_search_response(
         limit=limit,
     )
     file_items = [
-        row.model_copy(update={
-            "workspace_id": workspace_id,
-            "workspace_display_name": workspace_display_name,
-            "workspace_path": workspace_path,
-        })
+        row.model_copy(
+            update={
+                "workspace_id": workspace_id,
+                "workspace_display_name": workspace_display_name,
+                "workspace_path": workspace_path,
+            }
+        )
         for row in file_rows
     ]
 
@@ -2685,11 +2706,7 @@ async def _build_workspace_search_response(
                 title=item.title,
                 subtitle=item.kind.replace("_", " "),
                 snippet=_trim_snippet(item.summary or item.request_payload),
-                badges=[
-                    badge
-                    for badge in [item.tool_name, item.risk_level]
-                    if badge
-                ],
+                badges=[badge for badge in [item.tool_name, item.risk_level] if badge],
                 conversation_id=item.conversation_id,
                 run_id=item.task_id,
                 approval_item_id=item.id,
@@ -2952,10 +2969,9 @@ def _search_item_sort_key(
     title_prefix = 0 if clean_query and title.startswith(clean_query) else 1
     title_contains = 0 if clean_query and clean_query in title else 1
     subtitle_contains = 0 if clean_query and clean_query in subtitle else 1
-    secondary_contains = 0 if clean_query and (
-        clean_query in snippet
-        or clean_query in workspace_label
-    ) else 1
+    secondary_contains = (
+        0 if clean_query and (clean_query in snippet or clean_query in workspace_label) else 1
+    )
     return (
         exact,
         title_prefix,
@@ -3011,11 +3027,7 @@ async def _build_global_search_response(
                                 if summary.conversation_count
                                 else ""
                             ),
-                            (
-                                f"{summary.run_count} runs"
-                                if summary.run_count
-                                else ""
-                            ),
+                            (f"{summary.run_count} runs" if summary.run_count else ""),
                             "archived" if summary.is_archived else "",
                         ]
                         if badge
@@ -3117,9 +3129,7 @@ _LIVE_TASK_STATUS_CANDIDATES = {"pending", "planning", "executing", "paused"}
 def _task_workspace_scope(task_row: dict[str, Any]) -> str:
     metadata = _json_object(task_row.get("metadata"))
     return str(
-        metadata.get("source_workspace_root")
-        or task_row.get("workspace_path")
-        or "",
+        metadata.get("source_workspace_root") or task_row.get("workspace_path") or "",
     ).strip()
 
 
@@ -3160,10 +3170,9 @@ async def _count_pending_approval_items(
     pending_task_approvals = engine.approval_manager.list_pending_approvals()
     total = 0
     if pending_task_approvals:
-        task_rows_by_id = await engine.database.get_tasks_by_ids([
-            str(getattr(item, "task_id", "") or "").strip()
-            for item in pending_task_approvals
-        ])
+        task_rows_by_id = await engine.database.get_tasks_by_ids(
+            [str(getattr(item, "task_id", "") or "").strip() for item in pending_task_approvals]
+        )
         for pending in pending_task_approvals:
             if workspace_path:
                 task_row = task_rows_by_id.get(
@@ -3196,11 +3205,13 @@ async def _count_pending_approval_items(
 
     pending_conversation_approvals = engine.list_pending_conversation_approvals()
     if pending_conversation_approvals:
-        sessions_by_id = await engine.conversation_store.get_sessions_by_ids([
-            str(item.get("conversation_id", "") or "").strip()
-            for item in pending_conversation_approvals
-            if str(item.get("conversation_id", "") or "").strip()
-        ])
+        sessions_by_id = await engine.conversation_store.get_sessions_by_ids(
+            [
+                str(item.get("conversation_id", "") or "").strip()
+                for item in pending_conversation_approvals
+                if str(item.get("conversation_id", "") or "").strip()
+            ]
+        )
         for pending in pending_conversation_approvals:
             if workspace_path:
                 session = sessions_by_id.get(
@@ -3269,9 +3280,7 @@ async def _build_run_summary(
     )
 
     resolved_status = (
-        live_status
-        if live_status is not None
-        else await _resolve_task_status(engine, task_row)
+        live_status if live_status is not None else await _resolve_task_status(engine, task_row)
     )
 
     return RunSummaryResponse(
@@ -3284,9 +3293,7 @@ async def _build_run_summary(
         updated_at=str(task_row.get("updated_at", "") or ""),
         execution_run_id=str((latest_run_row or {}).get("run_id", "") or ""),
         process_name=str(
-            (latest_run_row or {}).get("process_name", "")
-            or metadata.get("process", "")
-            or "",
+            (latest_run_row or {}).get("process_name", "") or metadata.get("process", "") or "",
         ),
         linked_conversation_ids=[
             str(link.get("session_id", "") or "")
@@ -3321,9 +3328,7 @@ async def _build_workspace_summary(
     workspace_id = str(workspace.get("id", "") or "")
     task_rows = tasks if tasks is not None else await _workspace_tasks(engine, workspace)
     session_rows = (
-        sessions
-        if sessions is not None
-        else await _workspace_sessions(engine, workspace)
+        sessions if sessions is not None else await _workspace_sessions(engine, workspace)
     )
     last_activity_at = ""
     for row in task_rows:
@@ -3339,9 +3344,13 @@ async def _build_workspace_summary(
         for row in task_rows
         if str(row.get("status", "") or "").strip().lower() in _LIVE_TASK_STATUS_CANDIDATES
     ]
-    resolved_candidate_statuses = await asyncio.gather(
-        *(_resolve_task_status(engine, row) for row in active_candidate_rows),
-    ) if active_candidate_rows else []
+    resolved_candidate_statuses = (
+        await asyncio.gather(
+            *(_resolve_task_status(engine, row) for row in active_candidate_rows),
+        )
+        if active_candidate_rows
+        else []
+    )
     resolved_status_by_task = {
         str(row.get("id", "") or "").strip(): status
         for row, status in zip(active_candidate_rows, resolved_candidate_statuses, strict=False)
@@ -3358,11 +3367,7 @@ async def _build_workspace_summary(
         last_opened_at=str(workspace.get("last_opened_at", "") or ""),
         created_at=str(workspace.get("created_at", "") or ""),
         updated_at=str(workspace.get("updated_at", "") or ""),
-        metadata=(
-            workspace.get("metadata")
-            if isinstance(workspace.get("metadata"), dict)
-            else {}
-        ),
+        metadata=(workspace.get("metadata") if isinstance(workspace.get("metadata"), dict) else {}),
         exists_on_disk=Path(workspace_path).exists() if workspace_path else False,
         conversation_count=len(session_rows),
         run_count=len(task_rows),
@@ -3372,7 +3377,8 @@ async def _build_workspace_summary(
             if (
                 resolved_status_by_task.get(str(row.get("id", "") or "").strip())
                 or str(row.get("status", "") or "").strip().lower()
-            ) in _LIVE_TASK_STATUS_CANDIDATES
+            )
+            in _LIVE_TASK_STATUS_CANDIDATES
         ),
         last_activity_at=last_activity_at,
     )
@@ -3406,9 +3412,11 @@ def _tool_info_rows(engine: Engine) -> list[ToolInfo]:
                 ),
                 auth_required=tool_auth_required(tool),
                 auth_requirements=list(auth_requirements),
-                execution_surfaces=list(normalize_tool_execution_surfaces(
-                    schema.get("x_supported_execution_surfaces", []),
-                )),
+                execution_surfaces=list(
+                    normalize_tool_execution_surfaces(
+                        schema.get("x_supported_execution_surfaces", []),
+                    )
+                ),
                 availability_state=(
                     availability.state if availability is not None else "unavailable"
                 ),
@@ -3797,9 +3805,7 @@ def _settings_payload(engine: Engine) -> dict[str, Any]:
         entries_payload.append(snapshot)
     return {
         "basic": [item for item in entries_payload if item.get("exposure_level") == "basic"],
-        "advanced": [
-            item for item in entries_payload if item.get("exposure_level") != "basic"
-        ],
+        "advanced": [item for item in entries_payload if item.get("exposure_level") != "basic"],
         "updated_at": _latest_timestamp(*(item.get("updated_at") for item in entries_payload)),
     }
 
@@ -3915,18 +3921,20 @@ def _build_api_cowork_session(engine: Engine, session: dict[str, Any]) -> Cowork
             tool_name=tool_name,
             args=args,
         )
-        engine.event_bus.emit(Event(
-            event_type=APPROVAL_REQUESTED,
-            task_id=conversation_id,
-            data={
-                "conversation_id": conversation_id,
-                "workspace_path": str(session.get("workspace_path", "") or ""),
-                "approval_id": request.approval_id,
-                "tool_name": request.tool_name,
-                "risk_info": request.to_dict().get("risk_info"),
-                "source_component": "cowork_api",
-            },
-        ))
+        engine.event_bus.emit(
+            Event(
+                event_type=APPROVAL_REQUESTED,
+                task_id=conversation_id,
+                data={
+                    "conversation_id": conversation_id,
+                    "workspace_path": str(session.get("workspace_path", "") or ""),
+                    "approval_id": request.approval_id,
+                    "tool_name": request.tool_name,
+                    "risk_info": request.to_dict().get("risk_info"),
+                    "source_component": "cowork_api",
+                },
+            )
+        )
         await _append_conversation_replay_event(
             engine,
             conversation_id,
@@ -3937,18 +3945,20 @@ def _build_api_cowork_session(engine: Engine, session: dict[str, Any]) -> Cowork
             conversation_id,
             request.approval_id,
         )
-        engine.event_bus.emit(Event(
-            event_type=APPROVAL_RECEIVED,
-            task_id=conversation_id,
-            data={
-                "conversation_id": conversation_id,
-                "workspace_path": str(session.get("workspace_path", "") or ""),
-                "approval_id": request.approval_id,
-                "tool_name": request.tool_name,
-                "decision": decision.value,
-                "source_component": "cowork_api",
-            },
-        ))
+        engine.event_bus.emit(
+            Event(
+                event_type=APPROVAL_RECEIVED,
+                task_id=conversation_id,
+                data={
+                    "conversation_id": conversation_id,
+                    "workspace_path": str(session.get("workspace_path", "") or ""),
+                    "approval_id": request.approval_id,
+                    "tool_name": request.tool_name,
+                    "decision": decision.value,
+                    "source_component": "cowork_api",
+                },
+            )
+        )
         await _append_conversation_replay_event(
             engine,
             conversation_id,
@@ -4026,16 +4036,18 @@ async def _append_conversation_replay_event(
         journal_through_turn=journal_through_turn,
     )
     # Emit through event bus for instant SSE delivery
-    engine.event_bus.emit(Event(
-        event_type=CONVERSATION_MESSAGE,
-        task_id=conversation_id,
-        data={
-            "conversation_id": conversation_id,
-            "chat_event_type": event_type,
-            "seq": seq,
-            "payload": payload,
-        },
-    ))
+    engine.event_bus.emit(
+        Event(
+            event_type=CONVERSATION_MESSAGE,
+            task_id=conversation_id,
+            data={
+                "conversation_id": conversation_id,
+                "chat_event_type": event_type,
+                "seq": seq,
+                "payload": payload,
+            },
+        )
+    )
 
 
 def _normalize_ask_user_prompt_payload(payload: object) -> dict[str, Any] | None:
@@ -4095,9 +4107,8 @@ def _conversation_pending_prompt_from_turn(row: dict[str, Any]) -> dict[str, Any
         return None
     if "awaiting_input" in result.data and not bool(result.data.get("awaiting_input", False)):
         return None
-    prompt = (
-        _normalize_ask_user_prompt_payload(result.data)
-        or _normalize_ask_user_prompt_payload(getattr(result, "args", None))
+    prompt = _normalize_ask_user_prompt_payload(result.data) or _normalize_ask_user_prompt_payload(
+        getattr(result, "args", None)
     )
     if prompt is None:
         return None
@@ -4258,10 +4269,9 @@ async def _run_cowork_turn_for_api(
                 if isinstance(event.result.data, dict):
                     payload["data"] = dict(event.result.data)
                 if event.name == "ask_user":
-                    prompt = (
-                        _normalize_ask_user_prompt_payload(event.result.data)
-                        or _normalize_ask_user_prompt_payload(event.args)
-                    )
+                    prompt = _normalize_ask_user_prompt_payload(
+                        event.result.data
+                    ) or _normalize_ask_user_prompt_payload(event.args)
                     if prompt is not None:
                         payload["question_payload"] = prompt
                 await _append_conversation_replay_event(
@@ -4277,8 +4287,7 @@ async def _run_cowork_turn_for_api(
                         "content_indicator",
                         {
                             "content_blocks": [
-                                serialize_block(block)
-                                for block in event.result.content_blocks
+                                serialize_block(block) for block in event.result.content_blocks
                             ],
                         },
                     )
@@ -4312,9 +4321,7 @@ async def _run_cowork_turn_for_api(
                         "omitted_messages": int(event.omitted_messages),
                         "recall_index_used": bool(event.recall_index_used),
                     },
-                    journal_through_turn=int(
-                        getattr(session, "persisted_turn_count", 0) or 0
-                    ),
+                    journal_through_turn=int(getattr(session, "persisted_turn_count", 0) or 0),
                 )
     except CoworkStopRequestedError as exc:
         await _append_conversation_replay_event(
@@ -4407,10 +4414,7 @@ async def create_new_task(request: Request, body: TaskCreateRequest):
             engine.config,
         )
         if required:
-            available = (
-                set(await asyncio.to_thread(registry_for_process.list_tools))
-                - excluded
-            )
+            available = set(await asyncio.to_thread(registry_for_process.list_tools)) - excluded
             missing = sorted(name for name in required if name not in available)
             if missing:
                 raise HTTPException(
@@ -4503,18 +4507,20 @@ async def create_new_task(request: Request, body: TaskCreateRequest):
         process=process_def,
         process_name=effective_process or "",
     )
-    engine.event_bus.emit(Event(
-        event_type=TASK_CREATED,
-        task_id=task.id,
-        data={
-            "run_id": run_id,
-            "goal": task.goal,
-            "workspace": task.workspace,
-            "approval_mode": task.approval_mode,
-            "execution_surface": metadata.get("execution_surface", "api"),
-            "process": effective_process or "",
-        },
-    ))
+    engine.event_bus.emit(
+        Event(
+            event_type=TASK_CREATED,
+            task_id=task.id,
+            data={
+                "run_id": run_id,
+                "goal": task.goal,
+                "workspace": task.workspace,
+                "approval_mode": task.approval_mode,
+                "execution_surface": metadata.get("execution_surface", "api"),
+                "process": effective_process or "",
+            },
+        )
+    )
     log_latency_event(
         logger,
         event="api_task_create",
@@ -4533,6 +4539,7 @@ async def create_new_task(request: Request, body: TaskCreateRequest):
 async def _execute_in_background(engine: Engine, task, process_def=None) -> None:
     """Legacy helper retained for test compatibility."""
     import logging
+
     _bg_logger = logging.getLogger(__name__)
     try:
         orchestrator = engine.orchestrator
@@ -4610,15 +4617,15 @@ async def get_task(request: Request, task_id: str):
 
     # Build progress
     completed, total = task.progress
-    failed = sum(
-        1 for s in task.plan.subtasks if s.status == SubtaskStatus.FAILED
-    ) if task.plan else 0
-    pending = sum(
-        1 for s in task.plan.subtasks if s.status == SubtaskStatus.PENDING
-    ) if task.plan else 0
-    running = sum(
-        1 for s in task.plan.subtasks if s.status == SubtaskStatus.RUNNING
-    ) if task.plan else 0
+    failed = (
+        sum(1 for s in task.plan.subtasks if s.status == SubtaskStatus.FAILED) if task.plan else 0
+    )
+    pending = (
+        sum(1 for s in task.plan.subtasks if s.status == SubtaskStatus.PENDING) if task.plan else 0
+    )
+    running = (
+        sum(1 for s in task.plan.subtasks if s.status == SubtaskStatus.RUNNING) if task.plan else 0
+    )
 
     progress = ProgressResponse(
         total_subtasks=total,
@@ -4658,12 +4665,9 @@ async def stream_task_events(request: Request, task_id: str):
         queue: asyncio.Queue[Event] = asyncio.Queue(maxsize=_STREAM_QUEUE_MAXSIZE)
 
         def handler(event: Event):
-            if (
-                event.task_id == task_id
-                and should_deliver_operator(
-                    event.event_type,
-                    engine.effective_telemetry_mode(),
-                )
+            if event.task_id == task_id and should_deliver_operator(
+                event.event_type,
+                engine.effective_telemetry_mode(),
             ):
                 try:
                     queue.put_nowait(event)
@@ -4678,15 +4682,19 @@ async def stream_task_events(request: Request, task_id: str):
                     event = await asyncio.wait_for(queue.get(), timeout=30.0)
                     yield {
                         "event": event.event_type,
-                        "data": json.dumps({
-                            "task_id": event.task_id,
-                            **event.data,
-                            "timestamp": event.timestamp,
-                        }),
+                        "data": json.dumps(
+                            {
+                                "task_id": event.task_id,
+                                **event.data,
+                                "timestamp": event.timestamp,
+                            }
+                        ),
                     }
                     # Stop streaming when task is terminal
                     if event.event_type in (
-                        TASK_COMPLETED, TASK_FAILED, TASK_CANCELLED,
+                        TASK_COMPLETED,
+                        TASK_FAILED,
+                        TASK_CANCELLED,
                     ):
                         return
                 except TimeoutError:
@@ -4730,7 +4738,9 @@ async def stream_task_tokens(request: Request, task_id: str):
 
         def terminal_handler(event: Event):
             if event.task_id == task_id and event.event_type in (
-                TASK_COMPLETED, TASK_FAILED, TASK_CANCELLED,
+                TASK_COMPLETED,
+                TASK_FAILED,
+                TASK_CANCELLED,
             ):
                 if terminal_queue.empty():
                     terminal_queue.put_nowait(event)
@@ -4744,11 +4754,13 @@ async def stream_task_tokens(request: Request, task_id: str):
                     event = await asyncio.wait_for(queue.get(), timeout=1.0)
                     yield {
                         "event": "token",
-                        "data": json.dumps({
-                            "token": event.data.get("token", ""),
-                            "subtask_id": event.data.get("subtask_id", ""),
-                            "model": event.data.get("model", ""),
-                        }),
+                        "data": json.dumps(
+                            {
+                                "token": event.data.get("token", ""),
+                                "subtask_id": event.data.get("subtask_id", ""),
+                                "model": event.data.get("model", ""),
+                            }
+                        ),
                     }
                 except TimeoutError:
                     # Check if task is done
@@ -4872,21 +4884,25 @@ async def steer_task(request: Request, task_id: str, body: TaskSteerRequest):
         )
 
     # Store as user instruction in memory
-    await engine.memory_manager.store(MemoryEntry(
-        task_id=task_id,
-        entry_type="user_instruction",
-        summary=body.instruction[:150],
-        detail=body.instruction,
-        tags="steer",
-    ))
-    engine.event_bus.emit(Event(
-        event_type=STEER_INSTRUCTION,
-        task_id=task_id,
-        data={
-            "instruction_chars": len(str(body.instruction or "")),
-            "source": "api_patch",
-        },
-    ))
+    await engine.memory_manager.store(
+        MemoryEntry(
+            task_id=task_id,
+            entry_type="user_instruction",
+            summary=body.instruction[:150],
+            detail=body.instruction,
+            tags="steer",
+        )
+    )
+    engine.event_bus.emit(
+        Event(
+            event_type=STEER_INSTRUCTION,
+            task_id=task_id,
+            data={
+                "instruction_chars": len(str(body.instruction or "")),
+                "source": "api_patch",
+            },
+        )
+    )
 
     return {"status": "ok", "message": "Instruction injected."}
 
@@ -4925,15 +4941,17 @@ async def cancel_task(request: Request, task_id: str):
             latest_run_id = ""
             if isinstance(task.metadata, dict):
                 latest_run_id = str(task.metadata.get("run_id", "") or "").strip()
-            engine.event_bus.emit(Event(
-                event_type=TASK_CANCELLED,
-                task_id=task_id,
-                data={
-                    "run_id": latest_run_id,
-                    "reason": "cancel_requested",
-                    "outcome": "cancelled",
-                },
-            ))
+            engine.event_bus.emit(
+                Event(
+                    event_type=TASK_CANCELLED,
+                    task_id=task_id,
+                    data={
+                        "run_id": latest_run_id,
+                        "reason": "cancel_requested",
+                        "outcome": "cancelled",
+                    },
+                )
+            )
         return {
             "status": "ok",
             "message": f"Task {task_id} cancelled.",
@@ -4959,24 +4977,28 @@ async def cancel_task(request: Request, task_id: str):
             status="cancelled",
             last_error="cancel_requested",
         )
-    engine.event_bus.emit(Event(
-        event_type=TASK_CANCEL_REQUESTED,
-        task_id=task_id,
-        data={
-            "requested": True,
-            "path": "api_fallback",
-            "run_id": latest_run_id,
-        },
-    ))
-    engine.event_bus.emit(Event(
-        event_type=TASK_CANCELLED,
-        task_id=task_id,
-        data={
-            "run_id": latest_run_id,
-            "reason": "cancel_requested",
-            "outcome": "cancelled",
-        },
-    ))
+    engine.event_bus.emit(
+        Event(
+            event_type=TASK_CANCEL_REQUESTED,
+            task_id=task_id,
+            data={
+                "requested": True,
+                "path": "api_fallback",
+                "run_id": latest_run_id,
+            },
+        )
+    )
+    engine.event_bus.emit(
+        Event(
+            event_type=TASK_CANCELLED,
+            task_id=task_id,
+            data={
+                "run_id": latest_run_id,
+                "reason": "cancel_requested",
+                "outcome": "cancelled",
+            },
+        )
+    )
     return {
         "status": "ok",
         "message": f"Task {task_id} cancelled.",
@@ -5039,16 +5061,11 @@ async def resume_task(request: Request, task_id: str):
         should_spawn_worker = (
             task.status in (TaskStatus.EXECUTING, TaskStatus.PLANNING)
             and not worker_inflight
-            and (
-                task_run is None
-                or task_run_status in {"queued", "running"}
-            )
+            and (task_run is None or task_run_status in {"queued", "running"})
         )
         if should_spawn_worker:
             process_name = str(
-                (task_run or {}).get("process_name", "")
-                or metadata.get("process", "")
-                or "",
+                (task_run or {}).get("process_name", "") or metadata.get("process", "") or "",
             ).strip()
             process = await engine._resolve_process_definition(
                 process_name=process_name,
@@ -5085,14 +5102,16 @@ async def approve_task(request: Request, task_id: str, body: ApprovalRequest):
 
     # Store approval decision in memory
     content = f"{'Approved' if body.approved else 'Rejected'}: {body.reason or 'No reason given'}"
-    await engine.memory_manager.store(MemoryEntry(
-        task_id=task_id,
-        subtask_id=body.subtask_id,
-        entry_type="decision",
-        summary=content[:150],
-        detail=content,
-        tags="approval",
-    ))
+    await engine.memory_manager.store(
+        MemoryEntry(
+            task_id=task_id,
+            subtask_id=body.subtask_id,
+            entry_type="decision",
+            summary=content[:150],
+            detail=content,
+            tags="approval",
+        )
+    )
 
     return {
         "status": "ok",
@@ -5110,21 +5129,25 @@ async def submit_feedback(request: Request, task_id: str, body: FeedbackRequest)
     if not await _task_state_exists(engine, task_id):
         raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
 
-    await engine.memory_manager.store(MemoryEntry(
-        task_id=task_id,
-        subtask_id=body.subtask_id or "",
-        entry_type="user_instruction",
-        summary=body.feedback[:150],
-        detail=body.feedback,
-        tags="feedback",
-    ))
+    await engine.memory_manager.store(
+        MemoryEntry(
+            task_id=task_id,
+            subtask_id=body.subtask_id or "",
+            entry_type="user_instruction",
+            summary=body.feedback[:150],
+            detail=body.feedback,
+            tags="feedback",
+        )
+    )
 
     return {"status": "ok", "message": "Feedback recorded."}
 
 
 @router.post("/tasks/{task_id}/message")
 async def send_conversation_message(
-    request: Request, task_id: str, body: ConversationMessageRequest,
+    request: Request,
+    task_id: str,
+    body: ConversationMessageRequest,
 ):
     """Send a conversational message to a running task.
 
@@ -5146,23 +5169,27 @@ async def send_conversation_message(
         )
 
     # Store as conversation turn in memory
-    await engine.memory_manager.store(MemoryEntry(
-        task_id=task_id,
-        entry_type="user_instruction",
-        summary=body.message[:150],
-        detail=body.message,
-        tags="conversation",
-    ))
+    await engine.memory_manager.store(
+        MemoryEntry(
+            task_id=task_id,
+            entry_type="user_instruction",
+            summary=body.message[:150],
+            detail=body.message,
+            tags="conversation",
+        )
+    )
 
     # Emit conversation event
-    engine.event_bus.emit(Event(
-        event_type=CONVERSATION_MESSAGE,
-        task_id=task_id,
-        data={
-            "role": body.role,
-            "message": body.message,
-        },
-    ))
+    engine.event_bus.emit(
+        Event(
+            event_type=CONVERSATION_MESSAGE,
+            task_id=task_id,
+            data={
+                "role": body.role,
+                "message": body.message,
+            },
+        )
+    )
 
     return {
         "status": "ok",
@@ -5319,10 +5346,7 @@ async def get_setup_status(request: Request):
         needs_setup=needs_setup,
         config_path=str(config_path),
         providers=_setup_provider_rows(),
-        role_presets={
-            name: list(roles)
-            for name, roles in setup_mod.ROLE_PRESETS.items()
-        },
+        role_presets={name: list(roles) for name, roles in setup_mod.ROLE_PRESETS.items()},
     )
 
 
@@ -5371,9 +5395,7 @@ async def list_workspaces(request: Request, include_archived: bool = False):
     sessions = await engine.conversation_store.list_sessions()
     payload: list[WorkspaceSummaryResponse] = []
     for workspace in workspaces:
-        workspace_tasks = [
-            row for row in tasks if _workspace_matches_task(workspace, row)
-        ]
+        workspace_tasks = [row for row in tasks if _workspace_matches_task(workspace, row)]
         workspace_sessions = [
             row for row in sessions if _workspace_matches_path(workspace, row.get("workspace_path"))
         ]
@@ -5552,9 +5574,7 @@ def _validate_setup_models(models: list[Any]) -> list[dict[str, Any]]:
         model_name = str(getattr(raw_model, "model", "") or "").strip()
         api_key = str(getattr(raw_model, "api_key", "") or "")
         roles = [
-            str(role).strip()
-            for role in getattr(raw_model, "roles", []) or []
-            if str(role).strip()
+            str(role).strip() for role in getattr(raw_model, "roles", []) or [] if str(role).strip()
         ]
         if not name:
             raise HTTPException(status_code=400, detail="Model name is required.")
@@ -5683,9 +5703,8 @@ def _mcp_runtime_auth_state_override(
         return None
 
     oauth_state = oauth_state_for_alias(clean_alias, server=mcp_server)
-    if (
-        str(oauth_state.get("state", "") or "").strip().lower() != "ready"
-        or not bool(oauth_state.get("has_token", False))
+    if str(oauth_state.get("state", "") or "").strip().lower() != "ready" or not bool(
+        oauth_state.get("has_token", False)
     ):
         return None
 
@@ -5697,10 +5716,7 @@ def _mcp_runtime_auth_state_override(
         has_token=True,
         expired=False,
         expires_at=oauth_state.get("expires_at"),
-        token_type=(
-            str(oauth_state.get("token_type", "") or "").strip()
-            or None
-        ),
+        token_type=(str(oauth_state.get("token_type", "") or "").strip() or None),
         scopes=[
             str(scope).strip()
             for scope in list(oauth_state.get("scopes", []) or [])
@@ -5876,8 +5892,7 @@ def _build_integration_selection_state(
         if str(getattr(resource, "status", "")).strip().lower() == "active"
     }
     active_resource_refs = {
-        resource.resource_ref: resource.resource_id
-        for resource in active_resources_by_id.values()
+        resource.resource_ref: resource.resource_id for resource in active_resources_by_id.values()
     }
 
     selections: dict[str, str] = {}
@@ -6090,10 +6105,14 @@ def _build_workspace_integrations_response(
             provider=view.alias,
             mcp_server=view.alias,
         )
-        bound_profile_ids = [
-            binding.profile_id
-            for binding in active_bindings_for_resource(resource_store, resource.resource_id)
-        ] if resource is not None else []
+        bound_profile_ids = (
+            [
+                binding.profile_id
+                for binding in active_bindings_for_resource(resource_store, resource.resource_id)
+            ]
+            if resource is not None
+            else []
+        )
         for profile_id in bound_profile_ids:
             bound_resource_refs_by_profile.setdefault(profile_id, []).append(
                 resource.resource_ref if resource is not None else f"mcp:{view.alias}"
@@ -6188,72 +6207,72 @@ def _build_workspace_integrations_response(
         if (
             effective_profile is None
             and view.server.oauth.enabled
-            and (
-                auth_state.storage != "legacy_alias_store"
-                or not auth_state.has_token
-            )
+            and (auth_state.storage != "legacy_alias_store" or not auth_state.has_token)
         ):
             if routing_reason == "multiple_bound_accounts":
                 remediation.append("Choose which account should be the default for this server.")
             else:
                 remediation.append("Connect an account for this server.")
-        remediation.extend(_integration_account_remediation(
-            auth_state=auth_state,
-            is_effective=(
-                effective_profile is not None
-                or auth_state.storage == "legacy_alias_store"
-            ),
-        ))
+        remediation.extend(
+            _integration_account_remediation(
+                auth_state=auth_state,
+                is_effective=(
+                    effective_profile is not None or auth_state.storage == "legacy_alias_store"
+                ),
+            )
+        )
         if auth_state.storage == "legacy_alias_store" and auth_state.has_token:
             remediation.append("Migrate this legacy MCP token into a Loom account.")
         remediation = list(dict.fromkeys(item for item in remediation if item))
 
-        mcp_rows.append(MCPServerManagementResponse(
-            alias=view.alias,
-            type=view.server.type,
-            enabled=bool(view.server.enabled),
-            source=view.source,
-            source_path=source_path_text,
-            source_label=source_label,
-            command=str(view.server.command or ""),
-            args=[
-                str(item).strip()
-                for item in list(getattr(view.server, "args", []) or [])
-                if str(item).strip()
-            ],
-            url=str(view.server.url or view.server.fallback_sse_url or ""),
-            fallback_sse_url=str(view.server.fallback_sse_url or ""),
-            cwd=str(view.server.cwd or ""),
-            timeout_seconds=int(view.server.timeout_seconds or 0),
-            oauth_enabled=bool(view.server.oauth.enabled),
-            oauth_scopes=[
-                str(scope).strip()
-                for scope in list(getattr(view.server.oauth, "scopes", []) or [])
-                if str(scope).strip()
-            ],
-            allow_insecure_http=bool(view.server.allow_insecure_http),
-            allow_private_network=bool(view.server.allow_private_network),
-            trust_state=trust_state,
-            trust_summary=trust_summary,
-            approval_required=approval_required,
-            approval_state=approval_state,
-            runtime_state=runtime_state,
-            resource_id=resource.resource_id if resource is not None else "",
-            auth_provider=(
-                str(resource.provider or "").strip()
-                if resource is not None
-                else (
-                    str(effective_profile.provider or "").strip()
-                    if effective_profile is not None
-                    else str(view.alias or "")
-                )
-            ),
-            auth_state=auth_state,
-            effective_account=effective_account,
-            bound_profile_ids=sorted(set(bound_profile_ids)),
-            remediation=remediation,
-            flags=flags,
-        ))
+        mcp_rows.append(
+            MCPServerManagementResponse(
+                alias=view.alias,
+                type=view.server.type,
+                enabled=bool(view.server.enabled),
+                source=view.source,
+                source_path=source_path_text,
+                source_label=source_label,
+                command=str(view.server.command or ""),
+                args=[
+                    str(item).strip()
+                    for item in list(getattr(view.server, "args", []) or [])
+                    if str(item).strip()
+                ],
+                url=str(view.server.url or view.server.fallback_sse_url or ""),
+                fallback_sse_url=str(view.server.fallback_sse_url or ""),
+                cwd=str(view.server.cwd or ""),
+                timeout_seconds=int(view.server.timeout_seconds or 0),
+                oauth_enabled=bool(view.server.oauth.enabled),
+                oauth_scopes=[
+                    str(scope).strip()
+                    for scope in list(getattr(view.server.oauth, "scopes", []) or [])
+                    if str(scope).strip()
+                ],
+                allow_insecure_http=bool(view.server.allow_insecure_http),
+                allow_private_network=bool(view.server.allow_private_network),
+                trust_state=trust_state,
+                trust_summary=trust_summary,
+                approval_required=approval_required,
+                approval_state=approval_state,
+                runtime_state=runtime_state,
+                resource_id=resource.resource_id if resource is not None else "",
+                auth_provider=(
+                    str(resource.provider or "").strip()
+                    if resource is not None
+                    else (
+                        str(effective_profile.provider or "").strip()
+                        if effective_profile is not None
+                        else str(view.alias or "")
+                    )
+                ),
+                auth_state=auth_state,
+                effective_account=effective_account,
+                bound_profile_ids=sorted(set(bound_profile_ids)),
+                remediation=remediation,
+                flags=flags,
+            )
+        )
 
     account_rows: list[AccountInfoResponse] = []
     views_by_alias = {view.alias: view for view in mcp_views}
@@ -6265,11 +6284,9 @@ def _build_workspace_integrations_response(
             user_path=merged_auth.user_path,
         )
         bound_refs = sorted(set(bound_resource_refs_by_profile.get(profile_id, [])))
-        used_by_mcp_servers = sorted({
-            ref.split(":", 1)[1]
-            for ref in bound_refs
-            if ref.startswith("mcp:")
-        })
+        used_by_mcp_servers = sorted(
+            {ref.split(":", 1)[1] for ref in bound_refs if ref.startswith("mcp:")}
+        )
         effective_for_mcp_servers = sorted(
             set(effective_server_aliases_by_profile.get(profile_id, []))
         )
@@ -6289,33 +6306,34 @@ def _build_workspace_integrations_response(
             is_effective=bool(effective_for_mcp_servers),
         )
 
-        account_rows.append(AccountInfoResponse(
-            profile_id=profile.profile_id,
-            provider=profile.provider,
-            account_label=profile.account_label,
-            mode=profile.mode,
-            status=profile.status,
-            source=profile_source,
-            source_path=profile_source_path,
-            mcp_server=profile.mcp_server,
-            token_ref=profile.token_ref,
-            secret_ref=profile.secret_ref,
-            writable_storage_kind=_writable_storage_kind_for_profile(profile),
-            auth_state=auth_state,
-            default_selectors=default_selectors_by_profile.get(profile_id, []),
-            bound_resource_refs=bound_refs,
-            used_by_mcp_servers=used_by_mcp_servers,
-            effective_for_mcp_servers=effective_for_mcp_servers,
-            remediation=remediation,
-        ))
+        account_rows.append(
+            AccountInfoResponse(
+                profile_id=profile.profile_id,
+                provider=profile.provider,
+                account_label=profile.account_label,
+                mode=profile.mode,
+                status=profile.status,
+                source=profile_source,
+                source_path=profile_source_path,
+                mcp_server=profile.mcp_server,
+                token_ref=profile.token_ref,
+                secret_ref=profile.secret_ref,
+                writable_storage_kind=_writable_storage_kind_for_profile(profile),
+                auth_state=auth_state,
+                default_selectors=default_selectors_by_profile.get(profile_id, []),
+                bound_resource_refs=bound_refs,
+                used_by_mcp_servers=used_by_mcp_servers,
+                effective_for_mcp_servers=effective_for_mcp_servers,
+                remediation=remediation,
+            )
+        )
 
-    connected_server_count = sum(
-        1 for item in mcp_rows if item.runtime_state == "ready"
-    )
+    connected_server_count = sum(1 for item in mcp_rows if item.runtime_state == "ready")
     attention_server_count = sum(
         1
         for item in mcp_rows
-        if item.runtime_state in {
+        if item.runtime_state
+        in {
             "needs_auth",
             "needs_refresh",
             "draft",
@@ -6323,9 +6341,7 @@ def _build_workspace_integrations_response(
             "rejected",
         }
     )
-    pending_approval_count = sum(
-        1 for item in mcp_rows if item.runtime_state == "pending_approval"
-    )
+    pending_approval_count = sum(1 for item in mcp_rows if item.runtime_state == "pending_approval")
     legacy_auth_server_count = sum(
         1 for item in mcp_rows if item.auth_state.storage == "legacy_alias_store"
     )
@@ -6584,13 +6600,9 @@ def _oauth_provider_config_from_mcp_alias(
     if view is None:
         raise MCPOAuthFlowError(f"MCP server not found: {clean_alias}")
     if view.server.type != MCP_SERVER_TYPE_REMOTE:
-        raise MCPOAuthFlowError(
-            "Browser OAuth login is only available for remote MCP aliases."
-        )
+        raise MCPOAuthFlowError("Browser OAuth login is only available for remote MCP aliases.")
     if not view.server.oauth.enabled:
-        raise MCPOAuthFlowError(
-            f"MCP server {clean_alias!r} does not have OAuth enabled."
-        )
+        raise MCPOAuthFlowError(f"MCP server {clean_alias!r} does not have OAuth enabled.")
     if view.server.approval_required and view.server.approval_state != "approved":
         raise MCPOAuthFlowError(
             "Approve this workspace-defined remote server before connecting an account."
@@ -7025,16 +7037,12 @@ async def test_workspace_mcp_server(
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
         status = "ok"
-        message = (
-            f"Discovered {len(tools)} tool{'s' if len(tools) != 1 else ''} "
-            f"for {view.alias}."
-        )
+        message = f"Discovered {len(tools)} tool{'s' if len(tools) != 1 else ''} for {view.alias}."
     tool_names = sorted(
         {
             str(item.get("name", "") or "").strip()
             for item in tools
-            if isinstance(item, dict)
-            and str(item.get("name", "") or "").strip()
+            if isinstance(item, dict) and str(item.get("name", "") or "").strip()
         }
     )
     return MCPServerActionResponse(
@@ -7080,10 +7088,7 @@ async def _runtime_mcp_action(
             if refreshed.status == "failed":
                 reason = str(refreshed.reason or "").strip() or "Refresh failed."
                 lowered = reason.lower()
-                if (
-                    "refresh token is missing" in lowered
-                    or "refresh metadata missing" in lowered
-                ):
+                if "refresh token is missing" in lowered or "refresh metadata missing" in lowered:
                     raise HTTPException(
                         status_code=400,
                         detail=(
@@ -7205,10 +7210,7 @@ async def select_workspace_mcp_account(
     if row.approval_required and row.approval_state != "approved":
         raise HTTPException(
             status_code=409,
-            detail=(
-                "Approve this workspace-defined remote server before selecting "
-                "an account."
-            ),
+            detail=("Approve this workspace-defined remote server before selecting an account."),
         )
 
     _, profile = await _workspace_auth_profile(
@@ -7230,8 +7232,7 @@ async def select_workspace_mcp_account(
         raise HTTPException(
             status_code=400,
             detail=(
-                f"Account {profile.profile_id!r} is not compatible with MCP "
-                f"server {clean_alias!r}."
+                f"Account {profile.profile_id!r} is not compatible with MCP server {clean_alias!r}."
             ),
         )
 
@@ -7355,22 +7356,14 @@ async def create_workspace_auth_account(
         mcp_server=mcp_server,
         secret_ref=str(body.secret_ref or "").strip(),
         token_ref=token_ref,
-        scopes=[
-            str(scope).strip()
-            for scope in list(body.scopes or [])
-            if str(scope).strip()
-        ],
+        scopes=[str(scope).strip() for scope in list(body.scopes or []) if str(scope).strip()],
         env={
             str(key).strip(): str(value)
             for key, value in dict(body.env or {}).items()
             if str(key).strip()
         },
         command=str(body.command or "").strip(),
-        auth_check=[
-            str(item).strip()
-            for item in list(body.auth_check or [])
-            if str(item).strip()
-        ],
+        auth_check=[str(item).strip() for item in list(body.auth_check or []) if str(item).strip()],
         metadata={
             str(key).strip(): str(value)
             for key, value in dict(body.metadata or {}).items()
@@ -7453,23 +7446,15 @@ async def update_workspace_auth_account(
         ),
         mcp_server=next_mcp_server,
         secret_ref=(
-            profile.secret_ref
-            if body.secret_ref is None
-            else str(body.secret_ref or "").strip()
+            profile.secret_ref if body.secret_ref is None else str(body.secret_ref or "").strip()
         ),
         token_ref=(
-            profile.token_ref
-            if body.token_ref is None
-            else str(body.token_ref or "").strip()
+            profile.token_ref if body.token_ref is None else str(body.token_ref or "").strip()
         ),
         scopes=(
             list(profile.scopes)
             if body.scopes is None
-            else [
-                str(scope).strip()
-                for scope in list(body.scopes or [])
-                if str(scope).strip()
-            ]
+            else [str(scope).strip() for scope in list(body.scopes or []) if str(scope).strip()]
         ),
         env=(
             dict(profile.env)
@@ -7480,19 +7465,11 @@ async def update_workspace_auth_account(
                 if str(key).strip()
             }
         ),
-        command=(
-            profile.command
-            if body.command is None
-            else str(body.command or "").strip()
-        ),
+        command=(profile.command if body.command is None else str(body.command or "").strip()),
         auth_check=(
             list(profile.auth_check)
             if body.auth_check is None
-            else [
-                str(item).strip()
-                for item in list(body.auth_check or [])
-                if str(item).strip()
-            ]
+            else [str(item).strip() for item in list(body.auth_check or []) if str(item).strip()]
         ),
         metadata=(
             dict(profile.metadata)
@@ -8061,14 +8038,16 @@ async def reply_approval(
         if not resolved:
             raise HTTPException(status_code=404, detail="Pending task approval not found.")
         content = f"{'Approved' if approved else 'Rejected'}: {body.reason or 'No reason given'}"
-        await engine.memory_manager.store(MemoryEntry(
-            task_id=task_id,
-            subtask_id=subtask_id,
-            entry_type="decision",
-            summary=content[:150],
-            detail=content,
-            tags="approval",
-        ))
+        await engine.memory_manager.store(
+            MemoryEntry(
+                task_id=task_id,
+                subtask_id=subtask_id,
+                entry_type="decision",
+                summary=content[:150],
+                detail=content,
+                tags="approval",
+            )
+        )
         return {
             "status": "ok",
             "kind": "task_approval",
@@ -8148,12 +8127,9 @@ async def stream_notifications(
 
         def handler(event: Event):
             nonlocal overflowed
-            if (
-                event.event_type in relevant_events
-                and should_deliver_operator(
-                    event.event_type,
-                    engine.effective_telemetry_mode(),
-                )
+            if event.event_type in relevant_events and should_deliver_operator(
+                event.event_type,
+                engine.effective_telemetry_mode(),
             ):
                 try:
                     queue.put_nowait(event)
@@ -8296,11 +8272,13 @@ async def list_workspace_conversations(request: Request, workspace_id: str):
     engine = _get_engine(request)
     workspace = await _require_workspace(engine, workspace_id)
     sessions = await _workspace_sessions(engine, workspace)
-    linked_runs_by_session = await engine.conversation_store.list_linked_runs_for_sessions([
-        str(row.get("id", "") or "").strip()
-        for row in sessions
-        if str(row.get("id", "") or "").strip()
-    ])
+    linked_runs_by_session = await engine.conversation_store.list_linked_runs_for_sessions(
+        [
+            str(row.get("id", "") or "").strip()
+            for row in sessions
+            if str(row.get("id", "") or "").strip()
+        ]
+    )
     return [
         await _build_conversation_summary(
             engine,
@@ -8494,17 +8472,14 @@ async def get_conversation_events(
             )
         rows = await engine.conversation_store.get_transcript_page(
             conversation_id,
-            before_seq=(
-                None if before_seq is None else max(0, int(before_seq))
-            ),
+            before_seq=(None if before_seq is None else max(0, int(before_seq))),
             before_turn=before_turn,
             after_seq=max(0, int(after_seq)),
             limit=limit,
         )
         if rows:
-            if (
-                (before_seq is not None or after_seq <= 0)
-                and all("turn_number" not in row for row in rows)
+            if (before_seq is not None or after_seq <= 0) and all(
+                "turn_number" not in row for row in rows
             ):
                 rows = await _expand_conversation_event_page_prefix(
                     engine,
@@ -8541,10 +8516,9 @@ def _conversation_context_status_from_session_row(
 
 def _conversation_compaction_policy_mode(engine: Engine) -> str:
     limits = getattr(getattr(engine.config, "limits", None), "runner", None)
-    mode = str(
-        getattr(limits, "runner_compaction_policy_mode", "hybrid")
-        or "hybrid"
-    ).strip().lower()
+    mode = (
+        str(getattr(limits, "runner_compaction_policy_mode", "hybrid") or "hybrid").strip().lower()
+    )
     return (
         mode
         if mode in {"hybrid", "deterministic", "semantic", "legacy", "tiered", "off"}
@@ -8589,10 +8563,9 @@ async def get_conversation_status(
         )
         compaction_policy_mode = _conversation_compaction_policy_mode(engine)
         compaction_enabled = compaction_policy_mode != "off"
-        context_status = (
-            engine.conversation_context_status(conversation_id)
-            or _conversation_context_status_from_session_row(session)
-        )
+        context_status = engine.conversation_context_status(
+            conversation_id
+        ) or _conversation_context_status_from_session_row(session)
         if context_status is not None:
             context_status = {
                 **context_status,
@@ -8793,10 +8766,7 @@ async def stream_conversation_events(
 
         def handler(event: Event):
             nonlocal overflowed
-            if (
-                event.event_type == CONVERSATION_MESSAGE
-                and event.task_id == conversation_id
-            ):
+            if event.event_type == CONVERSATION_MESSAGE and event.task_id == conversation_id:
                 try:
                     queue.put_nowait(event)
                 except asyncio.QueueFull:
@@ -8859,14 +8829,16 @@ async def stream_conversation_events(
                         yield {
                             "event": "chat_event",
                             "id": str(seq),
-                            "data": json.dumps({
-                                "session_id": conversation_id,
-                                "seq": seq,
-                                "event_type": chat_event_type,
-                                "payload": payload if isinstance(payload, dict) else {},
-                                "payload_parse_error": False,
-                                "created_at": event.timestamp,
-                            }),
+                            "data": json.dumps(
+                                {
+                                    "session_id": conversation_id,
+                                    "seq": seq,
+                                    "event_type": chat_event_type,
+                                    "payload": payload if isinstance(payload, dict) else {},
+                                    "payload_parse_error": False,
+                                    "created_at": event.timestamp,
+                                }
+                            ),
                         }
                 except TimeoutError:
                     yield {"comment": "keepalive"}
@@ -8953,16 +8925,18 @@ async def get_run(request: Request, run_id: str):
         plan_data: list[dict[str, Any]] = []
         if task_obj is not None and task_obj.plan and task_obj.plan.subtasks:
             for s in task_obj.plan.subtasks:
-                plan_data.append({
-                    "id": s.id,
-                    "description": s.description,
-                    "status": s.status.value,
-                    "depends_on": s.depends_on,
-                    "phase_id": s.phase_id,
-                    "summary": s.summary or "",
-                    "is_critical_path": s.is_critical_path,
-                    "is_synthesis": s.is_synthesis,
-                })
+                plan_data.append(
+                    {
+                        "id": s.id,
+                        "description": s.description,
+                        "status": s.status.value,
+                        "depends_on": s.depends_on,
+                        "phase_id": s.phase_id,
+                        "summary": s.summary or "",
+                        "is_critical_path": s.is_critical_path,
+                        "is_synthesis": s.is_synthesis,
+                    }
+                )
         task_metadata = (
             task_obj.metadata
             if task_obj is not None and isinstance(task_obj.metadata, dict)
@@ -8980,6 +8954,7 @@ async def get_run(request: Request, run_id: str):
                 task_metadata.get("completion_grade", "") or "",
             ),
             "degraded_completion": task_metadata.get("degraded_completion", {}),
+            "quality_scorecard": task_metadata.get("quality_scorecard", {}),
         }
 
 
@@ -9166,6 +9141,7 @@ def _run_stream_payload_from_event(event: Event) -> dict[str, Any]:
         "streaming": not terminal and status != "paused",
     }
 
+
 @router.get("/runs/{run_id}/timeline")
 async def get_run_timeline(
     request: Request,
@@ -9216,6 +9192,7 @@ async def stream_run_events(
     is_terminal = resolved_status in ("completed", "failed", "cancelled")
 
     if task is None and is_terminal:
+
         async def inactive_generator():
             last_event_id = str(request.headers.get("last-event-id", "") or "").strip()
             cursor = await _resolve_run_stream_cursor(
@@ -9282,14 +9259,16 @@ async def stream_run_events(
                 return
             yield {
                 "event": "run_event",
-                "data": json.dumps({
-                    "event_type": "run_snapshot",
-                    "task_id": run_id,
-                    "timestamp": _now_iso(),
-                    "status": resolved_status,
-                    "terminal": True,
-                    "streaming": False,
-                }),
+                "data": json.dumps(
+                    {
+                        "event_type": "run_snapshot",
+                        "task_id": run_id,
+                        "timestamp": _now_iso(),
+                        "status": resolved_status,
+                        "terminal": True,
+                        "streaming": False,
+                    }
+                ),
             }
 
         return EventSourceResponse(inactive_generator())
@@ -9491,11 +9470,13 @@ async def cancel_run(request: Request, run_id: str):
     if current_status in ("completed", "failed", "cancelled"):
         return {"status": "ok", "message": f"Run already {current_status}."}
     await engine.database.update_task_status(run_id, "cancelled")
-    engine.event_bus.emit(Event(
-        event_type=TASK_CANCEL_REQUESTED,
-        task_id=run_id,
-        data={"requested": True, "path": "api_fallback"},
-    ))
+    engine.event_bus.emit(
+        Event(
+            event_type=TASK_CANCEL_REQUESTED,
+            task_id=run_id,
+            data={"requested": True, "path": "api_fallback"},
+        )
+    )
     return {"status": "ok", "message": f"Run {run_id} cancelled."}
 
 
@@ -9532,13 +9513,16 @@ async def delete_run(request: Request, run_id: str):
             status = str(cancel_result.get("task_status", "") or status).strip().lower()
 
     await engine.database.execute(
-        "DELETE FROM events WHERE task_id=?", (run_id,),
+        "DELETE FROM events WHERE task_id=?",
+        (run_id,),
     )
     await engine.database.execute(
-        "DELETE FROM task_runs WHERE task_id=?", (run_id,),
+        "DELETE FROM task_runs WHERE task_id=?",
+        (run_id,),
     )
     await engine.database.execute(
-        "DELETE FROM tasks WHERE id=?", (run_id,),
+        "DELETE FROM tasks WHERE id=?",
+        (run_id,),
     )
     try:
         await asyncio.to_thread(engine.state_manager.delete, run_id)
@@ -9643,16 +9627,18 @@ async def restart_run(request: Request, run_id: str):
             else None
         ),
     )
-    engine.event_bus.emit(Event(
-        event_type=TASK_RESTARTED,
-        task_id=task.id,
-        data={
-            "run_id": next_run_id,
-            "previous_run_id": previous_run_id,
-            "message": "Run resumed from saved task state.",
-            "recovered": True,
-        },
-    ))
+    engine.event_bus.emit(
+        Event(
+            event_type=TASK_RESTARTED,
+            task_id=task.id,
+            data={
+                "run_id": next_run_id,
+                "previous_run_id": previous_run_id,
+                "message": "Run resumed from saved task state.",
+                "recovered": True,
+            },
+        )
+    )
     await engine.submit_task(
         task=task,
         process=process,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -26,6 +27,7 @@ from loom.events.types import (
 )
 from loom.models.base import ModelResponse, TokenUsage
 from loom.models.router import ModelRouter, ResponseValidator
+from loom.processes.schema import PhaseTemplate, ProcessDefinition
 from loom.prompts.assembler import PromptAssembler
 from loom.state.task_state import Subtask
 from loom.tools.registry import ToolResult
@@ -111,6 +113,11 @@ class TestDataStructures:
 
 
 class TestDeterministicVerifier:
+    def test_processless_verifier_defaults_to_method_resilient_policy(self):
+        verifier = DeterministicVerifier(process=None)
+
+        assert verifier._tool_success_policy == "method_resilient"
+
     @pytest.mark.asyncio
     async def test_passes_with_no_tool_calls(self):
         v = DeterministicVerifier()
@@ -149,8 +156,7 @@ class TestDeterministicVerifier:
             tool="write_file",
             args={"path": "test.py"},
             result=ToolResult.fail(
-                "reason_code=forbidden_output_path; "
-                "Canonical deliverable policy violation.",
+                "reason_code=forbidden_output_path; Canonical deliverable policy violation.",
             ),
         )
         result = await v.verify(_make_subtask(), "output", [tc], None)
@@ -160,9 +166,11 @@ class TestDeterministicVerifier:
 
     @pytest.mark.asyncio
     async def test_safety_integrity_policy_downgrades_non_safety_tool_failures(self):
-        process = _make_process(static_checks={
-            "tool_success_policy": "safety_integrity_only",
-        })
+        process = _make_process(
+            static_checks={
+                "tool_success_policy": "safety_integrity_only",
+            }
+        )
         v = DeterministicVerifier(process=process)
         tc = MockToolCallRecord(
             tool="edit_file",
@@ -173,16 +181,15 @@ class TestDeterministicVerifier:
         )
         result = await v.verify(_make_subtask(), "output", [tc], None)
         assert result.passed
-        assert any(
-            c.name == "tool_edit_file_advisory" and c.passed
-            for c in result.checks
-        )
+        assert any(c.name == "tool_edit_file_advisory" and c.passed for c in result.checks)
 
     @pytest.mark.asyncio
     async def test_safety_integrity_policy_keeps_safety_failures_hard(self):
-        process = _make_process(static_checks={
-            "tool_success_policy": "safety_integrity_only",
-        })
+        process = _make_process(
+            static_checks={
+                "tool_success_policy": "safety_integrity_only",
+            }
+        )
         v = DeterministicVerifier(process=process)
         tc = MockToolCallRecord(
             tool="web_fetch",
@@ -193,10 +200,7 @@ class TestDeterministicVerifier:
         )
         result = await v.verify(_make_subtask(), "output", [tc], None)
         assert not result.passed
-        assert any(
-            c.name == "tool_web_fetch_success" and not c.passed
-            for c in result.checks
-        )
+        assert any(c.name == "tool_web_fetch_success" and not c.passed for c in result.checks)
 
     @pytest.mark.asyncio
     async def test_adhoc_process_defaults_to_method_resilient_policy(self):
@@ -212,10 +216,7 @@ class TestDeterministicVerifier:
         result = await v.verify(_make_subtask(), "output", [tc], None)
         assert not result.passed
         assert result.reason_code == "tool_method_failed"
-        assert any(
-            c.name == "tool_edit_file_success" and not c.passed
-            for c in result.checks
-        )
+        assert any(c.name == "tool_edit_file_success" and not c.passed for c in result.checks)
 
     @pytest.mark.asyncio
     async def test_method_resilient_policy_classifies_write_permission_failure(self):
@@ -331,10 +332,7 @@ class TestDeterministicVerifier:
         result = await v.verify(_make_subtask(), "output", [tc], None)
 
         assert not result.passed
-        assert any(
-            c.name == "tool_read_file_success" and not c.passed
-            for c in result.checks
-        )
+        assert any(c.name == "tool_read_file_success" and not c.passed for c in result.checks)
 
     @pytest.mark.asyncio
     async def test_adhoc_process_honors_explicit_all_tools_hard_policy(self):
@@ -353,10 +351,7 @@ class TestDeterministicVerifier:
         )
         result = await v.verify(_make_subtask(), "output", [tc], None)
         assert not result.passed
-        assert any(
-            c.name == "tool_edit_file_success" and not c.passed
-            for c in result.checks
-        )
+        assert any(c.name == "tool_edit_file_success" and not c.passed for c in result.checks)
 
     @pytest.mark.asyncio
     async def test_development_balanced_policy_keeps_test_failures_semantic(self):
@@ -408,7 +403,7 @@ class TestDeterministicVerifier:
                 "command": (
                     "cd dist && python3 -m http.server 8080 &\n"
                     "sleep 2\n"
-                    "curl -s -o /dev/null -w \"%{http_code}\" "
+                    'curl -s -o /dev/null -w "%{http_code}" '
                     "http://localhost:8080/index.html"
                 ),
             },
@@ -708,10 +703,7 @@ class TestDeterministicVerifier:
         )
         result = await v.verify(_make_subtask(), "output", [tc], None)
         assert result.passed
-        assert any(
-            c.name == "tool_web_fetch_advisory" and c.passed
-            for c in result.checks
-        )
+        assert any(c.name == "tool_web_fetch_advisory" and c.passed for c in result.checks)
 
     @pytest.mark.asyncio
     async def test_web_tool_404_failure_is_advisory(self):
@@ -723,10 +715,7 @@ class TestDeterministicVerifier:
         )
         result = await v.verify(_make_subtask(), "output", [tc], None)
         assert result.passed
-        assert any(
-            c.name == "tool_web_fetch_advisory" and c.passed
-            for c in result.checks
-        )
+        assert any(c.name == "tool_web_fetch_advisory" and c.passed for c in result.checks)
 
     @pytest.mark.asyncio
     async def test_web_tool_safety_failure_still_blocks(self):
@@ -740,10 +729,7 @@ class TestDeterministicVerifier:
         )
         result = await v.verify(_make_subtask(), "output", [tc], None)
         assert not result.passed
-        assert any(
-            c.name == "tool_web_fetch_success" and not c.passed
-            for c in result.checks
-        )
+        assert any(c.name == "tool_web_fetch_success" and not c.passed for c in result.checks)
 
     @pytest.mark.asyncio
     async def test_web_tool_response_too_large_is_advisory(self):
@@ -757,10 +743,7 @@ class TestDeterministicVerifier:
         )
         result = await v.verify(_make_subtask(), "output", [tc], None)
         assert result.passed
-        assert any(
-            c.name == "tool_web_fetch_advisory" and c.passed
-            for c in result.checks
-        )
+        assert any(c.name == "tool_web_fetch_advisory" and c.passed for c in result.checks)
 
     @pytest.mark.asyncio
     async def test_checks_file_nonempty(self, tmp_path):
@@ -878,15 +861,16 @@ class TestDeterministicVerifier:
         assert not result.passed
         assert result.reason_code == "csv_schema_mismatch"
         assert result.metadata["missing_targets"] == ["bad.csv"]
-        assert result.metadata["schema_diagnostics"] == [{
-            "target": "bad.csv",
-            "row_number": 3,
-            "actual_columns": 2,
-            "expected_columns": 3,
-        }]
+        assert result.metadata["schema_diagnostics"] == [
+            {
+                "target": "bad.csv",
+                "row_number": 3,
+                "actual_columns": 2,
+                "expected_columns": 3,
+            }
+        ]
         assert any(
-            (c.detail or "").find("reason_code=csv_schema_mismatch") >= 0
-            for c in result.checks
+            (c.detail or "").find("reason_code=csv_schema_mismatch") >= 0 for c in result.checks
         )
 
     @pytest.mark.asyncio
@@ -921,8 +905,7 @@ class TestDeterministicVerifier:
         assert result.outcome == "pass_with_warnings"
         assert result.reason_code == ""
         assert any(
-            c.name == "syntax_evidence_ledger.csv_advisory" and c.passed
-            for c in result.checks
+            c.name == "syntax_evidence_ledger.csv_advisory" and c.passed for c in result.checks
         )
 
     @pytest.mark.asyncio
@@ -1002,15 +985,412 @@ class TestLLMVerifier:
         async def compact(self, text: str, *, max_chars: int, label: str = "") -> str:
             return str(text or "")
 
+    @staticmethod
+    def _quality_verifier() -> LLMVerifier:
+        router = MagicMock(spec=ModelRouter)
+        prompts = MagicMock(spec=PromptAssembler)
+        prompts.process = ProcessDefinition(
+            name="quality-test",
+            quality_contract={
+                "enabled": True,
+                "dimensions": ["completeness", "analytical_depth"],
+                "minimum_overall_score": 0.8,
+                "minimum_dimension_score": 0.7,
+                "minimum_traceability_ratio": 0.5,
+                "required_sections": ["Executive Summary"],
+            },
+            phases=[
+                PhaseTemplate(
+                    id="analysis",
+                    description="Analyze",
+                    deliverables=["report.md", "source-index.csv"],
+                ),
+            ],
+        )
+        verifier = LLMVerifier(router, prompts, ResponseValidator())
+        verifier._compactor = TestLLMVerifier._FakeCompactor()
+        return verifier
+
+    @pytest.mark.asyncio
+    async def test_quality_artifact_snapshot_reads_all_expected_deliverables(
+        self,
+        tmp_path,
+    ):
+        verifier = self._quality_verifier()
+        for index in range(8):
+            (tmp_path / f"artifact-{index}.md").write_text(
+                f"# Artifact {index}\n\nSupported analysis {index}.",
+            )
+        verifier._prompts.process.phases[0].deliverables = [
+            f"artifact-{index}.md" for index in range(8)
+        ]
+        subtask = Subtask(id="analysis", phase_id="analysis", description="Analyze")
+
+        snapshot = await verifier._build_artifact_content_section(
+            subtask=subtask,
+            workspace=tmp_path,
+            tool_calls=[],
+            max_chars=20_000,
+            quality_contract={"enabled": True},
+        )
+
+        assert "artifact-0.md" in snapshot
+        assert "artifact-7.md" in snapshot
+
+    @pytest.mark.asyncio
+    async def test_quality_artifact_snapshot_includes_transitive_upstream_work(
+        self,
+        tmp_path,
+    ):
+        verifier = self._quality_verifier()
+        verifier._prompts.process.phases = [
+            PhaseTemplate(
+                id="collect",
+                description="Collect",
+                deliverables=["evidence.md"],
+            ),
+            PhaseTemplate(
+                id="interpret",
+                description="Interpret",
+                depends_on=["collect"],
+                deliverables=["analysis.md"],
+            ),
+            PhaseTemplate(
+                id="analysis",
+                description="Synthesize",
+                depends_on=["interpret"],
+                deliverables=["report.md", "source-index.csv"],
+            ),
+        ]
+        (tmp_path / "evidence.md").write_text("Finding [evidence: EV-1].")
+        (tmp_path / "analysis.md").write_text("Implication [evidence: EV-1].")
+        (tmp_path / "report.md").write_text(
+            "# Executive Summary\n\nDecision [evidence: EV-1].",
+        )
+        (tmp_path / "source-index.csv").write_text(
+            "evidence_id,source_url\nEV-1,https://example.invalid/source\n",
+        )
+        subtask = Subtask(id="analysis", phase_id="analysis", description="Analyze")
+
+        snapshot = await verifier._build_artifact_content_section(
+            subtask=subtask,
+            workspace=tmp_path,
+            tool_calls=[],
+            max_chars=20_000,
+            quality_contract={"enabled": True},
+        )
+        diagnostics = verifier._artifact_quality_diagnostics(
+            subtask=subtask,
+            workspace=tmp_path,
+            quality_contract={"enabled": True},
+        )
+
+        assert "evidence.md" in snapshot
+        assert "analysis.md" in snapshot
+        assert diagnostics["upstream_artifact_count"] == 2
+        assert diagnostics["upstream_evidence_reuse_ratio"] == 1.0
+        assert diagnostics["traceability_ratio"] == 1.0
+
+    def test_quality_diagnostics_detect_source_index_integrity_gaps(self, tmp_path):
+        verifier = self._quality_verifier()
+        (tmp_path / "report.md").write_text(
+            "# Executive Summary\n\nClaims [evidence: EV-1] [evidence: EV-2].",
+        )
+        (tmp_path / "source-index.csv").write_text(
+            "evidence_id,source_url\nEV-1,\nEV-1,https://example.invalid/source\n",
+        )
+        subtask = Subtask(id="analysis", phase_id="analysis", description="Analyze")
+
+        diagnostics = verifier._artifact_quality_diagnostics(
+            subtask=subtask,
+            workspace=tmp_path,
+            quality_contract={"enabled": True},
+        )
+
+        assert diagnostics["orphan_evidence_reference_count"] == 1
+        assert diagnostics["duplicate_source_index_id_count"] == 1
+        assert diagnostics["source_index_missing_url_count"] == 1
+
+    def test_quality_traceability_accepts_source_urls_without_evidence_ids(
+        self,
+        tmp_path,
+    ):
+        verifier = self._quality_verifier()
+        (tmp_path / "report.md").write_text(
+            "# Executive Summary\n\nSupported claim "
+            "(https://Example.invalid/source/?view=full#section).",
+        )
+        (tmp_path / "source-index.csv").write_text(
+            "evidence_id,source_url\n,https://example.invalid/source?view=full\n",
+        )
+        subtask = Subtask(id="analysis", phase_id="analysis", description="Analyze")
+
+        diagnostics = verifier._artifact_quality_diagnostics(
+            subtask=subtask,
+            workspace=tmp_path,
+            quality_contract={"enabled": True},
+        )
+
+        assert diagnostics["evidence_reference_count"] == 0
+        assert diagnostics["source_url_reference_count"] == 1
+        assert diagnostics["matched_source_url_reference_count"] == 1
+        assert diagnostics["traceability_ratio"] == 1.0
+        assert diagnostics["orphan_evidence_reference_count"] == 0
+
+    def test_quality_traceability_scores_mixed_ids_and_urls(self, tmp_path):
+        verifier = self._quality_verifier()
+        (tmp_path / "report.md").write_text(
+            "# Executive Summary\n\n"
+            "One [evidence: EV-1], two https://example.invalid/two, "
+            "three https://example.invalid/orphan.",
+        )
+        (tmp_path / "source-index.csv").write_text(
+            "evidence_id,source_url\n"
+            "EV-1,https://example.invalid/one\n"
+            "EV-2,https://example.invalid/two\n",
+        )
+        subtask = Subtask(id="analysis", phase_id="analysis", description="Analyze")
+
+        diagnostics = verifier._artifact_quality_diagnostics(
+            subtask=subtask,
+            workspace=tmp_path,
+            quality_contract={"enabled": True},
+        )
+
+        assert diagnostics["matched_evidence_reference_count"] == 1
+        assert diagnostics["matched_source_url_reference_count"] == 1
+        assert diagnostics["traceability_ratio"] == pytest.approx(2 / 3, abs=0.0001)
+        assert diagnostics["orphan_evidence_reference_count"] == 1
+
+    def test_required_sections_accept_reordered_equivalent_heading(self, tmp_path):
+        verifier = self._quality_verifier()
+        (tmp_path / "report.md").write_text(
+            "# Summary for Executives\n\nDecision-ready analysis.",
+        )
+        (tmp_path / "source-index.csv").write_text(
+            "evidence_id,source_url\n",
+        )
+        subtask = Subtask(id="analysis", phase_id="analysis", description="Analyze")
+
+        diagnostics = verifier._artifact_quality_diagnostics(
+            subtask=subtask,
+            workspace=tmp_path,
+            quality_contract={
+                "enabled": True,
+                "required_sections": ["Executive Summary"],
+            },
+        )
+
+        assert diagnostics["section_coverage_ratio"] == 1.0
+        assert diagnostics["missing_sections"] == []
+
+    def test_upstream_reuse_deduplicates_id_and_url_for_same_source(self, tmp_path):
+        verifier = self._quality_verifier()
+        verifier._prompts.process.phases = [
+            PhaseTemplate(
+                id="collect",
+                description="Collect",
+                deliverables=["evidence.md"],
+            ),
+            PhaseTemplate(
+                id="analysis",
+                description="Synthesize",
+                depends_on=["collect"],
+                deliverables=["report.md", "source-index.csv"],
+            ),
+        ]
+        (tmp_path / "evidence.md").write_text(
+            "Finding [evidence: EV-1] https://example.invalid/source.",
+        )
+        (tmp_path / "report.md").write_text(
+            "# Executive Summary\n\nDecision [evidence: EV-1].",
+        )
+        (tmp_path / "source-index.csv").write_text(
+            "evidence_id,source_url\nEV-1,https://example.invalid/source\n",
+        )
+        subtask = Subtask(id="analysis", phase_id="analysis", description="Analyze")
+
+        diagnostics = verifier._artifact_quality_diagnostics(
+            subtask=subtask,
+            workspace=tmp_path,
+            quality_contract={"enabled": True},
+        )
+
+        assert diagnostics["upstream_evidence_reference_count"] == 1
+        assert diagnostics["upstream_source_url_reference_count"] == 1
+        assert diagnostics["upstream_evidence_reuse_ratio"] == 1.0
+
+    def test_quality_floor_converts_thin_pass_to_targeted_failure(self, tmp_path):
+        verifier = self._quality_verifier()
+        (tmp_path / "report.md").write_text("# Executive Summary\n\nThin claim [evidence: EV-1].")
+        (tmp_path / "source-index.csv").write_text(
+            "evidence_id,source_url\nEV-1,https://example.invalid/source\n",
+        )
+        subtask = Subtask(id="analysis", phase_id="analysis", description="Analyze")
+        contract = verifier._quality_contract_for_subtask(subtask)
+        diagnostics = verifier._artifact_quality_diagnostics(
+            subtask=subtask,
+            workspace=tmp_path,
+            quality_contract=contract,
+        )
+        result = VerificationResult(
+            tier=2,
+            passed=True,
+            outcome="pass",
+            confidence=0.9,
+            metadata={
+                "quality": {
+                    "overall": 0.72,
+                    "requirement_coverage": 0.9,
+                    "dimensions": {
+                        "Completeness": 0.6,
+                        "analytical depth": 0.75,
+                    },
+                    "missing_targets": ["market-specific implications"],
+                },
+            },
+        )
+
+        audited = verifier._apply_quality_contract(
+            result=result,
+            quality_contract=contract,
+            diagnostics=diagnostics,
+        )
+
+        assert audited.passed is False
+        assert audited.reason_code == "quality_below_threshold"
+        assert audited.metadata["quality"]["meets_floor"] is False
+        assert "quality dimension: completeness" in audited.metadata["missing_targets"]
+
+    def test_ad_hoc_synthesis_gets_inferred_quality_contract(self):
+        verifier = self._quality_verifier()
+        verifier._prompts.process = None
+        subtask = Subtask(
+            id="final",
+            description="Synthesize the final report",
+            is_synthesis=True,
+        )
+
+        contract = verifier._quality_contract_for_subtask(subtask)
+
+        assert contract["enabled"] is True
+        assert contract["inferred"] is True
+        assert contract["minimum_overall_score"] == 0.72
+        assert "analytical_depth" in contract["dimensions"]
+
+    def test_ad_hoc_synthesis_prompt_includes_quality_and_claim_contracts(self):
+        verifier = self._quality_verifier()
+        verifier._prompts.process = None
+        subtask = Subtask(
+            id="final",
+            description="Synthesize the final report",
+            is_synthesis=True,
+            validity_contract_snapshot={
+                "enabled": True,
+                "claim_extraction": {"enabled": True},
+            },
+        )
+        contract = verifier._quality_contract_for_subtask(subtask)
+
+        prompt = verifier._augment_verifier_prompt(
+            "Verify this",
+            subtask=subtask,
+            quality_contract=contract,
+        )
+
+        assert "metadata.quality" in prompt
+        assert "metadata.claim_lifecycle" in prompt
+        assert "requirement_coverage" in prompt
+        assert "evidence_refs" in prompt
+
+    @pytest.mark.asyncio
+    async def test_tool_output_excerpt_is_bounded_without_semantic_compaction(self):
+        verifier = self._quality_verifier()
+        verifier._max_tool_output_excerpt_chars = 120
+        verifier._compactor.compact = AsyncMock(
+            side_effect=AssertionError("excerpt must not invoke semantic compaction")
+        )
+        result = SimpleNamespace(output="start " + ("detail " * 100) + " end")
+
+        excerpt = await verifier._tool_output_excerpt(
+            tool_name="read_file",
+            args={"path": "generic.md"},
+            result=result,
+        )
+
+        assert len(excerpt) <= 120
+        assert excerpt.startswith("start")
+        assert excerpt.endswith("end")
+
+    def test_quality_audit_does_not_mask_existing_failure(self):
+        verifier = self._quality_verifier()
+        result = VerificationResult(
+            tier=2,
+            passed=False,
+            outcome="fail",
+            reason_code="claim_contradicted",
+            confidence=0.9,
+            metadata={},
+        )
+        audited = verifier._apply_quality_contract(
+            result=result,
+            quality_contract=verifier._prompts.process.quality_contract,
+            diagnostics={"section_coverage_ratio": 0.0, "traceability_ratio": 0.0},
+        )
+        assert audited.reason_code == "claim_contradicted"
+        assert audited.metadata["quality"]["meets_floor"] is False
+
+    def test_observe_quality_policy_records_gap_without_failing_output(self, tmp_path):
+        verifier = self._quality_verifier()
+        verifier._config = VerificationConfig(quality_policy_mode="observe")
+        (tmp_path / "report.md").write_text("# Executive Summary\n\nThin.")
+        (tmp_path / "source-index.csv").write_text(
+            "evidence_id,source_url\n",
+        )
+        subtask = Subtask(id="analysis", phase_id="analysis", description="Analyze")
+        contract = verifier._quality_contract_for_subtask(subtask)
+        result = VerificationResult(
+            tier=2,
+            passed=True,
+            outcome="pass",
+            confidence=0.9,
+            metadata={
+                "quality": {
+                    "overall": 0.4,
+                    "requirement_coverage": 0.4,
+                    "dimensions": {
+                        "completeness": 0.4,
+                        "analytical_depth": 0.4,
+                    },
+                },
+            },
+        )
+
+        audited = verifier._apply_quality_contract(
+            result=result,
+            quality_contract=contract,
+            diagnostics=verifier._artifact_quality_diagnostics(
+                subtask=subtask,
+                workspace=tmp_path,
+                quality_contract=contract,
+            ),
+        )
+
+        assert audited.passed is True
+        assert audited.metadata["quality"]["meets_floor"] is False
+        assert audited.metadata["quality"]["policy_mode"] == "observe"
+
     @pytest.mark.asyncio
     async def test_passes_when_model_says_pass(self):
         router = MagicMock(spec=ModelRouter)
         model = AsyncMock()
         model.roles = ["verifier", "extractor"]
-        model.complete = AsyncMock(return_value=ModelResponse(
-            text=json.dumps({"passed": True, "issues": [], "confidence": 0.9}),
-            usage=TokenUsage(input_tokens=50, output_tokens=30, total_tokens=80),
-        ))
+        model.complete = AsyncMock(
+            return_value=ModelResponse(
+                text=json.dumps({"passed": True, "issues": [], "confidence": 0.9}),
+                usage=TokenUsage(input_tokens=50, output_tokens=30, total_tokens=80),
+            )
+        )
         router.select = MagicMock(return_value=model)
 
         prompts = MagicMock(spec=PromptAssembler)
@@ -1024,19 +1404,81 @@ class TestLLMVerifier:
         assert result.confidence == 0.9
 
     @pytest.mark.asyncio
+    async def test_inferred_quality_contract_self_corrects_missing_audit_locally(self):
+        router = MagicMock(spec=ModelRouter)
+        model = AsyncMock()
+        model.name = "mock-verifier"
+        model.roles = ["verifier", "extractor"]
+        quality = {
+            "overall": 0.9,
+            "requirement_coverage": 0.9,
+            "dimensions": {
+                "completeness": 0.9,
+                "evidence_traceability": 0.9,
+                "analytical_depth": 0.9,
+                "cross_artifact_synthesis": 0.9,
+                "uncertainty_handling": 0.9,
+                "internal_consistency": 0.9,
+            },
+            "missing_targets": [],
+        }
+        model.complete = AsyncMock(
+            side_effect=[
+                ModelResponse(
+                    text=json.dumps({"passed": True, "issues": [], "confidence": 0.9}),
+                    usage=TokenUsage(total_tokens=20),
+                ),
+                ModelResponse(
+                    text=json.dumps(
+                        {
+                            "passed": True,
+                            "issues": [],
+                            "confidence": 0.9,
+                            "metadata": {"quality": quality},
+                        }
+                    ),
+                    usage=TokenUsage(total_tokens=30),
+                ),
+            ]
+        )
+        router.select = MagicMock(return_value=model)
+        prompts = MagicMock(spec=PromptAssembler)
+        prompts.process = None
+        prompts.build_verifier_prompt = MagicMock(return_value="Verify this")
+        verifier = LLMVerifier(router, prompts, ResponseValidator())
+        verifier._compactor = self._FakeCompactor()
+
+        result = await verifier.verify(
+            _make_subtask(is_synthesis=True),
+            "output",
+            [],
+            None,
+        )
+
+        assert model.complete.await_count == 2
+        assert result.reason_code != "quality_assessment_missing"
+        assert result.metadata["quality_contract_retry"] is True
+        assert result.metadata["quality"]["overall"] == 0.9
+        assert result.metadata["quality"]["requirement_coverage"] == 0.9
+
+    @pytest.mark.asyncio
     async def test_fails_when_model_says_fail(self):
         router = MagicMock(spec=ModelRouter)
         model = AsyncMock()
         model.roles = ["verifier", "extractor"]
-        model.complete = AsyncMock(return_value=ModelResponse(
-            text=json.dumps({
-                "passed": False,
-                "issues": ["Missing error handling"],
-                "confidence": 0.8,
-                "suggestion": "Add try/except blocks",
-            }),
-            usage=TokenUsage(input_tokens=50, output_tokens=30, total_tokens=80),
-        ))
+        model.complete = AsyncMock(
+            return_value=ModelResponse(
+                text=json.dumps(
+                    {
+                        "passed": False,
+                        "issues": ["Missing error handling"],
+                        "confidence": 0.8,
+                        "suggestion": "Add try/except blocks",
+                    }
+                ),
+                usage=TokenUsage(input_tokens=50, output_tokens=30, total_tokens=80),
+            )
+        )
         router.select = MagicMock(return_value=model)
 
         prompts = MagicMock(spec=PromptAssembler)
@@ -1053,17 +1495,21 @@ class TestLLMVerifier:
         router = MagicMock(spec=ModelRouter)
         model = AsyncMock()
         model.roles = ["verifier", "extractor"]
-        model.complete = AsyncMock(return_value=ModelResponse(
-            text=json.dumps({
-                "passed": False,
-                "issues": ["Verifier backend unavailable"],
-                "confidence": 0.2,
-                "outcome": "fail",
-                "reason_code": "infra_verifier_error",
-                "severity_class": "infra",
-            }),
-            usage=TokenUsage(input_tokens=20, output_tokens=18, total_tokens=38),
-        ))
+        model.complete = AsyncMock(
+            return_value=ModelResponse(
+                text=json.dumps(
+                    {
+                        "passed": False,
+                        "issues": ["Verifier backend unavailable"],
+                        "confidence": 0.2,
+                        "outcome": "fail",
+                        "reason_code": "infra_verifier_error",
+                        "severity_class": "infra",
+                    }
+                ),
+                usage=TokenUsage(input_tokens=20, output_tokens=18, total_tokens=38),
+            )
+        )
         router.select = MagicMock(return_value=model)
         prompts = MagicMock(spec=PromptAssembler)
         prompts.build_verifier_prompt = MagicMock(return_value="Verify this")
@@ -1080,15 +1526,17 @@ class TestLLMVerifier:
         router = MagicMock(spec=ModelRouter)
         model = AsyncMock()
         model.roles = ["verifier", "extractor"]
-        model.complete = AsyncMock(return_value=ModelResponse(
-            text=(
-                "Assessment complete.\n"
-                '{"passed": true, "issues": [], "confidence": 0.74, '
-                '"suggestion": "Looks good"}\n'
-                "End."
-            ),
-            usage=TokenUsage(input_tokens=40, output_tokens=30, total_tokens=70),
-        ))
+        model.complete = AsyncMock(
+            return_value=ModelResponse(
+                text=(
+                    "Assessment complete.\n"
+                    '{"passed": true, "issues": [], "confidence": 0.74, '
+                    '"suggestion": "Looks good"}\n'
+                    "End."
+                ),
+                usage=TokenUsage(input_tokens=40, output_tokens=30, total_tokens=70),
+            )
+        )
         router.select = MagicMock(return_value=model)
 
         prompts = MagicMock(spec=PromptAssembler)
@@ -1106,15 +1554,19 @@ class TestLLMVerifier:
         router = MagicMock(spec=ModelRouter)
         model = AsyncMock()
         model.roles = ["verifier", "extractor"]
-        model.complete = AsyncMock(return_value=ModelResponse(
-            text=json.dumps({
-                "passed": False,
-                "issues": ["Needs citations"],
-                "confidence": 0.6,
-                "feedback": "Add source links for each claim",
-            }),
-            usage=TokenUsage(input_tokens=50, output_tokens=30, total_tokens=80),
-        ))
+        model.complete = AsyncMock(
+            return_value=ModelResponse(
+                text=json.dumps(
+                    {
+                        "passed": False,
+                        "issues": ["Needs citations"],
+                        "confidence": 0.6,
+                        "feedback": "Add source links for each claim",
+                    }
+                ),
+                usage=TokenUsage(input_tokens=50, output_tokens=30, total_tokens=80),
+            )
+        )
         router.select = MagicMock(return_value=model)
 
         prompts = MagicMock(spec=PromptAssembler)
@@ -1131,17 +1583,19 @@ class TestLLMVerifier:
         router = MagicMock(spec=ModelRouter)
         model = AsyncMock()
         model.roles = ["verifier", "extractor"]
-        model.complete = AsyncMock(return_value=ModelResponse(
-            text=(
-                "passed: false\n"
-                "confidence: 62%\n"
-                "feedback: Missing direct citations\n"
-                "issues:\n"
-                "  - No source links for pricing claims\n"
-                "  - Regulatory claims are unverified\n"
-            ),
-            usage=TokenUsage(input_tokens=60, output_tokens=40, total_tokens=100),
-        ))
+        model.complete = AsyncMock(
+            return_value=ModelResponse(
+                text=(
+                    "passed: false\n"
+                    "confidence: 62%\n"
+                    "feedback: Missing direct citations\n"
+                    "issues:\n"
+                    "  - No source links for pricing claims\n"
+                    "  - Regulatory claims are unverified\n"
+                ),
+                usage=TokenUsage(input_tokens=60, output_tokens=40, total_tokens=100),
+            )
+        )
         router.select = MagicMock(return_value=model)
 
         prompts = MagicMock(spec=PromptAssembler)
@@ -1161,14 +1615,16 @@ class TestLLMVerifier:
         router = MagicMock(spec=ModelRouter)
         model = AsyncMock()
         model.roles = ["verifier", "extractor"]
-        model.complete = AsyncMock(return_value=ModelResponse(
-            text=(
-                "Assessment: failed.\n"
-                "Confidence: 0.71\n"
-                "Reason: acceptance criteria were not met due to missing output file."
-            ),
-            usage=TokenUsage(input_tokens=30, output_tokens=20, total_tokens=50),
-        ))
+        model.complete = AsyncMock(
+            return_value=ModelResponse(
+                text=(
+                    "Assessment: failed.\n"
+                    "Confidence: 0.71\n"
+                    "Reason: acceptance criteria were not met due to missing output file."
+                ),
+                usage=TokenUsage(input_tokens=30, output_tokens=20, total_tokens=50),
+            )
+        )
         router.select = MagicMock(return_value=model)
 
         prompts = MagicMock(spec=PromptAssembler)
@@ -1186,10 +1642,12 @@ class TestLLMVerifier:
         router = MagicMock(spec=ModelRouter)
         model = AsyncMock()
         model.roles = ["verifier", "extractor"]
-        model.complete = AsyncMock(return_value=ModelResponse(
-            text="I cannot determine the result from the available information.",
-            usage=TokenUsage(input_tokens=30, output_tokens=20, total_tokens=50),
-        ))
+        model.complete = AsyncMock(
+            return_value=ModelResponse(
+                text="I cannot determine the result from the available information.",
+                usage=TokenUsage(input_tokens=30, output_tokens=20, total_tokens=50),
+            )
+        )
         router.select = MagicMock(return_value=model)
 
         prompts = MagicMock(spec=PromptAssembler)
@@ -1237,10 +1695,12 @@ class TestLLMVerifier:
         router = MagicMock(spec=ModelRouter)
         model = AsyncMock()
         model.roles = ["verifier", "extractor"]
-        model.complete = AsyncMock(return_value=ModelResponse(
-            text=json.dumps({"passed": True, "issues": [], "confidence": 0.8}),
-            usage=TokenUsage(input_tokens=50, output_tokens=30, total_tokens=80),
-        ))
+        model.complete = AsyncMock(
+            return_value=ModelResponse(
+                text=json.dumps({"passed": True, "issues": [], "confidence": 0.8}),
+                usage=TokenUsage(input_tokens=50, output_tokens=30, total_tokens=80),
+            )
+        )
         router.select = MagicMock(return_value=model)
 
         prompts = MagicMock(spec=PromptAssembler)
@@ -1271,13 +1731,15 @@ class TestLLMVerifier:
         router = MagicMock(spec=ModelRouter)
         model = AsyncMock()
         model.roles = ["verifier", "extractor"]
-        model.complete = AsyncMock(side_effect=[
-            RuntimeError("token limit exceeded"),
-            ModelResponse(
-                text=json.dumps({"passed": True, "issues": [], "confidence": 0.7}),
-                usage=TokenUsage(input_tokens=50, output_tokens=30, total_tokens=80),
-            ),
-        ])
+        model.complete = AsyncMock(
+            side_effect=[
+                RuntimeError("token limit exceeded"),
+                ModelResponse(
+                    text=json.dumps({"passed": True, "issues": [], "confidence": 0.7}),
+                    usage=TokenUsage(input_tokens=50, output_tokens=30, total_tokens=80),
+                ),
+            ]
+        )
         router.select = MagicMock(return_value=model)
 
         prompts = MagicMock(spec=PromptAssembler)
@@ -1395,16 +1857,16 @@ class TestLLMVerifier:
         router = MagicMock(spec=ModelRouter)
         model = AsyncMock()
         model.roles = ["verifier", "extractor"]
-        model.complete = AsyncMock(return_value=ModelResponse(
-            text=json.dumps({"passed": True, "issues": [], "confidence": 0.8}),
-            usage=TokenUsage(input_tokens=50, output_tokens=30, total_tokens=80),
-        ))
+        model.complete = AsyncMock(
+            return_value=ModelResponse(
+                text=json.dumps({"passed": True, "issues": [], "confidence": 0.8}),
+                usage=TokenUsage(input_tokens=50, output_tokens=30, total_tokens=80),
+            )
+        )
         router.select = MagicMock(return_value=model)
 
         prompts = MagicMock(spec=PromptAssembler)
-        prompts.build_verifier_prompt = MagicMock(
-            side_effect=lambda **kw: kw["result_summary"]
-        )
+        prompts.build_verifier_prompt = MagicMock(side_effect=lambda **kw: kw["result_summary"])
 
         long_summary = "A" * 12_000
         v = LLMVerifier(router, prompts, ResponseValidator())
@@ -1420,10 +1882,12 @@ class TestLLMVerifier:
         router = MagicMock(spec=ModelRouter)
         model = AsyncMock()
         model.roles = ["verifier", "extractor"]
-        model.complete = AsyncMock(return_value=ModelResponse(
-            text=json.dumps({"passed": True, "issues": [], "confidence": 0.8}),
-            usage=TokenUsage(input_tokens=50, output_tokens=30, total_tokens=80),
-        ))
+        model.complete = AsyncMock(
+            return_value=ModelResponse(
+                text=json.dumps({"passed": True, "issues": [], "confidence": 0.8}),
+                usage=TokenUsage(input_tokens=50, output_tokens=30, total_tokens=80),
+            )
+        )
         router.select = MagicMock(return_value=model)
 
         prompts = MagicMock(spec=PromptAssembler)
@@ -1443,12 +1907,14 @@ class TestLLMVerifier:
                     result=ToolResult.ok("Texas source details"),
                 ),
             ],
-            evidence_records=[{
-                "evidence_id": "EV-EXISTING",
-                "market": "Alberta",
-                "dimension": "economic",
-                "source_url": "https://example.com/alberta",
-            }],
+            evidence_records=[
+                {
+                    "evidence_id": "EV-EXISTING",
+                    "market": "Alberta",
+                    "dimension": "economic",
+                    "source_url": "https://example.com/alberta",
+                }
+            ],
         )
 
         assert result.passed
@@ -1462,10 +1928,12 @@ class TestLLMVerifier:
         router = MagicMock(spec=ModelRouter)
         model = AsyncMock()
         model.roles = ["verifier", "extractor"]
-        model.complete = AsyncMock(return_value=ModelResponse(
-            text=json.dumps({"passed": True, "issues": [], "confidence": 0.8}),
-            usage=TokenUsage(input_tokens=50, output_tokens=30, total_tokens=80),
-        ))
+        model.complete = AsyncMock(
+            return_value=ModelResponse(
+                text=json.dumps({"passed": True, "issues": [], "confidence": 0.8}),
+                usage=TokenUsage(input_tokens=50, output_tokens=30, total_tokens=80),
+            )
+        )
         router.select = MagicMock(return_value=model)
 
         prompts = MagicMock(spec=PromptAssembler)
@@ -1482,9 +1950,7 @@ class TestLLMVerifier:
                 MockToolCallRecord(
                     tool="read_file",
                     args={"path": "slogan-shortlist.md"},
-                    result=ToolResult.ok(
-                        "Top lines:\n- Your dentist sees more than cavities."
-                    ),
+                    result=ToolResult.ok("Top lines:\n- Your dentist sees more than cavities."),
                 ),
                 MockToolCallRecord(
                     tool="document_write",
@@ -1509,10 +1975,12 @@ class TestLLMVerifier:
         router = MagicMock(spec=ModelRouter)
         model = AsyncMock()
         model.roles = ["verifier", "extractor"]
-        model.complete = AsyncMock(return_value=ModelResponse(
-            text=json.dumps({"passed": True, "issues": [], "confidence": 0.8}),
-            usage=TokenUsage(input_tokens=50, output_tokens=30, total_tokens=80),
-        ))
+        model.complete = AsyncMock(
+            return_value=ModelResponse(
+                text=json.dumps({"passed": True, "issues": [], "confidence": 0.8}),
+                usage=TokenUsage(input_tokens=50, output_tokens=30, total_tokens=80),
+            )
+        )
         router.select = MagicMock(return_value=model)
 
         prompts = MagicMock(spec=PromptAssembler)
@@ -1553,10 +2021,12 @@ class TestLLMVerifier:
         router = MagicMock(spec=ModelRouter)
         model = AsyncMock()
         model.roles = ["verifier", "extractor"]
-        model.complete = AsyncMock(return_value=ModelResponse(
-            text=json.dumps({"passed": True, "issues": [], "confidence": 0.8}),
-            usage=TokenUsage(input_tokens=50, output_tokens=30, total_tokens=80),
-        ))
+        model.complete = AsyncMock(
+            return_value=ModelResponse(
+                text=json.dumps({"passed": True, "issues": [], "confidence": 0.8}),
+                usage=TokenUsage(input_tokens=50, output_tokens=30, total_tokens=80),
+            )
+        )
         router.select = MagicMock(return_value=model)
 
         process = ProcessDefinition(
@@ -1604,18 +2074,22 @@ class TestLLMVerifier:
         router = MagicMock(spec=ModelRouter)
         model = AsyncMock()
         model.roles = ["verifier", "extractor"]
-        model.complete = AsyncMock(return_value=ModelResponse(
-            text=json.dumps({
-                "passed": True,
-                "confidence": 0.82,
-                "issues": [],
-                "metadata": {
-                    "primary_unconfirmed_count": 1,
-                    "remediation_mode": "confirm_or_prune",
-                },
-            }),
-            usage=TokenUsage(input_tokens=50, output_tokens=30, total_tokens=80),
-        ))
+        model.complete = AsyncMock(
+            return_value=ModelResponse(
+                text=json.dumps(
+                    {
+                        "passed": True,
+                        "confidence": 0.82,
+                        "issues": [],
+                        "metadata": {
+                            "primary_unconfirmed_count": 1,
+                            "remediation_mode": "confirm_or_prune",
+                        },
+                    }
+                ),
+                usage=TokenUsage(input_tokens=50, output_tokens=30, total_tokens=80),
+            )
+        )
         router.select = MagicMock(return_value=model)
         prompts = MagicMock(spec=PromptAssembler)
         prompts.process = None
@@ -1634,19 +2108,23 @@ class TestLLMVerifier:
         router = MagicMock(spec=ModelRouter)
         model = AsyncMock()
         model.roles = ["verifier", "extractor"]
-        model.complete = AsyncMock(return_value=ModelResponse(
-            text=json.dumps({
-                "passed": False,
-                "outcome": "fail",
-                "reason_code": "policy_remediation_required",
-                "severity_class": "semantic",
-                "confidence": 0.45,
-                "feedback": "Insufficient evidence linkage",
-                "issues": ["claim-to-evidence map missing"],
-                "metadata": {"remediation_mode": "targeted_remediation"},
-            }),
-            usage=TokenUsage(input_tokens=50, output_tokens=30, total_tokens=80),
-        ))
+        model.complete = AsyncMock(
+            return_value=ModelResponse(
+                text=json.dumps(
+                    {
+                        "passed": False,
+                        "outcome": "fail",
+                        "reason_code": "policy_remediation_required",
+                        "severity_class": "semantic",
+                        "confidence": 0.45,
+                        "feedback": "Insufficient evidence linkage",
+                        "issues": ["claim-to-evidence map missing"],
+                        "metadata": {"remediation_mode": "targeted_remediation"},
+                    }
+                ),
+                usage=TokenUsage(input_tokens=50, output_tokens=30, total_tokens=80),
+            )
+        )
         router.select = MagicMock(return_value=model)
         prompts = MagicMock(spec=PromptAssembler)
         prompts.process = None
@@ -1664,26 +2142,30 @@ class TestLLMVerifier:
         router = MagicMock(spec=ModelRouter)
         model = AsyncMock()
         model.roles = ["verifier", "extractor"]
-        model.complete = AsyncMock(return_value=ModelResponse(
-            text=json.dumps({
-                "passed": False,
-                "outcome": "fail",
-                "reason_code": "policy_remediation_required",
-                "severity_class": "semantic",
-                "confidence": 0.45,
-                "feedback": "Supporting claims still need evidence links.",
-                "issues": ["missing evidence linkage"],
-                "metadata": {
-                    "remediation_required": "true",
-                    "remediation_mode": "Queue_Follow_Up",
-                    "missing_targets": "T1, T2",
-                    "unverified_claim_count": "3",
-                    "verified_claim_count": "7",
-                    "supporting_ratio": "55%",
-                },
-            }),
-            usage=TokenUsage(input_tokens=50, output_tokens=30, total_tokens=80),
-        ))
+        model.complete = AsyncMock(
+            return_value=ModelResponse(
+                text=json.dumps(
+                    {
+                        "passed": False,
+                        "outcome": "fail",
+                        "reason_code": "policy_remediation_required",
+                        "severity_class": "semantic",
+                        "confidence": 0.45,
+                        "feedback": "Supporting claims still need evidence links.",
+                        "issues": ["missing evidence linkage"],
+                        "metadata": {
+                            "remediation_required": "true",
+                            "remediation_mode": "Queue_Follow_Up",
+                            "missing_targets": "T1, T2",
+                            "unverified_claim_count": "3",
+                            "verified_claim_count": "7",
+                            "supporting_ratio": "55%",
+                        },
+                    }
+                ),
+                usage=TokenUsage(input_tokens=50, output_tokens=30, total_tokens=80),
+            )
+        )
         router.select = MagicMock(return_value=model)
         prompts = MagicMock(spec=PromptAssembler)
         prompts.process = None
@@ -1708,11 +2190,13 @@ class TestVotingVerifier:
     @pytest.mark.asyncio
     async def test_passes_on_majority(self):
         llm = AsyncMock(spec=LLMVerifier)
-        llm.verify = AsyncMock(side_effect=[
-            VerificationResult(tier=2, passed=True),
-            VerificationResult(tier=2, passed=True),
-            VerificationResult(tier=2, passed=False),
-        ])
+        llm.verify = AsyncMock(
+            side_effect=[
+                VerificationResult(tier=2, passed=True),
+                VerificationResult(tier=2, passed=True),
+                VerificationResult(tier=2, passed=False),
+            ]
+        )
 
         v = VotingVerifier(llm, vote_count=3)
         result = await v.verify(_make_subtask(), "output", [], None)
@@ -1723,11 +2207,13 @@ class TestVotingVerifier:
     @pytest.mark.asyncio
     async def test_fails_on_minority(self):
         llm = AsyncMock(spec=LLMVerifier)
-        llm.verify = AsyncMock(side_effect=[
-            VerificationResult(tier=2, passed=False),
-            VerificationResult(tier=2, passed=False),
-            VerificationResult(tier=2, passed=True),
-        ])
+        llm.verify = AsyncMock(
+            side_effect=[
+                VerificationResult(tier=2, passed=False),
+                VerificationResult(tier=2, passed=False),
+                VerificationResult(tier=2, passed=True),
+            ]
+        )
 
         v = VotingVerifier(llm, vote_count=3)
         result = await v.verify(_make_subtask(), "output", [], None)
@@ -1868,8 +2354,7 @@ class TestVerificationGates:
 
         assert result.passed
         summary_events = [
-            event for event in events
-            if event.event_type == "claim_verification_summary"
+            event for event in events if event.event_type == "claim_verification_summary"
         ]
         assert summary_events
         payload = summary_events[-1].data
@@ -1931,15 +2416,17 @@ class TestVerificationGates:
         event_bus.subscribe_all(lambda event: events.append(event))
         process = _make_process(
             deliverables={"phase-a": ["report.md"]},
-            regex_rules=[{
-                "name": "no-placeholders",
-                "description": "No unresolved placeholders in deliverables",
-                "check": r"\bN/A\b",
-                "severity": "error",
-                "type": "regex",
-                "target": "deliverables",
-                "enforcement": "hard",
-            }],
+            regex_rules=[
+                {
+                    "name": "no-placeholders",
+                    "description": "No unresolved placeholders in deliverables",
+                    "check": r"\bN/A\b",
+                    "severity": "error",
+                    "type": "regex",
+                    "target": "deliverables",
+                    "enforcement": "hard",
+                }
+            ],
         )
         gates = VerificationGates(
             router,
@@ -1969,9 +2456,7 @@ class TestVerificationGates:
 
         assert not result.passed
         placeholder_events = [
-            event
-            for event in events
-            if event.event_type == PLACEHOLDER_FINDINGS_EXTRACTED
+            event for event in events if event.event_type == PLACEHOLDER_FINDINGS_EXTRACTED
         ]
         assert placeholder_events
         payload = placeholder_events[-1].data
@@ -1991,15 +2476,17 @@ class TestVerificationGates:
         prompts = MagicMock(spec=PromptAssembler)
         process = _make_process(
             deliverables={"phase-a": ["report.md"]},
-            regex_rules=[{
-                "name": "no-placeholders",
-                "description": "No unresolved placeholders in deliverables",
-                "check": r"\bN/A\b",
-                "severity": "error",
-                "type": "regex",
-                "target": "deliverables",
-                "enforcement": "hard",
-            }],
+            regex_rules=[
+                {
+                    "name": "no-placeholders",
+                    "description": "No unresolved placeholders in deliverables",
+                    "check": r"\bN/A\b",
+                    "severity": "error",
+                    "type": "regex",
+                    "target": "deliverables",
+                    "enforcement": "hard",
+                }
+            ],
         )
         gates = VerificationGates(router, prompts, config, process=process)
         (tmp_path / "report.md").write_text(
@@ -2058,10 +2545,12 @@ class TestVerificationGates:
         router = MagicMock(spec=ModelRouter)
         model = AsyncMock()
         model.roles = ["verifier", "extractor"]
-        model.complete = AsyncMock(return_value=ModelResponse(
-            text="I cannot determine the result from the available information.",
-            usage=TokenUsage(input_tokens=20, output_tokens=15, total_tokens=35),
-        ))
+        model.complete = AsyncMock(
+            return_value=ModelResponse(
+                text="I cannot determine the result from the available information.",
+                usage=TokenUsage(input_tokens=20, output_tokens=15, total_tokens=35),
+            )
+        )
         router.select = MagicMock(return_value=model)
         prompts = PromptAssembler()
 
@@ -2103,15 +2592,17 @@ class TestVerificationGates:
             process=process,
             event_bus=event_bus,
         )
-        gates._tier2.verify = AsyncMock(return_value=VerificationResult(
-            tier=2,
-            passed=False,
-            outcome="fail",
-            reason_code="incomplete_deliverable_placeholder",
-            severity_class="semantic",
-            feedback="Deliverable contains [MISSING] placeholder markers.",
-            metadata={"issues": ["[MISSING] placeholder present"]},
-        ))
+        gates._tier2.verify = AsyncMock(
+            return_value=VerificationResult(
+                tier=2,
+                passed=False,
+                outcome="fail",
+                reason_code="incomplete_deliverable_placeholder",
+                severity_class="semantic",
+                feedback="Deliverable contains [MISSING] placeholder markers.",
+                metadata={"issues": ["[MISSING] placeholder present"]},
+            )
+        )
 
         tool_call = MockToolCallRecord(
             tool="write_file",
@@ -2139,8 +2630,7 @@ class TestVerificationGates:
         event_types = [event.event_type for event in events]
         assert VERIFICATION_CONTRADICTION_DETECTED in event_types
         contradiction_event = next(
-            event for event in events
-            if event.event_type == VERIFICATION_CONTRADICTION_DETECTED
+            event for event in events if event.event_type == VERIFICATION_CONTRADICTION_DETECTED
         )
         assert contradiction_event.data.get("coverage_sufficient") is True
         assert contradiction_event.data.get("contradiction_downgrade_count") == 1
@@ -2159,15 +2649,17 @@ class TestVerificationGates:
         router = MagicMock(spec=ModelRouter)
         prompts = PromptAssembler(process=process)
         gates = VerificationGates(router, prompts, config, process=process)
-        gates._tier2.verify = AsyncMock(return_value=VerificationResult(
-            tier=2,
-            passed=False,
-            outcome="fail",
-            reason_code="incomplete_deliverable_placeholder",
-            severity_class="semantic",
-            feedback="Deliverable still contains TODO markers.",
-            metadata={"issues": ["TODO placeholder found"]},
-        ))
+        gates._tier2.verify = AsyncMock(
+            return_value=VerificationResult(
+                tier=2,
+                passed=False,
+                outcome="fail",
+                reason_code="incomplete_deliverable_placeholder",
+                severity_class="semantic",
+                feedback="Deliverable still contains TODO markers.",
+                metadata={"issues": ["TODO placeholder found"]},
+            )
+        )
 
         tool_calls = [
             MockToolCallRecord(
@@ -2210,15 +2702,17 @@ class TestVerificationGates:
         router = MagicMock(spec=ModelRouter)
         prompts = PromptAssembler(process=process)
         gates = VerificationGates(router, prompts, config, process=process)
-        gates._tier2.verify = AsyncMock(return_value=VerificationResult(
-            tier=2,
-            passed=False,
-            outcome="fail",
-            reason_code="incomplete_deliverable_placeholder",
-            severity_class="semantic",
-            feedback="Placeholder marker reported by verifier.",
-            metadata={"issues": ["placeholder marker present"]},
-        ))
+        gates._tier2.verify = AsyncMock(
+            return_value=VerificationResult(
+                tier=2,
+                passed=False,
+                outcome="fail",
+                reason_code="incomplete_deliverable_placeholder",
+                severity_class="semantic",
+                feedback="Placeholder marker reported by verifier.",
+                metadata={"issues": ["placeholder marker present"]},
+            )
+        )
 
         tool_calls = [
             MockToolCallRecord(
@@ -2265,15 +2759,17 @@ class TestVerificationGates:
         router = MagicMock(spec=ModelRouter)
         prompts = PromptAssembler(process=process)
         gates = VerificationGates(router, prompts, config, process=process)
-        gates._tier2.verify = AsyncMock(return_value=VerificationResult(
-            tier=2,
-            passed=False,
-            outcome="fail",
-            reason_code="incomplete_deliverable_placeholder",
-            severity_class="semantic",
-            feedback="Verifier reported placeholder marker.",
-            metadata={"issues": ["placeholder marker present"]},
-        ))
+        gates._tier2.verify = AsyncMock(
+            return_value=VerificationResult(
+                tier=2,
+                passed=False,
+                outcome="fail",
+                reason_code="incomplete_deliverable_placeholder",
+                severity_class="semantic",
+                feedback="Verifier reported placeholder marker.",
+                metadata={"issues": ["placeholder marker present"]},
+            )
+        )
 
         result = await gates.verify(
             _make_subtask(subtask_id="phase-a"),
@@ -2317,15 +2813,17 @@ class TestVerificationGates:
             process=process,
             event_bus=event_bus,
         )
-        gates._tier2.verify = AsyncMock(return_value=VerificationResult(
-            tier=2,
-            passed=False,
-            outcome="fail",
-            reason_code="incomplete_deliverable_placeholder",
-            severity_class="semantic",
-            feedback="Verifier reported placeholder marker.",
-            metadata={"issues": ["placeholder marker present"]},
-        ))
+        gates._tier2.verify = AsyncMock(
+            return_value=VerificationResult(
+                tier=2,
+                passed=False,
+                outcome="fail",
+                reason_code="incomplete_deliverable_placeholder",
+                severity_class="semantic",
+                feedback="Verifier reported placeholder marker.",
+                metadata={"issues": ["placeholder marker present"]},
+            )
+        )
 
         result = await gates.verify(
             _make_subtask(subtask_id="phase-a"),
@@ -2344,8 +2842,7 @@ class TestVerificationGates:
         assert scan.get("coverage_sufficient") is False
         assert result.metadata.get("contradiction_detected_no_downgrade") is True
         contradiction_event = next(
-            event for event in events
-            if event.event_type == VERIFICATION_CONTRADICTION_DETECTED
+            event for event in events if event.event_type == VERIFICATION_CONTRADICTION_DETECTED
         )
         assert contradiction_event.data.get("contradiction_detected_no_downgrade_count") == 1
         assert contradiction_event.data.get("cap_exhaustion_count") == 1
@@ -2373,15 +2870,17 @@ class TestVerificationGates:
         router = MagicMock(spec=ModelRouter)
         prompts = PromptAssembler(process=process)
         gates = VerificationGates(router, prompts, config, process=process)
-        gates._tier2.verify = AsyncMock(return_value=VerificationResult(
-            tier=2,
-            passed=False,
-            outcome="fail",
-            reason_code="incomplete_deliverable_placeholder",
-            severity_class="semantic",
-            feedback="Verifier reported placeholder marker.",
-            metadata={"issues": ["placeholder marker present"]},
-        ))
+        gates._tier2.verify = AsyncMock(
+            return_value=VerificationResult(
+                tier=2,
+                passed=False,
+                outcome="fail",
+                reason_code="incomplete_deliverable_placeholder",
+                severity_class="semantic",
+                feedback="Verifier reported placeholder marker.",
+                metadata={"issues": ["placeholder marker present"]},
+            )
+        )
 
         result = await gates.verify(
             _make_subtask(subtask_id="phase-a"),
@@ -2403,14 +2902,18 @@ class TestVerificationGates:
 
     @pytest.mark.asyncio
     async def test_policy_engine_merges_tier1_warnings_with_tier2_pass(self):
-        process = _make_process(regex_rules=[{
-            "name": "no-todo",
-            "description": "No TODO markers",
-            "check": "TODO",
-            "severity": "error",
-            "type": "regex",
-            "target": "output",
-        }])
+        process = _make_process(
+            regex_rules=[
+                {
+                    "name": "no-todo",
+                    "description": "No TODO markers",
+                    "check": "TODO",
+                    "severity": "error",
+                    "type": "regex",
+                    "target": "output",
+                }
+            ]
+        )
         config = VerificationConfig(
             tier1_enabled=True,
             tier2_enabled=True,
@@ -2420,10 +2923,12 @@ class TestVerificationGates:
         router = MagicMock(spec=ModelRouter)
         model = AsyncMock()
         model.roles = ["verifier", "extractor"]
-        model.complete = AsyncMock(return_value=ModelResponse(
-            text=json.dumps({"passed": True, "issues": [], "confidence": 0.91}),
-            usage=TokenUsage(input_tokens=40, output_tokens=25, total_tokens=65),
-        ))
+        model.complete = AsyncMock(
+            return_value=ModelResponse(
+                text=json.dumps({"passed": True, "issues": [], "confidence": 0.91}),
+                usage=TokenUsage(input_tokens=40, output_tokens=25, total_tokens=65),
+            )
+        )
         router.select = MagicMock(return_value=model)
         prompts = PromptAssembler(process=process)
 
@@ -2441,14 +2946,18 @@ class TestVerificationGates:
 
     @pytest.mark.asyncio
     async def test_shadow_compare_emits_false_negative_candidate_for_legacy_regex(self):
-        process = _make_process(regex_rules=[{
-            "name": "no-todo",
-            "description": "No TODO markers",
-            "check": "TODO",
-            "severity": "error",
-            "type": "regex",
-            "target": "output",
-        }])
+        process = _make_process(
+            regex_rules=[
+                {
+                    "name": "no-todo",
+                    "description": "No TODO markers",
+                    "check": "TODO",
+                    "severity": "error",
+                    "type": "regex",
+                    "target": "output",
+                }
+            ]
+        )
         config = VerificationConfig(
             tier1_enabled=True,
             tier2_enabled=True,
@@ -2459,10 +2968,12 @@ class TestVerificationGates:
         router = MagicMock(spec=ModelRouter)
         model = AsyncMock()
         model.roles = ["verifier", "extractor"]
-        model.complete = AsyncMock(return_value=ModelResponse(
-            text=json.dumps({"passed": True, "issues": [], "confidence": 0.88}),
-            usage=TokenUsage(input_tokens=40, output_tokens=25, total_tokens=65),
-        ))
+        model.complete = AsyncMock(
+            return_value=ModelResponse(
+                text=json.dumps({"passed": True, "issues": [], "confidence": 0.88}),
+                usage=TokenUsage(input_tokens=40, output_tokens=25, total_tokens=65),
+            )
+        )
         router.select = MagicMock(return_value=model)
         prompts = PromptAssembler(process=process)
         event_bus = EventBus()
@@ -2530,11 +3041,13 @@ def _make_process(
     phases = []
     if deliverables:
         for phase_id, files in deliverables.items():
-            phases.append(PhaseTemplate(
-                id=phase_id,
-                description=f"Phase {phase_id}",
-                deliverables=[f"{f} — desc" for f in files],
-            ))
+            phases.append(
+                PhaseTemplate(
+                    id=phase_id,
+                    description=f"Phase {phase_id}",
+                    deliverables=[f"{f} — desc" for f in files],
+                )
+            )
 
     rules = []
     if regex_rules:
@@ -2563,10 +3076,12 @@ class TestDeterministicVerifierDeliverables:
         """Only the active phase deliverables should be enforced."""
         (tmp_path / "report.md").write_text("Report content")
 
-        process = _make_process(deliverables={
-            "research": ["report.md"],
-            "analysis": ["data.csv"],
-        })
+        process = _make_process(
+            deliverables={
+                "research": ["report.md"],
+                "analysis": ["data.csv"],
+            }
+        )
         v = DeterministicVerifier(process=process)
         result = await v.verify(
             _make_subtask(subtask_id="research"),
@@ -2580,11 +3095,90 @@ class TestDeterministicVerifierDeliverables:
         assert "deliverable_data.csv" not in check_names
 
     @pytest.mark.asyncio
+    async def test_recovered_command_policy_rejection_does_not_poison_deliverable(
+        self,
+        tmp_path,
+    ):
+        (tmp_path / "workspace_capabilities.md").write_text("PDF extraction verified")
+        process = _make_process(
+            deliverables={"discovery": ["workspace_capabilities.md"]},
+        )
+        calls = [
+            MockToolCallRecord(
+                tool="shell_execute",
+                args={"command": 'python3 -c "import pypdf"'},
+                result=ToolResult.fail(
+                    "Safety violation: inline interpreter execution is blocked",
+                    data={
+                        "reason_code": "command_policy_rejected",
+                        "policy_rule": r"\bpython[23]?\s+-c\s",
+                        "repairability": "automatic",
+                        "executed": False,
+                    },
+                ),
+            ),
+            MockToolCallRecord(
+                tool="shell_execute",
+                args={"command": "python3 tmp_probe.py"},
+                result=ToolResult.ok("pypdf OK"),
+            ),
+        ]
+
+        result = await DeterministicVerifier(process=process).verify(
+            _make_subtask(subtask_id="discovery"),
+            "Capability report complete",
+            calls,
+            tmp_path,
+        )
+
+        assert result.passed
+        assert result.outcome == "pass_with_warnings"
+        assert any(
+            check.name == "tool_shell_execute_advisory" and check.passed
+            for check in result.checks
+        )
+
+    @pytest.mark.asyncio
+    async def test_unrecovered_command_policy_rejection_requests_targeted_retry(
+        self,
+        tmp_path,
+    ):
+        process = _make_process(
+            deliverables={"discovery": ["workspace_capabilities.md"]},
+        )
+        blocked = MockToolCallRecord(
+            tool="shell_execute",
+            args={"command": 'python3 -c "import pypdf"'},
+            result=ToolResult.fail(
+                "Safety violation: inline interpreter execution is blocked",
+                data={
+                    "reason_code": "command_policy_rejected",
+                    "policy_rule": r"\bpython[23]?\s+-c\s",
+                    "repairability": "automatic",
+                    "executed": False,
+                },
+            ),
+        )
+
+        result = await DeterministicVerifier(process=process).verify(
+            _make_subtask(subtask_id="discovery"),
+            "",
+            [blocked],
+            tmp_path,
+        )
+
+        assert not result.passed
+        assert result.reason_code == "tool_method_failed"
+        assert result.severity_class == "semantic"
+
+    @pytest.mark.asyncio
     async def test_deliverables_found_in_tool_calls(self, tmp_path):
         """Deliverables reported in tool call files_changed should pass."""
-        process = _make_process(deliverables={
-            "phase1": ["output.txt"],
-        })
+        process = _make_process(
+            deliverables={
+                "phase1": ["output.txt"],
+            }
+        )
         tc = MockToolCallRecord(
             tool="write_file",
             args={"path": "output.txt"},
@@ -2602,9 +3196,11 @@ class TestDeterministicVerifierDeliverables:
     @pytest.mark.asyncio
     async def test_deliverables_missing_fails(self, tmp_path):
         """Missing deliverables should cause verification to fail."""
-        process = _make_process(deliverables={
-            "phase1": ["missing.txt"],
-        })
+        process = _make_process(
+            deliverables={
+                "phase1": ["missing.txt"],
+            }
+        )
         v = DeterministicVerifier(process=process)
         result = await v.verify(
             _make_subtask(subtask_id="phase1"),
@@ -2620,14 +3216,18 @@ class TestDeterministicVerifierDeliverables:
     async def test_deliverables_do_not_flatten_across_phases(self, tmp_path):
         """Non-active phase deliverables should not fail the current phase."""
         (tmp_path / "file_a.md").write_text("content")
-        process = _make_process(deliverables={
-            "phase_a": ["file_a.md"],
-            "phase_b": ["file_b.md"],
-        })
+        process = _make_process(
+            deliverables={
+                "phase_a": ["file_a.md"],
+                "phase_b": ["file_b.md"],
+            }
+        )
         v = DeterministicVerifier(process=process)
         result = await v.verify(
             _make_subtask(subtask_id="phase_a"),
-            "output", [], tmp_path,
+            "output",
+            [],
+            tmp_path,
         )
         assert result.passed
         check_names = {c.name: c.passed for c in result.checks}
@@ -2637,10 +3237,12 @@ class TestDeterministicVerifierDeliverables:
     @pytest.mark.asyncio
     async def test_unmatched_subtask_id_skips_multi_phase_deliverables(self, tmp_path):
         """Unmapped subtask IDs should not enforce unrelated phase outputs."""
-        process = _make_process(deliverables={
-            "phase_a": ["file_a.md"],
-            "phase_b": ["file_b.md"],
-        })
+        process = _make_process(
+            deliverables={
+                "phase_a": ["file_a.md"],
+                "phase_b": ["file_b.md"],
+            }
+        )
         v = DeterministicVerifier(process=process)
         result = await v.verify(
             _make_subtask(subtask_id="planner-generated-id"),
@@ -2653,10 +3255,12 @@ class TestDeterministicVerifierDeliverables:
 
     @pytest.mark.asyncio
     async def test_phase_hint_enforces_matching_phase_deliverables(self, tmp_path):
-        process = _make_process(deliverables={
-            "phase_a": ["file_a.md"],
-            "phase_b": ["file_b.md"],
-        })
+        process = _make_process(
+            deliverables={
+                "phase_a": ["file_a.md"],
+                "phase_b": ["file_b.md"],
+            }
+        )
         v = DeterministicVerifier(process=process)
         subtask = _make_subtask(subtask_id="planner-generated-id")
         subtask.phase_id = "phase_a"
@@ -2668,10 +3272,12 @@ class TestDeterministicVerifierDeliverables:
 
     @pytest.mark.asyncio
     async def test_unmatched_id_infers_phase_from_description(self, tmp_path):
-        process = _make_process(deliverables={
-            "market_sizing": ["market-sizing.md"],
-            "risk_map": ["risk-map.md"],
-        })
+        process = _make_process(
+            deliverables={
+                "market_sizing": ["market-sizing.md"],
+                "risk_map": ["risk-map.md"],
+            }
+        )
         v = DeterministicVerifier(process=process)
         result = await v.verify(
             _make_subtask(
@@ -2692,10 +3298,12 @@ class TestDeterministicVerifierDeliverables:
         self,
         tmp_path,
     ):
-        process = _make_process(deliverables={
-            "prep": ["prep.md"],
-            "synth": ["final.md"],
-        })
+        process = _make_process(
+            deliverables={
+                "prep": ["prep.md"],
+                "synth": ["final.md"],
+            }
+        )
         (tmp_path / "final.md").write_text("Final report", encoding="utf-8")
 
         verifier = DeterministicVerifier(process=process)
@@ -2720,10 +3328,12 @@ class TestDeterministicVerifierDeliverables:
         self,
         tmp_path,
     ):
-        process = _make_process(deliverables={
-            "prep": ["prep.md"],
-            "synth": ["final.md"],
-        })
+        process = _make_process(
+            deliverables={
+                "prep": ["prep.md"],
+                "synth": ["final.md"],
+            }
+        )
         (tmp_path / "prep.md").write_text("Prepared evidence", encoding="utf-8")
         (tmp_path / "final.md").write_text("Standalone summary", encoding="utf-8")
 
@@ -2748,10 +3358,12 @@ class TestDeterministicVerifierDeliverables:
         self,
         tmp_path,
     ):
-        process = _make_process(deliverables={
-            "prep": ["prep.md"],
-            "synth": ["final.md"],
-        })
+        process = _make_process(
+            deliverables={
+                "prep": ["prep.md"],
+                "synth": ["final.md"],
+            }
+        )
         (tmp_path / "prep.md").write_text("Prepared evidence", encoding="utf-8")
         (tmp_path / "final.md").write_text(
             "Final report built from prep.md findings.",
@@ -2785,9 +3397,11 @@ class TestDeterministicVerifierSemanticAgnostic:
             "AB-PESTLE-ECO-001,Alberta,Economic,EV-112,\n",
             encoding="utf-8",
         )
-        process = _make_process(deliverables={
-            "environmental-scan": ["market-condition-scorecard.csv"],
-        })
+        process = _make_process(
+            deliverables={
+                "environmental-scan": ["market-condition-scorecard.csv"],
+            }
+        )
         verifier = DeterministicVerifier(process=process)
         subtask = _make_subtask(
             subtask_id="environmental-scan",
@@ -2824,35 +3438,49 @@ class TestDeterministicVerifierRegexRules:
     @pytest.mark.asyncio
     async def test_error_severity_rule_is_advisory_by_default(self):
         """Regex rules are advisory by default unless explicitly hard."""
-        process = _make_process(regex_rules=[{
-            "name": "no-tbd",
-            "description": "No TBD markers allowed",
-            "check": "TBD",
-            "severity": "error",
-            "type": "regex",
-            "target": "output",
-        }])
+        process = _make_process(
+            regex_rules=[
+                {
+                    "name": "no-tbd",
+                    "description": "No TBD markers allowed",
+                    "check": "TBD",
+                    "severity": "error",
+                    "type": "regex",
+                    "target": "output",
+                }
+            ]
+        )
         v = DeterministicVerifier(process=process)
         result = await v.verify(
-            _make_subtask(), "This has TBD in it", [], None,
+            _make_subtask(),
+            "This has TBD in it",
+            [],
+            None,
         )
         assert result.passed
         assert result.outcome == "pass_with_warnings"
 
     @pytest.mark.asyncio
     async def test_hard_enforced_regex_rule_fails_on_match(self):
-        process = _make_process(regex_rules=[{
-            "name": "no-tbd-hard",
-            "description": "No TBD markers allowed",
-            "check": "TBD",
-            "severity": "error",
-            "type": "regex",
-            "target": "output",
-            "enforcement": "hard",
-        }])
+        process = _make_process(
+            regex_rules=[
+                {
+                    "name": "no-tbd-hard",
+                    "description": "No TBD markers allowed",
+                    "check": "TBD",
+                    "severity": "error",
+                    "type": "regex",
+                    "target": "output",
+                    "enforcement": "hard",
+                }
+            ]
+        )
         v = DeterministicVerifier(process=process)
         result = await v.verify(
-            _make_subtask(), "This has TBD in it", [], None,
+            _make_subtask(),
+            "This has TBD in it",
+            [],
+            None,
         )
         assert not result.passed
         assert result.outcome == "fail"
@@ -2861,15 +3489,17 @@ class TestDeterministicVerifierRegexRules:
     async def test_hard_placeholder_rule_routes_to_recoverable_unconfirmed(self, tmp_path):
         process = _make_process(
             deliverables={"phase-a": ["report.md"]},
-            regex_rules=[{
-                "name": "no-placeholders",
-                "description": "No unresolved placeholders in deliverables",
-                "check": r"\bN/A\b",
-                "severity": "error",
-                "type": "regex",
-                "target": "deliverables",
-                "enforcement": "hard",
-            }],
+            regex_rules=[
+                {
+                    "name": "no-placeholders",
+                    "description": "No unresolved placeholders in deliverables",
+                    "check": r"\bN/A\b",
+                    "severity": "error",
+                    "type": "regex",
+                    "target": "deliverables",
+                    "enforcement": "hard",
+                }
+            ],
         )
         (tmp_path / "report.md").write_text(
             "## Test Strategy\n\n| evidence | status |\n| N/A | open |\n",
@@ -2903,15 +3533,19 @@ class TestDeterministicVerifierRegexRules:
 
     @pytest.mark.asyncio
     async def test_hard_safety_failure_remains_hard_even_with_placeholder_rule(self):
-        process = _make_process(regex_rules=[{
-            "name": "no-placeholders",
-            "description": "No unresolved placeholders in output",
-            "check": r"\bN/A\b",
-            "severity": "error",
-            "type": "regex",
-            "target": "output",
-            "enforcement": "hard",
-        }])
+        process = _make_process(
+            regex_rules=[
+                {
+                    "name": "no-placeholders",
+                    "description": "No unresolved placeholders in output",
+                    "check": r"\bN/A\b",
+                    "severity": "error",
+                    "type": "regex",
+                    "target": "output",
+                    "enforcement": "hard",
+                }
+            ]
+        )
         verifier = DeterministicVerifier(process=process)
         tool_call = MockToolCallRecord(
             tool="write_file",
@@ -2932,17 +3566,24 @@ class TestDeterministicVerifierRegexRules:
     @pytest.mark.asyncio
     async def test_warning_severity_rule_passes_on_match(self):
         """Warning-severity regex rules should NOT fail verification when matched."""
-        process = _make_process(regex_rules=[{
-            "name": "no-todo",
-            "description": "TODO comments found",
-            "check": "TODO",
-            "severity": "warning",
-            "type": "regex",
-            "target": "output",
-        }])
+        process = _make_process(
+            regex_rules=[
+                {
+                    "name": "no-todo",
+                    "description": "TODO comments found",
+                    "check": "TODO",
+                    "severity": "warning",
+                    "type": "regex",
+                    "target": "output",
+                }
+            ]
+        )
         v = DeterministicVerifier(process=process)
         result = await v.verify(
-            _make_subtask(), "There is a TODO here", [], None,
+            _make_subtask(),
+            "There is a TODO here",
+            [],
+            None,
         )
         # Warning rules record the match but don't fail
         assert result.passed
@@ -2954,16 +3595,23 @@ class TestDeterministicVerifierRegexRules:
     @pytest.mark.asyncio
     async def test_error_severity_rule_passes_on_no_match(self):
         """Error-severity regex rules should pass when pattern is NOT found."""
-        process = _make_process(regex_rules=[{
-            "name": "no-tbd",
-            "description": "No TBD markers allowed",
-            "check": "TBD",
-            "severity": "error",
-            "type": "regex",
-            "target": "output",
-        }])
+        process = _make_process(
+            regex_rules=[
+                {
+                    "name": "no-tbd",
+                    "description": "No TBD markers allowed",
+                    "check": "TBD",
+                    "severity": "error",
+                    "type": "regex",
+                    "target": "output",
+                }
+            ]
+        )
         v = DeterministicVerifier(process=process)
         result = await v.verify(
-            _make_subtask(), "Clean output with no markers", [], None,
+            _make_subtask(),
+            "Clean output with no markers",
+            [],
+            None,
         )
         assert result.passed

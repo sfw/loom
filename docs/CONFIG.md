@@ -122,6 +122,8 @@ state separate from the default CLI/TUI database and scratch paths.
 | `enable_slo_metrics` | `bool` | `false` | Enables `/slo` snapshot endpoint. |
 | `delegate_task_timeout_seconds` | `int` | `14400` | Timeout for delegated orchestration calls (`/run`, `delegate_task`). |
 | `model_call_max_attempts` | `int` | `5` | Max retry attempts for model invocation retry policy. |
+| `model_call_global_max_concurrency` | `int` | `3` | Process-wide cap for concurrent provider model calls across overlapping runs. |
+| `model_call_backpressure_cooldown_seconds` | `float` | `2.0` | Shared cooldown applied after provider overload or rate-limit responses. |
 | `model_call_retry_base_delay_seconds` | `float` | `0.5` | Base exponential backoff delay. |
 | `model_call_retry_max_delay_seconds` | `float` | `8.0` | Max delay cap for retry backoff. |
 | `model_call_retry_jitter_seconds` | `float` | `0.25` | Added random jitter on retries. |
@@ -509,6 +511,8 @@ Operational OAuth notes:
 
 - `execution.delegate_task_timeout_seconds` is clamped to at least `1`.
 - `execution.model_call_max_attempts` is clamped to `1..10`.
+- `execution.model_call_global_max_concurrency` is clamped to `1..32`.
+- `execution.model_call_backpressure_cooldown_seconds` is clamped to `0..120`.
 - `execution.model_call_retry_base_delay_seconds` and jitter are clamped to `>= 0`.
 - `execution.model_call_retry_max_delay_seconds` is clamped to `>= base_delay`.
 - `verification.unconfirmed_supporting_threshold` is clamped to `0..1`.

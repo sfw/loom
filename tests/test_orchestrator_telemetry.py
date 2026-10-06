@@ -47,6 +47,28 @@ def test_accumulate_subtask_telemetry_updates_rollup() -> None:
     assert orchestrator._telemetry_rollup["sealed_reseal_applied"] == 2
 
 
+def test_accumulate_subtask_telemetry_is_isolated_by_task() -> None:
+    orchestrator = SimpleNamespace(_telemetry_rollups_by_task={})
+    first = SimpleNamespace(telemetry_counters={"model_invocations": 2, "tool_calls": 3})
+    second = SimpleNamespace(telemetry_counters={"model_invocations": 7, "tool_calls": 11})
+
+    orchestrator_telemetry.accumulate_subtask_telemetry(
+        orchestrator,
+        "task-a",
+        first,  # type: ignore[arg-type]
+    )
+    orchestrator_telemetry.accumulate_subtask_telemetry(
+        orchestrator,
+        "task-b",
+        second,  # type: ignore[arg-type]
+    )
+
+    assert orchestrator._telemetry_rollups_by_task["task-a"]["model_invocations"] == 2
+    assert orchestrator._telemetry_rollups_by_task["task-a"]["tool_calls"] == 3
+    assert orchestrator._telemetry_rollups_by_task["task-b"]["model_invocations"] == 7
+    assert orchestrator._telemetry_rollups_by_task["task-b"]["tool_calls"] == 11
+
+
 def test_task_event_counts_and_verification_reason_counts() -> None:
     bus = EventBus()
     bus.emit(Event(event_type="task_started", task_id="t1", data={}))

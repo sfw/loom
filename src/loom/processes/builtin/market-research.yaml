@@ -32,6 +32,45 @@ validity_contract:
     synthesis_min_verification_tier: 2
     critical_claim_support_ratio: 1.0
 
+quality_contract:
+  enabled: true
+  applies_to_phases:
+    - analyze-market-trends
+    - deep-competitor-research
+    - assess-market-risks
+    - synthesize-recommendations
+  dimensions:
+    - completeness
+    - evidence_traceability
+    - specificity
+    - analytical_depth
+    - cross_artifact_synthesis
+    - actionability
+    - uncertainty_handling
+    - internal_consistency
+  minimum_overall_score: 0.78
+  minimum_dimension_score: 0.65
+  minimum_requirement_coverage: 0.80
+  phase_overrides:
+    synthesize-recommendations:
+      minimum_overall_score: 0.82
+      minimum_dimension_score: 0.70
+      minimum_requirement_coverage: 0.90
+      minimum_traceability_ratio: 0.70
+      minimum_upstream_evidence_reuse_ratio: 0.20
+      require_source_index_urls: true
+      required_sections:
+        - Executive Summary
+        - Research Objective and Scope
+        - Market-by-Market Findings
+        - Competitive Implications
+        - Priority Opportunities
+        - Risk-Adjusted Recommendations
+        - Implementation Roadmap
+        - Monitoring Plan
+        - Data Gaps and Limitations
+        - Evidence and Methodology
+
 tool_guidance: |
   Use CSV for structured comparison and markdown for narrative synthesis.
   Prefer primary sources where possible (company filings, investor reports,
@@ -43,7 +82,7 @@ tools:
   guidance: >
     Use web_search/web_fetch for external evidence, spreadsheet for matrices,
     and document_write for final synthesis artifacts.
-  required: [web_search, web_fetch, spreadsheet, calculator, read_file, write_file, document_write, search_files]
+  required: [web_search, web_fetch, spreadsheet, calculator, read_file, read_artifact, write_file, document_write, search_files, fact_checker]
   excluded: [delete_file, shell_execute, git_command]
 
 phases:
@@ -165,8 +204,13 @@ phases:
     is_critical_path: true
     is_synthesis: true
     acceptance_criteria: >
-      Final synthesis clearly answers the market research objective, includes
-      market-by-market recommendations, and cites evidence for key calls.
+      Final synthesis clearly answers the research objective and preserves the
+      material findings from every upstream artifact. It must include an
+      executive summary, explicit scope and methodology, market-by-market
+      findings, competitive implications, prioritized opportunities,
+      risk-adjusted recommendations with owners and horizons, an implementation
+      roadmap, a measurable monitoring plan, evidence traceability for material
+      claims, and explicit data gaps, assumptions, and limitations.
     deliverables:
       - "market-research-report.md — final market research synthesis and recommendations"
       - "strategic-watchlist.csv — monitoring metrics, thresholds, and owners"
@@ -190,6 +234,19 @@ tests:
     goal: "Run market research on live companies and produce a risk-aware competitive synthesis."
     timeout_seconds: 1200
     requires_network: true
+    acceptance:
+      quality:
+        allowed_completion_grades: [verified, verified_with_warnings]
+        artifact_minimum_characters:
+          market-research-report.md: 2500
+        artifact_required_patterns:
+          market-research-report.md:
+            - "(?im)^#{1,6}\\s+Executive Summary\\s*$"
+            - "(?im)^#{1,6}\\s+Data Gaps (?:and|&) Limitations\\s*$"
+            - "(?im)^#{1,6}\\s+Evidence (?:and|&) Methodology\\s*$"
+        csv_minimum_rows:
+          strategic-watchlist.csv: 5
+          source-index.csv: 8
 
 verification:
   policy:
@@ -219,6 +276,7 @@ verification:
         - remediation_required
         - remediation_mode
         - missing_targets
+        - quality
     outcome_policy:
       pass_states: [pass, pass_with_warnings, partial_verified]
       fail_states: [fail]
@@ -307,9 +365,17 @@ prompt_contracts:
   executor_constraints: |
     Keep factual claims traceable to evidence IDs or source URLs.
     If a claim cannot be verified, label it explicitly as unverified.
+    Read all declared upstream dependency artifacts before synthesis. Preserve
+    supported detail and reconcile contradictions rather than replacing deep
+    analysis with a shorter generic summary. Before the first canonical write,
+    build a coverage checklist from the phase acceptance criteria and quality
+    contract; before finishing, audit every checklist item.
   verifier_constraints: |
-    Evaluate acceptance criteria and process verification rules without assuming
-    a fixed output schema. Use metadata keys only when inferable.
+    Evaluate the complete expected artifact set against acceptance criteria and
+    the quality contract. Score requirement coverage, evidence traceability,
+    specificity, analytical depth, cross-artifact synthesis, actionability,
+    uncertainty handling, and internal consistency. Do not treat file existence,
+    document length, or the absence of placeholders as evidence of quality.
   remediation_instructions:
     default: |
       Perform targeted remediation only for failing checks. Preserve validated

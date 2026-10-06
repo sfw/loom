@@ -683,6 +683,120 @@ class TestSubtaskRunnerContextBudget:
         )
 
     @pytest.mark.asyncio
+    async def test_hybrid_replans_candidate_indices_after_semantic_checkpoint(self):
+        runner = self._make_runner_for_hybrid_compaction(context_budget=700)
+        runner._preserve_recent_critical_messages = 2
+        messages = [{"role": "user", "content": "Goal: preserve useful findings."}]
+        for index in range(10):
+            messages.extend([
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": f"call_{index}",
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "arguments": json.dumps({
+                                "query": "research detail " * 120,
+                            }),
+                        },
+                    }],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": f"call_{index}",
+                    "content": json.dumps({
+                        "success": True,
+                        "output": "useful evidence " * 180,
+                    }),
+                },
+            ])
+        messages.append({
+            "role": "user",
+            "content": "LATEST: finish from the preserved checkpoint.",
+        })
+
+        compacted = await runner._compact_messages_for_model(
+            messages,
+            remaining_seconds=240,
+        )
+
+        assert any(
+            str(message.get("content", "")).startswith(
+                "Prior semantic context checkpoint",
+            )
+            for message in compacted
+            if isinstance(message, dict)
+        )
+        assert len(compacted) < len(messages)
+        assert runner._last_compaction_diagnostics["compaction_applied_stages"][0] == (
+            "stage_4_semantic_checkpoint"
+        )
+
+    @pytest.mark.asyncio
+    async def test_hybrid_compaction_stage_failure_rolls_back_and_fails_open(
+        self,
+        monkeypatch,
+    ):
+        from loom.engine.runner import compaction as compaction_module
+
+        runner = self._make_runner_for_hybrid_compaction(context_budget=500)
+        runner._preserve_recent_critical_messages = 2
+        messages = [{"role": "user", "content": "Goal: preserve useful findings."}]
+        for index in range(10):
+            messages.extend([
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": f"call_{index}",
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "arguments": json.dumps({
+                                "query": "research detail " * 120,
+                            }),
+                        },
+                    }],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": f"call_{index}",
+                    "content": json.dumps({
+                        "success": True,
+                        "output": "useful evidence " * 180,
+                    }),
+                },
+            ])
+        messages.append({
+            "role": "user",
+            "content": "LATEST: finish from the preserved checkpoint.",
+        })
+
+        async def _raise_stage_failure(*_args, **_kwargs):
+            raise IndexError("stale compaction candidate")
+
+        monkeypatch.setattr(
+            compaction_module,
+            "compact_assistant_tool_calls",
+            _raise_stage_failure,
+        )
+
+        compacted = await runner._compact_messages_for_model(
+            messages,
+            remaining_seconds=240,
+        )
+
+        assert compacted
+        assert runner._last_compaction_diagnostics[
+            "compaction_compactor_failures"
+        ] >= 1
+        assert "stage_1_tool_args_error" in runner._last_compaction_diagnostics[
+            "compaction_skip_reasons"
+        ]
+
+    @pytest.mark.asyncio
     async def test_microcompact_reduces_tool_output_without_semantic_compactor_call(self):
         runner = self._make_runner_for_tiered_compaction(context_budget=700)
         messages = [

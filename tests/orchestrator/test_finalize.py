@@ -34,9 +34,7 @@ class TestOrchestratorFinalize:
 
     @pytest.mark.asyncio
     async def test_completed_when_all_done(self, tmp_path):
-        plan_json = json.dumps({
-            "subtasks": [{"id": "s1", "description": "Only step"}]
-        })
+        plan_json = json.dumps({"subtasks": [{"id": "s1", "description": "Only step"}]})
 
         orch = Orchestrator(
             model_router=_make_mock_router(plan_response_text=plan_json),
@@ -64,14 +62,16 @@ class TestOrchestratorFinalize:
             config=_make_config(),
         )
         task = _make_task()
-        task.plan = Plan(subtasks=[
-            Subtask(
-                id="synth",
-                description="Synthesize",
-                is_synthesis=True,
-                status=SubtaskStatus.COMPLETED,
-            ),
-        ])
+        task.plan = Plan(
+            subtasks=[
+                Subtask(
+                    id="synth",
+                    description="Synthesize",
+                    is_synthesis=True,
+                    status=SubtaskStatus.COMPLETED,
+                ),
+            ]
+        )
         task.metadata["validity_scorecard"] = {
             "subtask_metrics": {
                 "synth": {
@@ -96,9 +96,42 @@ class TestOrchestratorFinalize:
         result = orch._finalize_task(task)
 
         assert result.metadata["completion_grade"] == "degraded"
-        assert "missing_required_claim_evidence" in (
-            result.metadata["degraded_completion"]["reasons"]
+        assert (
+            "missing_required_claim_evidence" in (result.metadata["degraded_completion"]["reasons"])
         )
+
+    def test_finalize_marks_missing_synthesis_artifact_needs_attention(self, tmp_path):
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text='{"subtasks": []}'),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=_make_state_manager(tmp_path),
+            event_bus=_make_event_bus(),
+            config=_make_config(),
+        )
+        task = _make_task(workspace=str(tmp_path))
+        task.plan = Plan(
+            subtasks=[
+                Subtask(id="research", description="Research", status=SubtaskStatus.COMPLETED),
+                Subtask(
+                    id="final",
+                    description="Synthesize final report",
+                    is_synthesis=True,
+                    status=SubtaskStatus.COMPLETED,
+                ),
+            ]
+        )
+        task.metadata["artifact_seals"] = {
+            "research.md": {"path": "research.md", "subtask_id": "research"},
+        }
+
+        result = orch._finalize_task(task)
+
+        assert result.status == TaskStatus.COMPLETED
+        assert result.metadata["completion_grade"] == "needs_attention"
+        assert result.metadata["synthesis_completion"]["artifact_present"] is False
+        assert "missing_synthesis_artifact" in (result.metadata["degraded_completion"]["reasons"])
 
     def test_finalize_distinguishes_verified_with_warnings(self, tmp_path):
         orch = Orchestrator(
@@ -111,18 +144,101 @@ class TestOrchestratorFinalize:
             config=_make_config(),
         )
         task = _make_task()
-        task.plan = Plan(subtasks=[
-            Subtask(
-                id="done",
-                description="Done",
-                status=SubtaskStatus.COMPLETED,
-            ),
-        ])
+        task.plan = Plan(
+            subtasks=[
+                Subtask(
+                    id="done",
+                    description="Done",
+                    status=SubtaskStatus.COMPLETED,
+                ),
+            ]
+        )
         task.metadata["verification_outcome_counts"] = {"pass_with_warnings": 1}
 
         result = orch._finalize_task(task)
 
         assert result.metadata["completion_grade"] == "verified_with_warnings"
+
+    def test_finalize_separates_completion_from_quality_floor(self, tmp_path):
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text='{"subtasks": []}'),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=_make_state_manager(tmp_path),
+            event_bus=_make_event_bus(),
+            config=_make_config(),
+        )
+        task = _make_task()
+        task.plan = Plan(
+            subtasks=[
+                Subtask(
+                    id="synthesis",
+                    description="Synthesize",
+                    status=SubtaskStatus.COMPLETED,
+                ),
+            ]
+        )
+        task.metadata["subtask_quality"] = {
+            "synthesis": {
+                "overall": 0.74,
+                "meets_floor": False,
+                "reason_code": "quality_below_threshold",
+            },
+        }
+
+        result = orch._finalize_task(task)
+
+        assert result.status == TaskStatus.COMPLETED
+        assert result.metadata["completion_grade"] == "degraded"
+        degraded = result.metadata["degraded_completion"]
+        assert "quality_below_floor" in degraded["reasons"]
+        assert degraded["quality_below_floor_subtasks"] == ["synthesis"]
+        assert result.metadata["quality_scorecard"]["synthesis"] == {
+            "overall": 0.74,
+            "requirement_coverage": None,
+            "dimensions": {},
+            "meets_floor": False,
+            "reason_code": "quality_below_threshold",
+            "policy_mode": "enforce",
+            "missing_targets": [],
+        }
+
+    def test_finalize_assist_mode_reports_quality_without_degrading_run(self, tmp_path):
+        orch = Orchestrator(
+            model_router=_make_mock_router(plan_response_text='{"subtasks": []}'),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=_make_state_manager(tmp_path),
+            event_bus=_make_event_bus(),
+            config=_make_config(),
+        )
+        task = _make_task()
+        task.plan = Plan(
+            subtasks=[
+                Subtask(
+                    id="synthesis",
+                    description="Synthesize",
+                    status=SubtaskStatus.COMPLETED,
+                ),
+            ]
+        )
+        task.metadata["subtask_quality"] = {
+            "synthesis": {
+                "overall": 0.74,
+                "meets_floor": False,
+                "reason_code": "quality_below_threshold",
+                "policy_mode": "assist",
+            },
+        }
+
+        result = orch._finalize_task(task)
+
+        assert result.status == TaskStatus.COMPLETED
+        assert result.metadata["completion_grade"] == "verified"
+        assert result.metadata["quality_scorecard"]["synthesis"]["meets_floor"] is False
+        assert result.metadata["quality_scorecard"]["synthesis"]["policy_mode"] == "assist"
 
     def test_finalize_degrades_with_open_correction_cycle(self, tmp_path):
         orch = Orchestrator(
@@ -135,13 +251,15 @@ class TestOrchestratorFinalize:
             config=_make_config(),
         )
         task = _make_task()
-        task.plan = Plan(subtasks=[
-            Subtask(
-                id="done",
-                description="Done",
-                status=SubtaskStatus.COMPLETED,
-            ),
-        ])
+        task.plan = Plan(
+            subtasks=[
+                Subtask(
+                    id="done",
+                    description="Done",
+                    status=SubtaskStatus.COMPLETED,
+                ),
+            ]
+        )
         orch._task_correction_cycle_states[task.id] = {"corr-1": "retrying"}
 
         result = orch._finalize_task(task)
@@ -153,9 +271,7 @@ class TestOrchestratorFinalize:
 
     @pytest.mark.asyncio
     async def test_wrap_up_exports_evidence_ledger_csv_to_workspace(self, tmp_path):
-        plan_json = json.dumps({
-            "subtasks": [{"id": "s1", "description": "Only step"}]
-        })
+        plan_json = json.dumps({"subtasks": [{"id": "s1", "description": "Only step"}]})
         workspace = tmp_path / "workspace"
         workspace.mkdir()
 
@@ -168,20 +284,24 @@ class TestOrchestratorFinalize:
             event_bus=_make_event_bus(),
             config=_make_config(),
         )
-        orch._runner.run = AsyncMock(return_value=(
-            SubtaskResult(
-                status="success",
-                summary="captured evidence",
-                evidence_records=[{
-                    "evidence_id": "EV-1",
-                    "tool": "web_fetch",
-                    "source_url": "https://example.com/report",
-                    "quality": 0.9,
-                    "facets": {"market": "water"},
-                }],
-            ),
-            VerificationResult(tier=1, passed=True),
-        ))
+        orch._runner.run = AsyncMock(
+            return_value=(
+                SubtaskResult(
+                    status="success",
+                    summary="captured evidence",
+                    evidence_records=[
+                        {
+                            "evidence_id": "EV-1",
+                            "tool": "web_fetch",
+                            "source_url": "https://example.com/report",
+                            "quality": 0.9,
+                            "facets": {"market": "water"},
+                        }
+                    ],
+                ),
+                VerificationResult(tier=1, passed=True),
+            )
+        )
 
         task = _make_task(workspace=str(workspace))
         result = await orch.execute_task(task)
@@ -199,9 +319,7 @@ class TestOrchestratorFinalize:
 
     @pytest.mark.asyncio
     async def test_wrap_up_skips_evidence_csv_when_no_ledger(self, tmp_path):
-        plan_json = json.dumps({
-            "subtasks": [{"id": "s1", "description": "Only step"}]
-        })
+        plan_json = json.dumps({"subtasks": [{"id": "s1", "description": "Only step"}]})
         workspace = tmp_path / "workspace"
         workspace.mkdir()
 
@@ -223,13 +341,17 @@ class TestOrchestratorFinalize:
 
     @pytest.mark.asyncio
     async def test_wrap_up_exports_evidence_csv_for_degraded_task(self, tmp_path):
-        plan_json = json.dumps({
-            "subtasks": [{
-                "id": "s1",
-                "description": "Only step",
-                "is_critical_path": True,
-            }]
-        })
+        plan_json = json.dumps(
+            {
+                "subtasks": [
+                    {
+                        "id": "s1",
+                        "description": "Only step",
+                        "is_critical_path": True,
+                    }
+                ]
+            }
+        )
         workspace = tmp_path / "workspace"
         workspace.mkdir()
 
@@ -240,27 +362,33 @@ class TestOrchestratorFinalize:
             prompt_assembler=_make_mock_prompts(),
             state_manager=_make_state_manager(tmp_path / "state"),
             event_bus=_make_event_bus(),
-            config=Config(execution=ExecutionConfig(
-                max_subtask_retries=0,
-                max_correction_retries=0,
-            )),
+            config=Config(
+                execution=ExecutionConfig(
+                    max_subtask_retries=0,
+                    max_correction_retries=0,
+                )
+            ),
         )
-        orch._runner.run = AsyncMock(return_value=(
-            SubtaskResult(
-                status="failed",
-                summary="verification failed",
-                evidence_records=[{
-                    "evidence_id": "EV-FAIL-1",
-                    "tool": "web_search",
-                    "query": "utility market",
-                }],
-            ),
-            VerificationResult(
-                tier=2,
-                passed=False,
-                feedback="Verification failed",
-            ),
-        ))
+        orch._runner.run = AsyncMock(
+            return_value=(
+                SubtaskResult(
+                    status="failed",
+                    summary="verification failed",
+                    evidence_records=[
+                        {
+                            "evidence_id": "EV-FAIL-1",
+                            "tool": "web_search",
+                            "query": "utility market",
+                        }
+                    ],
+                ),
+                VerificationResult(
+                    tier=2,
+                    passed=False,
+                    feedback="Verification failed",
+                ),
+            )
+        )
 
         task = _make_task(workspace=str(workspace))
         result = await orch.execute_task(task)
@@ -278,12 +406,14 @@ class TestOrchestratorFinalize:
     @pytest.mark.asyncio
     async def test_cancel_task(self, tmp_path):
         """Cancel during execution: after s1 completes, cancel before s2 runs."""
-        plan_json = json.dumps({
-            "subtasks": [
-                {"id": "s1", "description": "First"},
-                {"id": "s2", "description": "Second", "depends_on": ["s1"]},
-            ]
-        })
+        plan_json = json.dumps(
+            {
+                "subtasks": [
+                    {"id": "s1", "description": "First"},
+                    {"id": "s2", "description": "Second", "depends_on": ["s1"]},
+                ]
+            }
+        )
 
         executor_model = AsyncMock()
         executor_model.name = "mock-exec"
@@ -303,10 +433,12 @@ class TestOrchestratorFinalize:
         router = MagicMock(spec=ModelRouter)
         planner_model = AsyncMock()
         planner_model.name = "mock-plan"
-        planner_model.complete = AsyncMock(return_value=ModelResponse(
-            text=plan_json,
-            usage=TokenUsage(input_tokens=10, output_tokens=10, total_tokens=20),
-        ))
+        planner_model.complete = AsyncMock(
+            return_value=ModelResponse(
+                text=plan_json,
+                usage=TokenUsage(input_tokens=10, output_tokens=10, total_tokens=20),
+            )
+        )
 
         def select_fn(tier=1, role="executor"):
             if role == "planner":
@@ -387,31 +519,37 @@ class TestOrchestratorFinalize:
     async def test_pause_blocks_subtask_runner_until_resume(self, tmp_path):
         executor_model = AsyncMock()
         executor_model.name = "mock-exec"
-        executor_model.complete = AsyncMock(side_effect=[
-            ModelResponse(
-                text="",
-                tool_calls=[
-                    ToolCall(
-                        id="tc-1",
-                        name="read_file",
-                        arguments={"path": "notes.md"},
-                    ),
-                ],
-                usage=TokenUsage(input_tokens=10, output_tokens=10, total_tokens=20),
-            ),
-            ModelResponse(
-                text="Done",
-                usage=TokenUsage(input_tokens=10, output_tokens=10, total_tokens=20),
-            ),
-        ])
+        executor_model.complete = AsyncMock(
+            side_effect=[
+                ModelResponse(
+                    text="",
+                    tool_calls=[
+                        ToolCall(
+                            id="tc-1",
+                            name="read_file",
+                            arguments={"path": "notes.md"},
+                        ),
+                    ],
+                    usage=TokenUsage(input_tokens=10, output_tokens=10, total_tokens=20),
+                ),
+                ModelResponse(
+                    text="Done",
+                    usage=TokenUsage(input_tokens=10, output_tokens=10, total_tokens=20),
+                ),
+            ]
+        )
         planner_model = AsyncMock()
         planner_model.name = "mock-plan"
-        planner_model.complete = AsyncMock(return_value=ModelResponse(
-            text=json.dumps({
-                "subtasks": [{"id": "s1", "description": "Only step"}],
-            }),
-            usage=TokenUsage(input_tokens=10, output_tokens=10, total_tokens=20),
-        ))
+        planner_model.complete = AsyncMock(
+            return_value=ModelResponse(
+                text=json.dumps(
+                    {
+                        "subtasks": [{"id": "s1", "description": "Only step"}],
+                    }
+                ),
+                usage=TokenUsage(input_tokens=10, output_tokens=10, total_tokens=20),
+            )
+        )
 
         router = MagicMock(spec=ModelRouter)
 
@@ -505,17 +643,21 @@ class TestOrchestratorFinalize:
         router = MagicMock(spec=ModelRouter)
         planner_model = AsyncMock()
         planner_model.name = "mock-planner"
-        planner_model.complete = AsyncMock(side_effect=[
-            ModelConnectionError("Model server returned HTTP 522: upstream timeout"),
-            ModelConnectionError("Model server returned HTTP 522: upstream timeout"),
-            ModelConnectionError("Model server returned HTTP 522: upstream timeout"),
-        ])
+        planner_model.complete = AsyncMock(
+            side_effect=[
+                ModelConnectionError("Model server returned HTTP 522: upstream timeout"),
+                ModelConnectionError("Model server returned HTTP 522: upstream timeout"),
+                ModelConnectionError("Model server returned HTTP 522: upstream timeout"),
+            ]
+        )
         executor_model = AsyncMock()
         executor_model.name = "mock-executor"
-        executor_model.complete = AsyncMock(return_value=ModelResponse(
-            text="Subtask completed successfully.",
-            usage=TokenUsage(input_tokens=50, output_tokens=30, total_tokens=80),
-        ))
+        executor_model.complete = AsyncMock(
+            return_value=ModelResponse(
+                text="Subtask completed successfully.",
+                usage=TokenUsage(input_tokens=50, output_tokens=30, total_tokens=80),
+            )
+        )
 
         def select_fn(tier=1, role="executor"):
             if role == "planner":
@@ -524,17 +666,19 @@ class TestOrchestratorFinalize:
 
         router.select = MagicMock(side_effect=select_fn)
 
-        cfg = Config(execution=ExecutionConfig(
-            max_subtask_retries=0,
-            max_loop_iterations=50,
-            max_parallel_subtasks=3,
-            auto_approve_confidence_threshold=0.5,
-            enable_streaming=False,
-            model_call_max_attempts=3,
-            model_call_retry_base_delay_seconds=0.0,
-            model_call_retry_max_delay_seconds=0.0,
-            model_call_retry_jitter_seconds=0.0,
-        ))
+        cfg = Config(
+            execution=ExecutionConfig(
+                max_subtask_retries=0,
+                max_loop_iterations=50,
+                max_parallel_subtasks=3,
+                auto_approve_confidence_threshold=0.5,
+                enable_streaming=False,
+                model_call_max_attempts=3,
+                model_call_retry_base_delay_seconds=0.0,
+                model_call_retry_max_delay_seconds=0.0,
+                model_call_retry_jitter_seconds=0.0,
+            )
+        )
         orch = Orchestrator(
             model_router=router,
             tool_registry=_make_mock_tools(),

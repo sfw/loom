@@ -586,6 +586,16 @@ export interface RunDetail extends RunSummary {
   plan_subtasks: PlanSubtask[];
   completion_grade?: string;
   degraded_completion?: Record<string, unknown>;
+  quality_scorecard?: Record<string, RunQualityScore>;
+}
+
+export interface RunQualityScore {
+  overall?: number | null;
+  requirement_coverage?: number | null;
+  dimensions?: Record<string, number>;
+  meets_floor?: boolean | null;
+  reason_code?: string;
+  missing_targets?: string[];
 }
 
 export interface RunArtifact {

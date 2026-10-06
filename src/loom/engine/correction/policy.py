@@ -12,58 +12,78 @@ from loom.engine.correction.types import (
     RepairAction,
 )
 
-_TERMINAL_INTEGRITY_CODES = frozenset({
-    "artifact_seal_invalid",
-    "path_policy_violation",
-    "safety_policy_violation",
-})
-_HUMAN_CODES = frozenset({
-    "approval_required",
-    "authentication_required",
-    "destructive_action_requires_approval",
-})
-_VERIFIER_CODES = frozenset({
-    "parse_inconclusive",
-    "required_verifier_empty",
-    "required_verifier_missing",
-    "infra_verifier_error",
-})
-_TOOL_CODES = frozenset({
-    "tool_capability_unavailable",
-    "tool_method_failed",
-    "tool_runtime_capability_unavailable",
-    "tool_runtime_retryable",
-    "tool_transient_failure",
-    "tool_upstream_unavailable",
-    "tool_write_retryable",
-})
-_EVIDENCE_CODES = frozenset({
-    "claim_insufficient_evidence",
-    "coverage_below_threshold",
-    "recommendation_unconfirmed",
-    "unconfirmed_critical_path",
-    "unconfirmed_noncritical",
-})
-_PLACEHOLDER_CODES = frozenset({
-    "incomplete_deliverable_content",
-    "incomplete_deliverable_placeholder",
-})
-_SCHEMA_CODES = frozenset({
-    "csv_schema_mismatch",
-})
-_CONTRACT_CODES = frozenset({
-    "aggregate_scan_not_zonal",
-    "incomplete_pestle_coverage_unverified_assumptions_remain",
-    "missing_leading_indicators_and_geographic_granularity",
-    "missing_market_specific_recommendations",
-    "missing_required_contract_field",
-    "missing_structured_leading_indicators",
-    "structured_output_contract_failed",
-    "unverified_primary_deliverables",
-})
+_TERMINAL_INTEGRITY_CODES = frozenset(
+    {
+        "artifact_seal_invalid",
+        "path_policy_violation",
+        "safety_policy_violation",
+    }
+)
+_HUMAN_CODES = frozenset(
+    {
+        "approval_required",
+        "authentication_required",
+        "destructive_action_requires_approval",
+    }
+)
+_VERIFIER_CODES = frozenset(
+    {
+        "parse_inconclusive",
+        "quality_assessment_missing",
+        "required_verifier_empty",
+        "required_verifier_missing",
+        "infra_verifier_error",
+    }
+)
+_TOOL_CODES = frozenset(
+    {
+        "tool_capability_unavailable",
+        "tool_method_failed",
+        "tool_runtime_capability_unavailable",
+        "tool_runtime_retryable",
+        "tool_transient_failure",
+        "tool_upstream_unavailable",
+        "tool_write_retryable",
+    }
+)
+_EVIDENCE_CODES = frozenset(
+    {
+        "claim_insufficient_evidence",
+        "coverage_below_threshold",
+        "recommendation_unconfirmed",
+        "unconfirmed_critical_path",
+        "unconfirmed_noncritical",
+    }
+)
+_PLACEHOLDER_CODES = frozenset(
+    {
+        "incomplete_deliverable_content",
+        "incomplete_deliverable_placeholder",
+    }
+)
+_SCHEMA_CODES = frozenset(
+    {
+        "csv_schema_mismatch",
+    }
+)
+_CONTRACT_CODES = frozenset(
+    {
+        "aggregate_scan_not_zonal",
+        "evidence_traceability_below_threshold",
+        "incomplete_pestle_coverage_unverified_assumptions_remain",
+        "missing_leading_indicators_and_geographic_granularity",
+        "missing_market_specific_recommendations",
+        "missing_required_contract_field",
+        "missing_structured_leading_indicators",
+        "quality_below_threshold",
+        "structured_output_contract_failed",
+        "unverified_primary_deliverables",
+    }
+)
 _REASON_CODE_ALIASES = {
     "budget_exhausted_incomplete": "runner_tool_budget_exhausted",
     "iteration_budget_exceeded": "runner_tool_budget_exhausted",
+    "runner_degraded_fit_checkpoint_required": "runner_tool_budget_exhausted",
     "runner_repeated_degraded_fit": "runner_tool_budget_exhausted",
     "tool_budget_exceeded": "runner_tool_budget_exhausted",
     "tool_budget_exhausted": "runner_tool_budget_exhausted",
@@ -148,8 +168,10 @@ def canonicalize_reason_code(
         return aliased or "structured_output_contract_failed", BlockerClass.ARTIFACT_CONTRACT
     if aliased == "runner_tool_budget_exhausted" or _BUDGET_REASON_RE.search(raw):
         return "runner_tool_budget_exhausted", BlockerClass.RESOURCE_EXHAUSTION
-    if aliased in _VERIFIER_CODES or "verifier" in aliased and (
-        "parse" in aliased or "infra" in aliased or "missing" in aliased
+    if (
+        aliased in _VERIFIER_CODES
+        or "verifier" in aliased
+        and ("parse" in aliased or "infra" in aliased or "missing" in aliased)
     ):
         return aliased or "infra_verifier_error", BlockerClass.VERIFIER_FAILURE
     if aliased in _TOOL_CODES:
@@ -232,9 +254,8 @@ def _repairability_for(
         return Repairability.HUMAN_REQUIRED
     if code == "claim_contradicted":
         remediation_mode = str(metadata.get("remediation_mode", "") or "").strip().lower()
-        if (
-            remediation_mode in {"confirm_or_prune", "confirm_or_prune_then_queue"}
-            or bool(metadata.get("prune_authorized", False))
+        if remediation_mode in {"confirm_or_prune", "confirm_or_prune_then_queue"} or bool(
+            metadata.get("prune_authorized", False)
         ):
             return Repairability.CONDITIONAL
         return Repairability.HUMAN_REQUIRED
@@ -283,11 +304,7 @@ def _check_reason_code(check_name: str, detail: str, fallback: str) -> str:
         return match.group(1).lower()
     normalized_name = str(check_name or "").strip().lower()
     if normalized_name in (
-        _SCHEMA_CODES
-        | _CONTRACT_CODES
-        | _VERIFIER_CODES
-        | _TOOL_CODES
-        | _EVIDENCE_CODES
+        _SCHEMA_CODES | _CONTRACT_CODES | _VERIFIER_CODES | _TOOL_CODES | _EVIDENCE_CODES
     ):
         return normalized_name
     return fallback
@@ -304,13 +321,42 @@ def classify_blockers(verification) -> tuple[Blocker, ...]:
     severity = str(getattr(verification, "severity_class", "") or "").strip().lower()
     feedback = str(getattr(verification, "feedback", "") or "").strip()
     targets = _metadata_list(metadata, "missing_targets")
+    required_tool = str(metadata.get("required_tool", "") or "").strip().lower()
+    if (
+        raw_code in {"required_verifier_missing", "required_verifier_empty"}
+        and required_tool == "fact_checker"
+    ):
+        # This is not a verifier parse/infrastructure failure: the executor did
+        # not produce the claim-level grounding input that verification needs.
+        # A verifier-only retry is incapable of creating those verdicts, so
+        # route back through the execution/source lane.
+        code = (
+            "required_fact_checker_missing"
+            if raw_code == "required_verifier_missing"
+            else "required_fact_checker_empty"
+        )
+        return (
+            Blocker(
+                code=code,
+                message=feedback or "Required claim-level fact grounding is missing.",
+                blocking=True,
+                repairability=Repairability.AUTOMATIC,
+                blocker_class=BlockerClass.TOOL_FAILURE,
+                source="verification:fact_checker",
+                targets=targets,
+                metadata={
+                    "original_reason_code": raw_code,
+                    "required_tool": required_tool,
+                },
+            ),
+        )
     failed_checks = [
-        check for check in (getattr(verification, "checks", None) or [])
+        check
+        for check in (getattr(verification, "checks", None) or [])
         if not bool(getattr(check, "passed", False))
     ]
     check_text = " ".join(
-        f"{getattr(check, 'name', '')} {getattr(check, 'detail', '')}"
-        for check in failed_checks
+        f"{getattr(check, 'name', '')} {getattr(check, 'detail', '')}" for check in failed_checks
     )
     code, blocker_class = canonicalize_reason_code(
         raw_code,
@@ -359,11 +405,7 @@ def classify_blockers(verification) -> tuple[Blocker, ...]:
                     targets=tuple(blocker_targets),
                     metadata={
                         "original_reason_code": raw_code,
-                        **(
-                            _schema_diagnostics(detail)
-                            if check_code in _SCHEMA_CODES
-                            else {}
-                        ),
+                        **(_schema_diagnostics(detail) if check_code in _SCHEMA_CODES else {}),
                     },
                 )
             )
@@ -435,8 +477,7 @@ def build_actions(
         for blocker in blockers
         for target in (blocker.targets or ("",))
         if any(
-            key in blocker.metadata
-            for key in {"row_number", "actual_columns", "expected_columns"}
+            key in blocker.metadata for key in {"row_number", "actual_columns", "expected_columns"}
         )
     ]
     action_type = {

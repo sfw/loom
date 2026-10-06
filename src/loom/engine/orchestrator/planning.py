@@ -38,6 +38,113 @@ from loom.utils.concurrency import run_blocking_io
 
 logger = logging.getLogger(__name__)
 
+_NATIVE_READ_FILE_EXTENSIONS = frozenset({
+    ".txt", ".log", ".rst", ".md", ".mdx",
+    ".pdf", ".doc", ".docx", ".ppt", ".pptx",
+})
+
+
+async def _preflight_attached_inputs(
+    orchestrator,
+    *,
+    workspace_path: Path,
+    read_roots: list[Path],
+    read_path_map: dict[str, Path],
+    auth_context,
+) -> list[dict[str, object]]:
+    """Validate attached inputs with native readers before model planning."""
+    entries: list[dict[str, object]] = []
+    for logical_path, source_path in list(read_path_map.items())[:32]:
+        source = Path(source_path)
+        entry: dict[str, object] = {
+            "path": str(logical_path),
+            "extension": source.suffix.lower(),
+            "exists": source.exists(),
+            "readable": False,
+            "reader": "",
+        }
+        if not source.exists():
+            entry["error"] = "attached input does not exist"
+            entries.append(entry)
+            continue
+        if source.is_dir():
+            entry.update({"readable": True, "reader": "list_directory", "kind": "directory"})
+            entries.append(entry)
+            continue
+        try:
+            entry["size_bytes"] = int(source.stat().st_size or 0)
+        except OSError as exc:
+            entry["error"] = f"unable to inspect attached input: {exc}"
+            entries.append(entry)
+            continue
+        if source.suffix.lower() not in _NATIVE_READ_FILE_EXTENSIONS:
+            entry.update({"readable": True, "reader": "registered format-specific tool"})
+            entries.append(entry)
+            continue
+
+        read_args: dict[str, object] = {"path": str(logical_path)}
+        if source.suffix.lower() == ".pdf":
+            read_args["page_start"] = 0
+            read_args["page_end"] = 1
+        try:
+            result = await orchestrator._tools.execute(
+                "read_file",
+                read_args,
+                workspace=workspace_path,
+                read_roots=read_roots,
+                read_path_map=read_path_map,
+                auth_context=auth_context,
+            )
+        except Exception as exc:
+            entry["error"] = f"native reader preflight failed: {exc}"
+            entries.append(entry)
+            continue
+        result_data = result.data if isinstance(result.data, dict) else {}
+        extracted_text = ""
+        for block in list(result.content_blocks or []):
+            block_text = str(getattr(block, "extracted_text", "") or "")
+            if block_text:
+                extracted_text += block_text
+        if not result.content_blocks:
+            extracted_text = str(result.output or "")
+        entry.update({
+            "readable": bool(result.success),
+            "reader": "read_file",
+            "text_extractable": bool(extracted_text.strip()) if result.success else False,
+            "extracted_chars": len(extracted_text),
+        })
+        if "pages" in result_data:
+            entry["pages"] = result_data["pages"]
+        if not result.success:
+            entry["error"] = str(result.error or "native read failed")
+        entries.append(entry)
+    return entries
+
+
+def _format_input_capability_manifest(entries: list[dict[str, object]]) -> str:
+    if not entries:
+        return ""
+    lines = [
+        "DETERMINISTIC INPUT CAPABILITY MANIFEST:",
+        (
+            "This manifest was produced by Loom before planning; do not create "
+            "a capability-probe subtask."
+        ),
+    ]
+    for entry in entries:
+        state = "readable" if entry.get("readable") else "unreadable"
+        details = [state, f"reader={entry.get('reader') or 'none'}"]
+        if entry.get("text_extractable") is not None:
+            details.append(f"text_extractable={str(bool(entry['text_extractable'])).lower()}")
+        if entry.get("pages") is not None:
+            details.append(f"pages={entry['pages']}")
+        if entry.get("extracted_chars") is not None:
+            details.append(f"sample_chars={entry['extracted_chars']}")
+        if entry.get("error"):
+            details.append(f"error={entry['error']}")
+        lines.append(f"- {entry.get('path', '')}: " + ", ".join(details))
+    return "\n".join(lines)
+
 
 def phase_mode(orchestrator) -> str:
     """Resolve process phase mode with bounded valid values."""
@@ -155,6 +262,22 @@ async def plan_task(
                 workspace_analysis = analysis_text
             else:
                 code_analysis = analysis_text
+
+            input_manifest = await _preflight_attached_inputs(
+                orchestrator,
+                workspace_path=workspace_path,
+                read_roots=read_roots,
+                read_path_map=read_path_map,
+                auth_context=auth_context,
+            )
+            if input_manifest:
+                metadata = task.metadata if isinstance(task.metadata, dict) else {}
+                metadata["input_capability_manifest"] = input_manifest
+                task.metadata = metadata
+                manifest_text = _format_input_capability_manifest(input_manifest)
+                workspace_analysis = "\n\n".join(
+                    part for part in (workspace_analysis, manifest_text) if part
+                )
 
     prompt = orchestrator._prompts.build_planner_prompt(
         task=task,
@@ -553,6 +676,16 @@ def _prepare_plan_for_execution(
 ) -> Plan:
     """Normalize and validate planner output before execution."""
     working = deepcopy(plan)
+    working, native_reader_normalizations = _normalize_native_reader_probe_subtasks(
+        task=task,
+        plan=working,
+    )
+    if native_reader_normalizations:
+        self._emit(TASK_PLAN_NORMALIZED, task.id, {
+            "context": context,
+            "normalized_subtasks": native_reader_normalizations,
+            "plan_version": int(working.version),
+        })
     normalized_plan, normalized_subtasks = self._normalize_non_terminal_synthesis(
         working,
     )
@@ -596,6 +729,69 @@ def _prepare_plan_for_execution(
                 f"{context}: " + "; ".join(post_alignment_issues),
             )
     return working
+
+
+def _normalize_native_reader_probe_subtasks(
+    *,
+    task: Task,
+    plan: Plan,
+) -> tuple[Plan, list[dict[str, object]]]:
+    """Route redundant document capability probes through native readers."""
+    metadata = task.metadata if isinstance(task.metadata, dict) else {}
+    manifest = metadata.get("input_capability_manifest", [])
+    if not isinstance(manifest, list):
+        return plan, []
+    readable_paths = [
+        str(item.get("path", "") or "").strip()
+        for item in manifest
+        if isinstance(item, dict)
+        and bool(item.get("readable"))
+        and str(item.get("reader", "") or "").strip() == "read_file"
+    ]
+    if not readable_paths:
+        return plan, []
+    goal_text = str(task.goal or "").lower()
+    if any(
+        marker in goal_text
+        for marker in ("extractor benchmark", "extraction benchmark", "test extraction methods")
+    ):
+        return plan, []
+
+    normalized: list[dict[str, object]] = []
+    for subtask in plan.subtasks:
+        haystack = " ".join([
+            str(subtask.id or ""),
+            str(subtask.description or ""),
+            str(subtask.acceptance_criteria or ""),
+        ]).lower()
+        capability_probe = any(
+            marker in haystack
+            for marker in (
+                "probe execution",
+                "probe capabilities",
+                "extraction commands",
+                "pdftotext",
+                "python-docx",
+                "pypdf",
+            )
+        )
+        document_input = any(marker in haystack for marker in ("pdf", "docx", "document"))
+        if not capability_probe or not document_input:
+            continue
+        paths = ", ".join(f"`{path}`" for path in readable_paths[:12])
+        original_description = str(subtask.description or "").strip()
+        subtask.description = (
+            f"Loom has already preflighted these attached inputs as readable: {paths}. "
+            "Use `read_file` directly to open and inspect them, then complete the "
+            "subtask deliverable and acceptance criteria. Do not probe shell binaries, "
+            "inline interpreters, or write temporary extraction scripts."
+        )
+        normalized.append({
+            "subtask_id": subtask.id,
+            "normalization": "native_attachment_reader",
+            "original_description": original_description,
+        })
+    return plan, normalized
 
 def _annotate_subtask_phase_ids(self, *, task: Task, plan: Plan) -> None:
     """Annotate each subtask with the closest matching process phase id."""

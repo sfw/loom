@@ -26,6 +26,7 @@ from loom.engine.orchestrator import (
     SubtaskResultStatus,
     ToolCallRecord,
 )
+from loom.engine.orchestrator.dispatch import _record_quality_observation
 from loom.engine.verification import Check, VerificationResult
 from loom.events.types import (
     FORBIDDEN_CANONICAL_WRITE_BLOCKED,
@@ -68,6 +69,67 @@ from tests.orchestrator.conftest import (
 
 class TestOrchestratorExecution:
     """Tests for the subtask execution phase."""
+
+    def test_quality_repair_ledger_is_bounded_and_privacy_safe(self):
+        task = _make_task()
+        subtask = Subtask(id="synthesis", description="Synthesize")
+        failed_quality = {
+            "overall": 0.62,
+            "requirement_coverage": 0.70,
+            "dimensions": {"completeness": 0.64, "depth": 0.73},
+            "meets_floor": False,
+            "reason_code": "quality_below_threshold",
+            "policy_mode": "enforce",
+            "missing_targets": ["generic requirement"],
+            "diagnostics": {
+                "traceability_ratio": 0.5,
+                "artifact_metrics": [{
+                    "path": "private-output-name.md",
+                    "role": "current",
+                    "word_count": 100,
+                }],
+            },
+        }
+        repaired_quality = {
+            **failed_quality,
+            "overall": 0.84,
+            "requirement_coverage": 0.92,
+            "dimensions": {"completeness": 0.86, "depth": 0.82},
+            "meets_floor": True,
+            "reason_code": "",
+            "missing_targets": [],
+            "diagnostics": {
+                "traceability_ratio": 0.9,
+                "artifact_metrics": [{
+                    "path": "private-output-name.md",
+                    "role": "current",
+                    "word_count": 180,
+                }],
+            },
+        }
+
+        _record_quality_observation(
+            task=task,
+            subtask=subtask,
+            quality=failed_quality,
+            stage="verification_failure",
+        )
+        _record_quality_observation(
+            task=task,
+            subtask=subtask,
+            quality=repaired_quality,
+            stage="verification_success",
+        )
+
+        observations = task.metadata["quality_observations"]
+        assert len(observations) == 2
+        assert all("path" not in item for item in observations)
+        assert "private-output-name.md" not in repr(observations)
+        outcome = task.metadata["quality_repair_outcomes"][0]
+        assert outcome["recovered"] is True
+        assert outcome["overall_delta"] == 0.22
+        assert outcome["word_count_delta"] == 80
+        assert outcome["regressed_dimensions"] == []
 
     @pytest.mark.asyncio
     async def test_dispatch_subtask_carries_prior_successful_tool_calls(self, tmp_path):
@@ -3167,3 +3229,77 @@ class TestOrchestratorExecution:
 
         with pytest.raises(asyncio.CancelledError):
             await orch.execute_task(task, reuse_existing_plan=True)
+
+    def test_dispatch_exception_is_classified_as_compaction_infrastructure(self, tmp_path):
+        orch = Orchestrator(
+            model_router=_make_mock_router(),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=_make_state_manager(tmp_path),
+            event_bus=_make_event_bus(),
+            config=_make_config(),
+        )
+        try:
+            exec(compile(
+                "raise IndexError('stale candidate index')",
+                "/tmp/loom/engine/runner/compaction.py",
+                "exec",
+            ))
+        except IndexError as error:
+            _, result, verification = orch._build_subtask_exception_outcome(
+                Subtask(id="research", description="Research"),
+                error,
+            )
+        else:  # pragma: no cover - the compiled fixture always raises
+            raise AssertionError("expected fixture to raise")
+
+        assert result.status == SubtaskResultStatus.FAILED
+        assert verification.reason_code == "infra_compaction_error"
+        assert verification.severity_class == "infra"
+        assert verification.metadata["exception_component"] == "runner_compaction"
+        assert verification.checks[0].name == "executor_infrastructure"
+
+    @pytest.mark.asyncio
+    async def test_partial_checkpoint_reports_no_progress_not_budget_exhaustion(
+        self,
+        tmp_path,
+    ):
+        state = _make_state_manager(tmp_path)
+        orch = Orchestrator(
+            model_router=_make_mock_router(),
+            tool_registry=_make_mock_tools(),
+            memory_manager=_make_mock_memory(),
+            prompt_assembler=_make_mock_prompts(),
+            state_manager=state,
+            event_bus=_make_event_bus(),
+            config=_make_config(),
+        )
+        task = _make_task()
+        subtask = Subtask(
+            id="research",
+            description="Research",
+            is_critical_path=True,
+        )
+        task.plan = Plan(subtasks=[subtask])
+        state.create(task)
+        verification = VerificationResult(
+            tier=1,
+            passed=False,
+            feedback="The targeted repair made no progress.",
+            reason_code="coverage_below_threshold",
+            severity_class="semantic",
+            metadata={
+                "correction": {
+                    "stop_for_no_progress": True,
+                    "stop_for_attempt_budget": False,
+                },
+            },
+        )
+
+        await orch._abort_on_critical_path_failure(task, subtask, verification)
+
+        assert subtask.status == SubtaskStatus.PARTIAL
+        assert "no-progress attempts" in subtask.summary
+        assert "budget exhausted" not in subtask.summary.lower()
+        assert task.metadata["recoverable_gaps"][-1]["terminal_reason"] == "no_progress"
