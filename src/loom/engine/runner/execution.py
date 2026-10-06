@@ -1847,6 +1847,9 @@ async def run_subtask(
                                             subtask=subtask,
                                             request=request,
                                         )
+                                        timeout_pause_started_at = (
+                                            runner._begin_subtask_timeout_pause()
+                                        )
 
                                         def _check_task_control() -> str:
                                             return runner._task_status_text(task)
@@ -1862,6 +1865,9 @@ async def run_subtask(
                                             await runner._clear_waiting_for_user_input(
                                                 task=task,
                                                 question_id=request.question_id,
+                                            )
+                                            runner._end_subtask_timeout_pause(
+                                                timeout_pause_started_at,
                                             )
                                         answer_payload = answer.to_payload()
                                         answer_status = (

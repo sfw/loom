@@ -1161,6 +1161,7 @@ async def _restart_process_run_in_place(
     run.progress_ui_last_refresh_at = 0.0
     run.paused_started_at = 0.0
     run.paused_accumulated_seconds = 0.0
+    self._clear_process_run_user_input_pause(run.run_id)
     self._clear_process_run_cancel_handler(run.run_id)
     self._process_run_pending_inject.pop(run.run_id, None)
     if run.task_id:

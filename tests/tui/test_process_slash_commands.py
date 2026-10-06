@@ -4349,6 +4349,7 @@ class TestProcessSlashCommands:
         ))
 
         selected = await app._choose_process_run_workspace(
+            "run-1",
             "market-research",
             "Analyze Encor",
         )
@@ -4376,6 +4377,7 @@ class TestProcessSlashCommands:
         ))
 
         selected = await app._choose_process_run_workspace(
+            "run-1",
             "market-research",
             "Analyze Encor",
         )
@@ -4404,6 +4406,7 @@ class TestProcessSlashCommands:
         ))
 
         selected = await app._choose_process_run_workspace(
+            "run-1",
             "market-research",
             "Analyze Encor",
         )
@@ -4413,6 +4416,62 @@ class TestProcessSlashCommands:
         assert app._prompt_process_run_workspace_choice.await_count == 2
         chat.add_info.assert_called_once()
         assert "Invalid working folder" in chat.add_info.call_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_prepare_process_run_with_timeout_ignores_user_input_pause(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        from loom.tui.app import LoomApp, ProcessRunLaunchRequest, ProcessRunState
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=tmp_path,
+        )
+        pane = MagicMock()
+        run = ProcessRunState(
+            run_id="abc123",
+            process_name="market-research",
+            goal="Analyze Encor",
+            run_workspace=tmp_path,
+            process_defn=None,
+            pane_id="tab-run-abc123",
+            pane=pane,
+            status="queued",
+        )
+        app._process_runs = {"abc123": run}
+        app._fail_process_run_launch = MagicMock()
+        app._tui_run_launch_timeout_seconds = MagicMock(return_value=5.0)
+
+        clock = {"now": 0.0}
+        monkeypatch.setattr(
+            "loom.tui.app.process_runs.lifecycle.time.monotonic",
+            lambda: clock["now"],
+        )
+        monkeypatch.setattr(
+            "loom.tui.app.process_runs.ui_state.time.monotonic",
+            lambda: clock["now"],
+        )
+
+        async def _fake_prepare(_run_id, _launch_request):
+            app._begin_process_run_user_input_pause("abc123")
+            clock["now"] = 10.0
+            await asyncio.sleep(0)
+            app._end_process_run_user_input_pause("abc123")
+            clock["now"] = 10.1
+            return True
+
+        app._prepare_process_run_launch = _fake_prepare
+
+        prepared = await app._prepare_process_run_with_timeout(
+            "abc123",
+            ProcessRunLaunchRequest(goal="Analyze Encor"),
+        )
+
+        assert prepared is True
+        app._fail_process_run_launch.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_llm_process_run_folder_name_rejects_prompt_echo(self, tmp_path):

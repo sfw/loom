@@ -239,6 +239,36 @@ class TestProcessRunPane:
         assert first == second
         assert first == 16.0
 
+    def test_elapsed_seconds_freezes_while_waiting_for_user_input(self):
+        from loom.tui.app import LoomApp
+
+        app = LoomApp(
+            model=MagicMock(name="model"),
+            tools=MagicMock(),
+            workspace=Path("/tmp"),
+        )
+        app._update_process_run_visuals = MagicMock()
+        app._refresh_sidebar_progress_summary = MagicMock()
+        run = SimpleNamespace(
+            run_id="abc123",
+            started_at=10.0,
+            ended_at=None,
+            paused_started_at=0.0,
+            paused_accumulated_seconds=0.0,
+            user_input_pause_started_at=0.0,
+            user_input_paused_accumulated_seconds=0.0,
+        )
+        app._process_runs = {"abc123": run}
+
+        with patch("loom.tui.app.process_runs.ui_state.time.monotonic", return_value=40.0):
+            app._begin_process_run_user_input_pause("abc123")
+            first = app._elapsed_seconds_for_run(run)
+        with patch("loom.tui.app.process_runs.ui_state.time.monotonic", return_value=120.0):
+            second = app._elapsed_seconds_for_run(run)
+
+        assert first == second
+        assert first == 30.0
+
     def test_has_active_process_runs_ignores_paused_status(self):
         from loom.tui.app import LoomApp
 

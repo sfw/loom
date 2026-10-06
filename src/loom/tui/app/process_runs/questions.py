@@ -57,7 +57,11 @@ async def _prompt_process_run_question(
             callback=handle_answer,
         )
 
-        await answer_event.wait()
+        self._begin_process_run_user_input_pause(run_id)
+        try:
+            await answer_event.wait()
+        finally:
+            self._end_process_run_user_input_pause(run_id)
         if not answer_holder:
             return
         answer_payload = dict(answer_holder[0])
