@@ -351,6 +351,7 @@ class OllamaProvider(ModelProvider):
         not in the content. Extracts image content blocks from tool results.
         """
         result = []
+        tool_names_by_id: dict[str, str] = {}
         for msg in messages:
             out = {
                 "role": msg.get("role", "user"),
@@ -361,9 +362,24 @@ class OllamaProvider(ModelProvider):
 
             # Copy tool_calls if present
             if msg.get("tool_calls"):
-                out["tool_calls"] = msg["tool_calls"]
+                out["tool_calls"] = self._normalize_ollama_tool_calls(
+                    msg["tool_calls"],
+                )
+                for tool_call in out["tool_calls"]:
+                    call_id = str(tool_call.get("id", "") or "").strip()
+                    function = tool_call.get("function", {})
+                    tool_name = str(function.get("name", "") or "").strip()
+                    if call_id and tool_name:
+                        tool_names_by_id[call_id] = tool_name
             if msg.get("tool_call_id"):
                 out["tool_call_id"] = msg["tool_call_id"]
+            if msg.get("role") == "tool":
+                tool_name = str(msg.get("tool_name", "") or "").strip()
+                if not tool_name:
+                    tool_call_id = str(msg.get("tool_call_id", "") or "").strip()
+                    tool_name = tool_names_by_id.get(tool_call_id, "")
+                if tool_name:
+                    out["tool_name"] = tool_name
 
             if msg.get("role") == "tool":
                 images = self._extract_images_from_tool_result(msg.get("content", ""))
@@ -376,6 +392,42 @@ class OllamaProvider(ModelProvider):
 
             result.append(out)
         return result
+
+    @staticmethod
+    def _normalize_ollama_tool_calls(tool_calls: list[dict]) -> list[dict]:
+        """Translate internal OpenAI-shaped tool calls to Ollama's schema.
+
+        Loom stores tool arguments as a JSON string for OpenAI-compatible
+        providers. Ollama's native API expects ``function.arguments`` to be
+        an object, so passing the internal message through unchanged causes
+        the next request after a tool call to fail with HTTP 400.
+        """
+        normalized: list[dict] = []
+        for tool_call in tool_calls:
+            if not isinstance(tool_call, dict):
+                continue
+            function = tool_call.get("function", {})
+            if not isinstance(function, dict):
+                function = {}
+            arguments = function.get("arguments", {})
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except json.JSONDecodeError:
+                    logger.warning(
+                        "Malformed tool args in Ollama history: %s",
+                        arguments[:200],
+                    )
+                    arguments = {}
+            if not isinstance(arguments, dict):
+                arguments = {}
+
+            normalized_call = dict(tool_call)
+            normalized_function = dict(function)
+            normalized_function["arguments"] = arguments
+            normalized_call["function"] = normalized_function
+            normalized.append(normalized_call)
+        return normalized
 
     @staticmethod
     def _attachment_path_text(message: dict) -> str:
