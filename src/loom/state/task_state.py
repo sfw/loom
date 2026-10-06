@@ -35,6 +35,7 @@ class SubtaskStatus(StrEnum):
     PENDING = "pending"
     RUNNING = "running"
     COMPLETED = "completed"
+    PARTIAL = "partial"
     FAILED = "failed"
     BLOCKED = "blocked"
     SKIPPED = "skipped"
@@ -145,9 +146,18 @@ class Task:
 
     @property
     def progress(self) -> tuple[int, int]:
-        """Return (completed, total) subtask counts."""
+        """Return (usable, total) subtask counts.
+
+        Partial subtasks produced usable checkpointed work and are therefore
+        progress for dependency and run-completion purposes, while remaining
+        visibly distinct from fully verified work.
+        """
         total = len(self.plan.subtasks)
-        completed = sum(1 for s in self.plan.subtasks if s.status == SubtaskStatus.COMPLETED)
+        completed = sum(
+            1
+            for s in self.plan.subtasks
+            if s.status in {SubtaskStatus.COMPLETED, SubtaskStatus.PARTIAL}
+        )
         return completed, total
 
 

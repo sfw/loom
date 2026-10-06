@@ -32,6 +32,14 @@ validity_contract:
     synthesis_min_verification_tier: 2
     critical_claim_support_ratio: 1.0
 
+quality_contract:
+  enabled: true
+  applies_to_phases: [build-presentation]
+  dimensions: [completeness, evidence_traceability, specificity, analytical_depth, cross_artifact_synthesis, actionability, uncertainty_handling, internal_consistency]
+  minimum_overall_score: 0.80
+  minimum_dimension_score: 0.68
+  minimum_requirement_coverage: 0.90
+
 tool_guidance: |
   Keep outputs slide-ready: action title, supporting evidence, and "so what."
   Use CSV for exhibits and Markdown for concise notes. Explicitly label
@@ -41,7 +49,7 @@ tools:
   guidance: >
     Use web_search/web_fetch for external benchmarks, spreadsheet for impact
     models, and document_write for executive outputs.
-  required: [web_search, web_fetch, spreadsheet, read_file, write_file, document_write, search_files]
+  required: [web_search, web_fetch, spreadsheet, read_file, read_artifact, write_file, document_write, search_files]
   excluded: [delete_file, shell_execute, git_command]
 
 phases:
@@ -204,6 +212,7 @@ verification:
         - remediation_required
         - remediation_mode
         - missing_targets
+        - quality
     outcome_policy:
       pass_states: [pass, pass_with_warnings, partial_verified]
       fail_states: [fail]

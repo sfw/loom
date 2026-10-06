@@ -202,3 +202,45 @@ class TestRunProcessCaseDeterministic:
             "Forbidden verification pattern matched" in detail
             for detail in result.details
         )
+
+    @pytest.mark.asyncio
+    @pytest.mark.process_integration
+    async def test_artifact_quality_assertions_reject_thin_present_output(self, tmp_path):
+        process = ProcessDefinition(
+            name="quality-demo",
+            phase_mode="strict",
+            phases=[
+                PhaseTemplate(
+                    id="phase-a",
+                    description="Phase A",
+                    depends_on=[],
+                    deliverables=["out.md — markdown output", "metrics.csv — metrics"],
+                ),
+            ],
+        )
+        case = ProcessTestCase(
+            id="quality",
+            mode="deterministic",
+            goal="Reject thin output",
+            acceptance=ProcessTestAcceptance(
+                phases_must_include=["phase-a"],
+                deliverables_must_exist=["out.md", "metrics.csv"],
+                allowed_completion_grades=["verified"],
+                artifact_minimum_characters={"out.md": 500},
+                artifact_required_patterns={
+                    "out.md": [r"(?im)^# Executive Summary$"],
+                },
+                csv_minimum_rows={"metrics.csv": 4},
+            ),
+        )
+
+        result = await run_process_case_deterministic(
+            process,
+            case,
+            workspace=tmp_path / "workspace",
+        )
+
+        assert not result.passed
+        assert any("minimum is 500" in detail for detail in result.details)
+        assert any("missing required pattern" in detail for detail in result.details)
+        assert any("minimum is 4" in detail for detail in result.details)

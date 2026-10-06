@@ -98,7 +98,7 @@ describe("RunsTab", () => {
   });
 
   it("wraps long run goals in the selected run header instead of truncating them", () => {
-    const goal = "We are a film and TV production house that will be attending Banff World Media Festival in 2026 and need the entire prompt visible in the run header";
+    const goal = "We are preparing a detailed synthetic research brief and need the entire prompt visible in the run header";
     mockApp.selectedRunId = "run-abc";
     mockApp.runDetail = {
       id: "run-abc",
@@ -155,6 +155,77 @@ describe("RunsTab", () => {
     expect(screen.getByText(/0% had it/i)).toBeInTheDocument();
     expect(screen.getByText("hard_invariant_failed")).toBeInTheDocument();
     expect(screen.getByText(/did not queue follow-up remediation/i)).toBeInTheDocument();
+  });
+
+  it("shows recoverable partial work as completed with gaps", () => {
+    mockApp.selectedRunId = "run-partial";
+    mockApp.runDetail = {
+      id: "run-partial",
+      goal: "Build a synthetic market brief",
+      status: "completed",
+      process_name: "market-research",
+      plan_subtasks: [
+        {
+          id: "collect-evidence",
+          description: "Collect public evidence",
+          status: "partial",
+          summary: "One source remained unavailable; alternate evidence was preserved.",
+          depends_on: [],
+          phase_id: "",
+          is_critical_path: true,
+          is_synthesis: false,
+        },
+        {
+          id: "synthesize",
+          description: "Synthesize the brief",
+          status: "completed",
+          summary: "Completed with caveats.",
+          depends_on: ["collect-evidence"],
+          phase_id: "",
+          is_critical_path: true,
+          is_synthesis: true,
+        },
+      ],
+    };
+
+    render(<RunsTab />);
+
+    expect(screen.getByText("Completed with recoverable gaps")).toBeInTheDocument();
+    expect(screen.getByText("completed with gaps")).toBeInTheDocument();
+    expect(screen.queryByText("Why This Failed")).not.toBeInTheDocument();
+  });
+
+  it("shows the output quality scorecard and repair targets", () => {
+    mockApp.selectedRunId = "run-quality";
+    mockApp.runDetail = {
+      id: "run-quality",
+      goal: "Build a synthetic research brief",
+      status: "completed",
+      process_name: "research-report",
+      completion_grade: "degraded",
+      plan_subtasks: [],
+      quality_scorecard: {
+        synthesis: {
+          overall: 0.74,
+          requirement_coverage: 0.81,
+          dimensions: {
+            completeness: 0.68,
+            analytical_depth: 0.77,
+          },
+          meets_floor: false,
+          reason_code: "quality_below_threshold",
+          missing_targets: ["implementation roadmap", "source traceability"],
+        },
+      },
+    };
+
+    render(<RunsTab />);
+
+    expect(screen.getByText("Output quality scorecard")).toBeInTheDocument();
+    expect(screen.getByText("quality floor missed")).toBeInTheDocument();
+    expect(screen.getByText("74% overall")).toBeInTheDocument();
+    expect(screen.getByText("81% requirements")).toBeInTheDocument();
+    expect(screen.getByText(/implementation roadmap, source traceability/i)).toBeInTheDocument();
   });
 
   it("does not mount tool-call payloads until the row is expanded", async () => {

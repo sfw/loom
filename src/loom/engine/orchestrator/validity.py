@@ -1421,9 +1421,13 @@ def _enforce_synthesis_claim_gate(
         claim_extraction.get("enabled", False),
         False,
     )
+    require_fact_checker = self._to_bool(
+        contract.get("require_fact_checker_for_synthesis", False),
+        False,
+    )
     claim_extraction_expected = (
         self._to_bool(metadata.get("claim_extraction_expected", False), False)
-        or self._to_bool(contract.get("require_fact_checker_for_synthesis", False), False)
+        or require_fact_checker
         or (claim_extraction_enabled and verification_profile == "research")
         or verification_profile == "research"
     )
@@ -1436,6 +1440,7 @@ def _enforce_synthesis_claim_gate(
     if not claims:
         if (
             enforce_profile_resilience
+            and not require_fact_checker
             and verification_profile in {"coding", "data_ops", "hybrid"}
             and int(assertion_counts.get("behavior_supported", 0) or 0) > 0
         ):
@@ -1472,6 +1477,8 @@ def _enforce_synthesis_claim_gate(
                 metadata=metadata,
             )
         if (
+            not require_fact_checker
+            and
             verification_profile in {"coding", "data_ops", "hybrid"}
             and int(assertion_counts.get("behavior_supported", 0) or 0) > 0
         ):
@@ -1622,6 +1629,7 @@ def _enforce_synthesis_claim_gate(
         )
         if (
             enforce_profile_resilience
+            and not require_fact_checker
             and verification_profile in {"coding", "data_ops", "hybrid"}
             and int(assertion_counts.get("behavior_supported", 0) or 0) > 0
         ):
@@ -1643,6 +1651,7 @@ def _enforce_synthesis_claim_gate(
         )
     if (
         enforce_profile_resilience
+        and not require_fact_checker
         and verification_profile in {"coding", "data_ops", "hybrid"}
         and counts["contradicted"] == 0
         and counts["stale"] == 0

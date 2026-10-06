@@ -348,7 +348,7 @@ def _generate_toml(models: list[dict]) -> str:
         "minimal_text_output_chars = 260",
         "tool_call_argument_context_chars = 700",
         "compact_tool_call_argument_chars = 1600",
-        'runner_compaction_policy_mode = "off"',
+        'runner_compaction_policy_mode = "hybrid"',
         "enable_filetype_ingest_router = true",
         "enable_artifact_telemetry_events = true",
         "artifact_telemetry_max_metadata_chars = 1200",

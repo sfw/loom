@@ -80,11 +80,7 @@ def _is_private_or_loopback_host(hostname: str) -> bool:
     except ValueError:
         return False
     return bool(
-        ip.is_private
-        or ip.is_loopback
-        or ip.is_link_local
-        or ip.is_reserved
-        or ip.is_multicast
+        ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast
     )
 
 
@@ -152,8 +148,13 @@ class ModelCapabilities:
 
         if provider == "ollama":
             vision_models = {
-                "llava", "bakllava", "gemma3", "smolvlm",
-                "llama3.2-vision", "moondream", "minicpm-v",
+                "llava",
+                "bakllava",
+                "gemma3",
+                "smolvlm",
+                "llama3.2-vision",
+                "moondream",
+                "minicpm-v",
             }
             has_vision = any(v in model_lower for v in vision_models)
             return cls(
@@ -162,10 +163,17 @@ class ModelCapabilities:
             )
 
         if provider == "openai_compatible":
-            has_vision = any(v in model_lower for v in [
-                "gpt-4o", "gpt-4-vision", "gpt-4-turbo",
-                "gemini", "pixtral", "internvl",
-            ])
+            has_vision = any(
+                v in model_lower
+                for v in [
+                    "gpt-4o",
+                    "gpt-4-vision",
+                    "gpt-4-turbo",
+                    "gemini",
+                    "pixtral",
+                    "internvl",
+                ]
+            )
             return cls(
                 vision=has_vision,
                 native_pdf="gpt-4o" in model_lower,
@@ -212,6 +220,7 @@ class WorkspaceConfig:
 @dataclass(frozen=True)
 class ExecutionConfig:
     max_subtask_retries: int = 3
+    max_correction_retries: int = 3
     max_loop_iterations: int = 50
     max_parallel_subtasks: int = 5
     auto_approve_confidence_threshold: float = 0.8
@@ -248,6 +257,8 @@ class ExecutionConfig:
     enable_durable_task_runner: bool = True
     enable_mutation_idempotency: bool = False
     sealed_artifact_post_call_guard: str = "warn"  # off | warn | enforce
+    runner_checkpoint_reserve_iterations: int = 2
+    noncatastrophic_outcome: str = "degraded"  # degraded | paused
     enable_slo_metrics: bool = False
     delegate_task_timeout_seconds: int = 14_400
     ask_user_v2_enabled: bool = True
@@ -264,6 +275,8 @@ class ExecutionConfig:
     model_call_retry_base_delay_seconds: float = 0.5
     model_call_retry_max_delay_seconds: float = 8.0
     model_call_retry_jitter_seconds: float = 0.25
+    model_call_global_max_concurrency: int = 3
+    model_call_backpressure_cooldown_seconds: float = 2.0
     cowork_tool_exposure_mode: str = "hybrid"  # full | adaptive | hybrid
     cowork_memory_index_enabled: bool = True
     cowork_memory_index_v2_actions_enabled: bool = True
@@ -307,30 +320,32 @@ class VerificationConfig:
     contradiction_scan_max_files: int = 80
     contradiction_scan_max_total_bytes: int = 2_500_000
     contradiction_scan_max_file_bytes: int = 300_000
-    contradiction_scan_allowed_suffixes: list[str] = field(default_factory=lambda: [
-        ".md",
-        ".txt",
-        ".rst",
-        ".csv",
-        ".tsv",
-        ".json",
-        ".yaml",
-        ".yml",
-        ".toml",
-        ".ini",
-        ".cfg",
-        ".conf",
-        ".xml",
-        ".html",
-        ".htm",
-        ".py",
-        ".js",
-        ".ts",
-        ".tsx",
-        ".jsx",
-        ".sql",
-        ".sh",
-    ])
+    contradiction_scan_allowed_suffixes: list[str] = field(
+        default_factory=lambda: [
+            ".md",
+            ".txt",
+            ".rst",
+            ".csv",
+            ".tsv",
+            ".json",
+            ".yaml",
+            ".yml",
+            ".toml",
+            ".ini",
+            ".cfg",
+            ".conf",
+            ".xml",
+            ".html",
+            ".htm",
+            ".py",
+            ".js",
+            ".ts",
+            ".tsx",
+            ".jsx",
+            ".sql",
+            ".sh",
+        ]
+    )
     contradiction_scan_min_files_for_sufficiency: int = 2
     remediation_queue_max_attempts: int = 3
     remediation_queue_backoff_seconds: float = 2.0
@@ -338,6 +353,7 @@ class VerificationConfig:
     resilience_policy_mode: str = "enforce"  # enforce | shadow | off
     resilience_profile_confidence_threshold: float = 0.65
     resilience_no_progress_attempts: int = 2
+    quality_policy_mode: str = "enforce"  # observe | assist | enforce
 
 
 @dataclass(frozen=True)
@@ -420,7 +436,7 @@ class RunnerLimitsConfig:
     minimal_text_output_chars: int = 260
     tool_call_argument_context_chars: int = 700
     compact_tool_call_argument_chars: int = 1600
-    runner_compaction_policy_mode: str = "off"  # "legacy" | "tiered" | "off"
+    runner_compaction_policy_mode: str = "hybrid"
     enable_filetype_ingest_router: bool = True
     enable_artifact_telemetry_events: bool = True
     artifact_telemetry_max_metadata_chars: int = 1200
@@ -789,9 +805,7 @@ def load_config(path: Path | None = None) -> Config:
     )
     if isinstance(ask_user_timeout_default_raw, list):
         ask_user_timeout_default_response = ",".join(
-            str(item).strip()
-            for item in ask_user_timeout_default_raw
-            if str(item).strip()
+            str(item).strip() for item in ask_user_timeout_default_raw if str(item).strip()
         )
     else:
         ask_user_timeout_default_response = str(
@@ -804,6 +818,21 @@ def load_config(path: Path | None = None) -> Config:
     except (TypeError, ValueError):
         model_call_max_attempts = 5
     model_call_max_attempts = max(1, min(10, model_call_max_attempts))
+
+    model_call_global_max_concurrency = _int_from(
+        exec_data,
+        "model_call_global_max_concurrency",
+        ExecutionConfig.model_call_global_max_concurrency,
+        minimum=1,
+        maximum=32,
+    )
+    model_call_backpressure_cooldown_seconds = _float_from(
+        exec_data,
+        "model_call_backpressure_cooldown_seconds",
+        ExecutionConfig.model_call_backpressure_cooldown_seconds,
+        minimum=0.0,
+        maximum=120.0,
+    )
 
     base_delay_raw = exec_data.get("model_call_retry_base_delay_seconds", 0.5)
     try:
@@ -832,6 +861,13 @@ def load_config(path: Path | None = None) -> Config:
         max_subtask_retries=exec_data.get(
             "max_subtask_retries",
             ExecutionConfig.max_subtask_retries,
+        ),
+        max_correction_retries=_int_from(
+            exec_data,
+            "max_correction_retries",
+            ExecutionConfig.max_correction_retries,
+            minimum=0,
+            maximum=20,
         ),
         max_loop_iterations=exec_data.get(
             "max_loop_iterations",
@@ -931,7 +967,9 @@ def load_config(path: Path | None = None) -> Config:
                     "executor_completion_contract_mode",
                     ExecutionConfig.executor_completion_contract_mode,
                 ),
-            ).strip().lower()
+            )
+            .strip()
+            .lower()
         ),
         planner_degraded_mode=(
             str(
@@ -939,7 +977,9 @@ def load_config(path: Path | None = None) -> Config:
                     "planner_degraded_mode",
                     ExecutionConfig.planner_degraded_mode,
                 ),
-            ).strip().lower()
+            )
+            .strip()
+            .lower()
         ),
         enable_sqlite_remediation_queue=_bool_from(
             exec_data,
@@ -961,7 +1001,24 @@ def load_config(path: Path | None = None) -> Config:
                 "sealed_artifact_post_call_guard",
                 ExecutionConfig.sealed_artifact_post_call_guard,
             ),
-        ).strip().lower(),
+        )
+        .strip()
+        .lower(),
+        runner_checkpoint_reserve_iterations=_int_from(
+            exec_data,
+            "runner_checkpoint_reserve_iterations",
+            ExecutionConfig.runner_checkpoint_reserve_iterations,
+            minimum=1,
+            maximum=20,
+        ),
+        noncatastrophic_outcome=str(
+            exec_data.get(
+                "noncatastrophic_outcome",
+                ExecutionConfig.noncatastrophic_outcome,
+            ),
+        )
+        .strip()
+        .lower(),
         enable_slo_metrics=_bool_from(
             exec_data,
             "enable_slo_metrics",
@@ -990,7 +1047,9 @@ def load_config(path: Path | None = None) -> Config:
         ),
         ask_user_policy=str(
             exec_data.get("ask_user_policy", ExecutionConfig.ask_user_policy),
-        ).strip().lower(),
+        )
+        .strip()
+        .lower(),
         ask_user_timeout_seconds=_int_from(
             exec_data,
             "ask_user_timeout_seconds",
@@ -1024,13 +1083,17 @@ def load_config(path: Path | None = None) -> Config:
         model_call_retry_base_delay_seconds=model_call_retry_base_delay_seconds,
         model_call_retry_max_delay_seconds=model_call_retry_max_delay_seconds,
         model_call_retry_jitter_seconds=model_call_retry_jitter_seconds,
+        model_call_global_max_concurrency=model_call_global_max_concurrency,
+        model_call_backpressure_cooldown_seconds=(model_call_backpressure_cooldown_seconds),
         cowork_tool_exposure_mode=(
             str(
                 exec_data.get(
                     "cowork_tool_exposure_mode",
                     ExecutionConfig.cowork_tool_exposure_mode,
                 ),
-            ).strip().lower()
+            )
+            .strip()
+            .lower()
         ),
         cowork_memory_index_enabled=_bool_from(
             exec_data,
@@ -1116,19 +1179,28 @@ def load_config(path: Path | None = None) -> Config:
                 "agent_tools_default_network_mode",
                 ExecutionConfig.agent_tools_default_network_mode,
             ),
-        ).strip().lower(),
+        )
+        .strip()
+        .lower(),
     )
     completion_mode = execution.executor_completion_contract_mode
     if completion_mode not in {"off", "warn", "enforce"}:
         completion_mode = ExecutionConfig.executor_completion_contract_mode
-    sealed_artifact_post_call_guard = str(
-        execution.sealed_artifact_post_call_guard or "",
-    ).strip().lower()
+    sealed_artifact_post_call_guard = (
+        str(
+            execution.sealed_artifact_post_call_guard or "",
+        )
+        .strip()
+        .lower()
+    )
     if sealed_artifact_post_call_guard not in {"off", "warn", "enforce"}:
         sealed_artifact_post_call_guard = ExecutionConfig.sealed_artifact_post_call_guard
     planner_mode = execution.planner_degraded_mode
     if planner_mode not in {"allow", "require_approval", "deny"}:
         planner_mode = ExecutionConfig.planner_degraded_mode
+    noncatastrophic_outcome = execution.noncatastrophic_outcome
+    if noncatastrophic_outcome not in {"degraded", "paused"}:
+        noncatastrophic_outcome = ExecutionConfig.noncatastrophic_outcome
     cowork_tool_exposure_mode = execution.cowork_tool_exposure_mode
     if cowork_tool_exposure_mode not in {"full", "adaptive", "hybrid"}:
         cowork_tool_exposure_mode = ExecutionConfig.cowork_tool_exposure_mode
@@ -1176,6 +1248,7 @@ def load_config(path: Path | None = None) -> Config:
             "executor_completion_contract_mode": completion_mode,
             "sealed_artifact_post_call_guard": sealed_artifact_post_call_guard,
             "planner_degraded_mode": planner_mode,
+            "noncatastrophic_outcome": noncatastrophic_outcome,
             "cowork_tool_exposure_mode": cowork_tool_exposure_mode,
             "cowork_memory_index_queue_max_batches": cowork_memory_index_queue_max_batches,
             "cowork_memory_index_section_limit": cowork_memory_index_section_limit,
@@ -1240,11 +1313,24 @@ def load_config(path: Path | None = None) -> Config:
         remediation_queue_backoff_seconds,
         remediation_queue_max_backoff_seconds,
     )
-    resilience_policy_mode = str(
-        verif_data.get("resilience_policy_mode", "enforce"),
-    ).strip().lower()
+    resilience_policy_mode = (
+        str(
+            verif_data.get("resilience_policy_mode", "enforce"),
+        )
+        .strip()
+        .lower()
+    )
     if resilience_policy_mode not in {"enforce", "shadow", "off"}:
         resilience_policy_mode = "enforce"
+    quality_policy_mode = (
+        str(
+            verif_data.get("quality_policy_mode", VerificationConfig.quality_policy_mode),
+        )
+        .strip()
+        .lower()
+    )
+    if quality_policy_mode not in {"observe", "assist", "enforce"}:
+        quality_policy_mode = VerificationConfig.quality_policy_mode
     resilience_profile_confidence_threshold = _float_from(
         verif_data,
         "resilience_profile_confidence_threshold",
@@ -1347,17 +1433,14 @@ def load_config(path: Path | None = None) -> Config:
         contradiction_scan_max_total_bytes=contradiction_scan_max_total_bytes,
         contradiction_scan_max_file_bytes=contradiction_scan_max_file_bytes,
         contradiction_scan_allowed_suffixes=contradiction_scan_allowed_suffixes,
-        contradiction_scan_min_files_for_sufficiency=(
-            contradiction_scan_min_files_for_sufficiency
-        ),
+        contradiction_scan_min_files_for_sufficiency=(contradiction_scan_min_files_for_sufficiency),
         remediation_queue_max_attempts=remediation_queue_max_attempts,
         remediation_queue_backoff_seconds=remediation_queue_backoff_seconds,
         remediation_queue_max_backoff_seconds=remediation_queue_max_backoff_seconds,
         resilience_policy_mode=resilience_policy_mode,
-        resilience_profile_confidence_threshold=(
-            resilience_profile_confidence_threshold
-        ),
+        resilience_profile_confidence_threshold=(resilience_profile_confidence_threshold),
         resilience_no_progress_attempts=resilience_no_progress_attempts,
+        quality_policy_mode=quality_policy_mode,
     )
 
     mem_data = raw.get("memory", {})
@@ -1386,9 +1469,7 @@ def load_config(path: Path | None = None) -> Config:
     telemetry = TelemetryConfig(
         mode=mode_resolution.mode,
         configured_mode_input=(
-            configured_mode_input
-            if "mode" in telemetry_data
-            else mode_resolution.mode
+            configured_mode_input if "mode" in telemetry_data else mode_resolution.mode
         ),
         runtime_override_enabled=_bool_from(
             telemetry_data,
@@ -1449,9 +1530,13 @@ def load_config(path: Path | None = None) -> Config:
     tui_data = raw.get("tui", {})
     if not isinstance(tui_data, dict):
         tui_data = {}
-    workspace_watch_backend = str(
-        tui_data.get("workspace_watch_backend", TUIConfig.workspace_watch_backend),
-    ).strip().lower()
+    workspace_watch_backend = (
+        str(
+            tui_data.get("workspace_watch_backend", TUIConfig.workspace_watch_backend),
+        )
+        .strip()
+        .lower()
+    )
     if workspace_watch_backend not in {"poll", "native"}:
         workspace_watch_backend = TUIConfig.workspace_watch_backend
     tui = TUIConfig(
@@ -1599,13 +1684,24 @@ def load_config(path: Path | None = None) -> Config:
     if not isinstance(compactor_limits_data, dict):
         compactor_limits_data = {}
 
-    runner_compaction_policy_mode = str(
-        runner_limits_data.get(
-            "runner_compaction_policy_mode",
-            RunnerLimitsConfig.runner_compaction_policy_mode,
-        ),
-    ).strip().lower()
-    if runner_compaction_policy_mode not in {"legacy", "tiered", "off"}:
+    runner_compaction_policy_mode = (
+        str(
+            runner_limits_data.get(
+                "runner_compaction_policy_mode",
+                RunnerLimitsConfig.runner_compaction_policy_mode,
+            ),
+        )
+        .strip()
+        .lower()
+    )
+    if runner_compaction_policy_mode not in {
+        "hybrid",
+        "deterministic",
+        "semantic",
+        "legacy",
+        "tiered",
+        "off",
+    }:
         runner_compaction_policy_mode = RunnerLimitsConfig.runner_compaction_policy_mode
     compaction_pressure_ratio_soft = _float_from(
         runner_limits_data,
@@ -2080,9 +2176,7 @@ def load_config(path: Path | None = None) -> Config:
                 raw_scopes = raw_oauth.get("scopes", [])
                 if isinstance(raw_scopes, list):
                     oauth_scopes = [
-                        str(scope).strip()
-                        for scope in raw_scopes
-                        if str(scope).strip()
+                        str(scope).strip() for scope in raw_scopes if str(scope).strip()
                     ]
 
             allow_insecure_http = bool(server_data.get("allow_insecure_http", False))
@@ -2097,9 +2191,7 @@ def load_config(path: Path | None = None) -> Config:
                         allow_private_network=allow_private_network,
                     )
                 except ConfigError as e:
-                    raise ConfigError(
-                        f"Invalid MCP server {alias!r}: {e}"
-                    ) from e
+                    raise ConfigError(f"Invalid MCP server {alias!r}: {e}") from e
 
             fallback_sse_url = str(server_data.get("fallback_sse_url", "")).strip()
             timeout_seconds = normalize_mcp_timeout_seconds(
@@ -2139,9 +2231,9 @@ def load_config(path: Path | None = None) -> Config:
         limits=limits,
         mcp=MCPConfig(
             servers=mcp_servers,
-            oauth_browser_login=bool(
-                mcp_data.get("oauth_browser_login", True)
-            ) if isinstance(mcp_data, dict) else True,
+            oauth_browser_login=bool(mcp_data.get("oauth_browser_login", True))
+            if isinstance(mcp_data, dict)
+            else True,
         ),
         source_path=str(path) if path is not None else "",
     )

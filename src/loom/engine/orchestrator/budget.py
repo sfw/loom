@@ -135,13 +135,15 @@ async def _enforce_global_budget(self, task: Task) -> bool:
         return False
     self._apply_budget_metadata(task, budget_name, observed, limit)
     for candidate in task.plan.subtasks:
-        if candidate.status == SubtaskStatus.PENDING:
-            candidate.status = SubtaskStatus.SKIPPED
+        if candidate.status == SubtaskStatus.RUNNING:
+            candidate.status = SubtaskStatus.PENDING
             candidate.summary = (
-                "Skipped: global run budget exhausted "
-                f"({budget_name})."
+                "Checkpointed: global run budget exhausted "
+                f"({budget_name}); resume to continue."
             )
-    task.status = TaskStatus.FAILED
+    task.status = TaskStatus.PAUSED
+    task.metadata["recovery_required"] = True
+    task.metadata["automatic_recovery_requested"] = False
     task.add_error(
         "budget",
         f"Global run budget exhausted: {budget_name} "

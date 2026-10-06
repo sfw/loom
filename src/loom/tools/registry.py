@@ -211,8 +211,8 @@ class ToolResult:
         return cls(success=True, output=output, **kwargs)
 
     @classmethod
-    def fail(cls, error: str) -> ToolResult:
-        return cls(success=False, output="", error=error)
+    def fail(cls, error: str, **kwargs) -> ToolResult:
+        return cls(success=False, output="", error=error, **kwargs)
 
     @classmethod
     def multimodal(
@@ -237,7 +237,27 @@ class ToolContext:
 
 
 class ToolSafetyError(Exception):
-    """Raised when a tool call violates safety constraints."""
+    """Raised when a tool call violates safety constraints.
+
+    Structured metadata lets verification distinguish a rejected, unexecuted
+    command that can be repaired automatically from an actual integrity or
+    workspace-boundary violation.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason_code: str = "safety_violation",
+        policy_rule: str = "",
+        repairability: str = "terminal",
+        executed: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.reason_code = str(reason_code or "safety_violation").strip()
+        self.policy_rule = str(policy_rule or "").strip()
+        self.repairability = str(repairability or "terminal").strip()
+        self.executed = bool(executed)
 
 
 class Tool(ABC):
@@ -1294,7 +1314,15 @@ class ToolRegistry:
                 f"Tool '{name}' timed out after {tool.timeout_seconds}s"
             )
         except ToolSafetyError as e:
-            return ToolResult.fail(f"Safety violation: {e}")
+            return ToolResult.fail(
+                f"Safety violation: {e}",
+                data={
+                    "reason_code": e.reason_code,
+                    "policy_rule": e.policy_rule,
+                    "repairability": e.repairability,
+                    "executed": e.executed,
+                },
+            )
         except Exception as e:
             return ToolResult.fail(f"Tool error: {type(e).__name__}: {e}")
 

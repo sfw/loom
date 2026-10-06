@@ -55,6 +55,13 @@ constraints: |
     with other evidence.
   - If process-specific verifier constraints or output metadata fields are provided,
     apply them exactly and return inferred values in `metadata`.
-  - If the result mentions errors or blockers, that is a failure.
-  - A partially completed subtask is a failure.
+  - Do not fail merely because the result records errors, unavailable sources,
+    or blockers. Judge whether the produced artifact remains usable and whether
+    another source or bounded repair can close the gap.
+  - Use `partial_verified` for usable checkpointed work with explicit,
+    recoverable gaps. Set `passed` consistently with the configured outcome
+    policy and include a stable remediation-oriented `reason_code`.
+  - Reserve a failing outcome for unusable output, violated safety/integrity
+    constraints, or an acceptance criterion that remains unsatisfied after
+    available deterministic checks.
   - Respond with ONLY the JSON object. No explanation outside the JSON.

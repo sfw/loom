@@ -155,7 +155,14 @@ class RunnerSettings:
         ).strip().lower()
         runner_compaction_policy_mode = (
             policy_mode
-            if policy_mode in {"legacy", "tiered", "off"}
+            if policy_mode in {
+                "hybrid",
+                "deterministic",
+                "semantic",
+                "legacy",
+                "tiered",
+                "off",
+            }
             else runner_defaults.RUNNER_COMPACTION_POLICY_MODE
         )
         preserve_recent_critical_messages = max(

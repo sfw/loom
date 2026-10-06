@@ -196,15 +196,20 @@ function eventTypeBadgeLabel(eventType: string): string {
   }
 }
 
-function subtaskStatus(events: Array<{ event_type: string; data: Record<string, unknown> }>, subtaskId: string): "pending" | "running" | "completed" | "failed" {
+type RunSubtaskStatus = "pending" | "running" | "completed" | "partial" | "failed";
+
+function subtaskStatus(events: Array<{ event_type: string; data: Record<string, unknown> }>, subtaskId: string): RunSubtaskStatus {
   const matching = events.filter(
     (e) =>
       (e.event_type.startsWith("subtask_") || e.event_type.startsWith("phase_")) &&
       (e.data.subtask_id === subtaskId || e.data.phase_id === subtaskId),
   );
-  if (matching.some((e) => e.event_type === "subtask_completed" || e.data.status === "completed")) return "completed";
-  if (matching.some((e) => e.event_type === "subtask_failed" || e.data.status === "failed")) return "failed";
-  if (matching.some((e) => e.event_type === "subtask_started" || e.data.status === "running")) return "running";
+  const latest = matching[matching.length - 1];
+  if (!latest) return "pending";
+  if (latest.data.status === "partial") return "partial";
+  if (latest.event_type === "subtask_completed" || latest.data.status === "completed") return "completed";
+  if (latest.event_type === "subtask_failed" || latest.data.status === "failed") return "failed";
+  if (latest.event_type === "subtask_started" || latest.data.status === "running") return "running";
   return "pending";
 }
 
@@ -387,7 +392,7 @@ function SubtaskStatusIcon({
   status,
   animated = true,
 }: {
-  status: "pending" | "running" | "completed" | "failed";
+  status: RunSubtaskStatus;
   animated?: boolean;
 }) {
   switch (status) {
@@ -395,6 +400,8 @@ function SubtaskStatusIcon({
       return <CheckCircle2 size={14} className="text-emerald-400" />;
     case "failed":
       return <AlertTriangle size={14} className="text-red-400" />;
+    case "partial":
+      return <AlertTriangle size={14} className="text-amber-400" />;
     case "running":
       return <Loader2 size={14} className={cn("text-sky-400", animated && "animate-spin")} />;
     default:
@@ -1467,7 +1474,8 @@ function RunDetailView({
       return apiPlan.map((s, i) => ({
         id: s.id,
         goal: s.description || s.id,
-        status: s.status as "pending" | "running" | "completed" | "failed",
+        status: s.status as RunSubtaskStatus,
+        summary: s.summary || "",
         depends_on: s.depends_on ?? [],
         phase_id: s.phase_id || "",
         is_critical_path: s.is_critical_path,
@@ -1488,9 +1496,36 @@ function RunDetailView({
     }
     return Array.from(ids.values()).sort((a, b) => a.order - b.order).map((n) => ({
       ...n,
+      summary: "",
       status: subtaskStatus(runTimeline, n.id),
     }));
   }, [runDetail, runTimeline]);
+  const recoverableGapNodes = planNodes.filter(
+    (node) => node.status === "partial" || node.status === "failed",
+  );
+  const hasRecoverableGaps = runStatus === "completed" && (
+    runDetail.completion_grade === "degraded" || recoverableGapNodes.length > 0
+  );
+  const hasVerificationWarnings = runStatus === "completed"
+    && runDetail.completion_grade === "verified_with_warnings";
+  const qualityEntries = useMemo(() => Object.entries(
+    runDetail.quality_scorecard ?? {},
+  ).map(([subtaskId, quality]) => ({
+    subtaskId,
+    overall: typeof quality.overall === "number" ? quality.overall : null,
+    requirementCoverage: typeof quality.requirement_coverage === "number"
+      ? quality.requirement_coverage
+      : null,
+    dimensions: quality.dimensions && typeof quality.dimensions === "object"
+      ? Object.entries(quality.dimensions).filter((entry): entry is [string, number] => (
+        typeof entry[1] === "number"
+      ))
+      : [],
+    meetsFloor: quality.meets_floor !== false,
+    missingTargets: Array.isArray(quality.missing_targets)
+      ? quality.missing_targets.filter((item): item is string => typeof item === "string")
+      : [],
+  })), [runDetail.quality_scorecard]);
 
   // --- Activity category filters ---
   type ActivityCategory = "tool" | "subtask" | "verify" | "model" | "task" | "other";
@@ -1621,6 +1656,16 @@ function RunDetailView({
               <span className="text-[11px] text-zinc-600 italic">ad-hoc</span>
             )}
             <StatusBadge status={runDetail.status} />
+            {hasRecoverableGaps && (
+              <span className="rounded-full border border-amber-400/20 bg-amber-500/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-amber-200">
+                completed with gaps
+              </span>
+            )}
+            {hasVerificationWarnings && (
+              <span className="rounded-full border border-amber-400/20 bg-amber-500/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-amber-200">
+                verified with warnings
+              </span>
+            )}
           </div>
         </div>
 
@@ -1699,6 +1744,122 @@ function RunDetailView({
 
       {/* --- Scrollable body --- */}
       <div className="flex-1 overflow-y-auto px-6 py-5 space-y-8">
+        {hasRecoverableGaps && (
+          <section className="rounded-2xl border border-amber-500/20 bg-amber-500/[0.06] p-4">
+            <div className="flex items-start gap-3">
+              <div className="mt-0.5 rounded-xl bg-amber-500/10 p-2 text-amber-300">
+                <AlertTriangle size={16} />
+              </div>
+              <div className="min-w-0 flex-1">
+                <h3 className="text-sm font-semibold text-amber-100">
+                  Completed with recoverable gaps
+                </h3>
+                <p className="mt-2 text-xs leading-5 text-zinc-300">
+                  Loom preserved usable checkpointed work and continued the run.
+                  {recoverableGapNodes.length > 0
+                    ? " Review these stages before relying on unsupported details:"
+                    : " Review the run activity before relying on unsupported details."}
+                </p>
+                {recoverableGapNodes.length > 0 && (
+                  <ul className="mt-2 space-y-1.5 text-xs leading-5 text-zinc-300">
+                    {recoverableGapNodes.map((node) => (
+                      <li key={node.id} className="flex items-start gap-2">
+                        <span className="mt-[7px] h-1 w-1 rounded-full bg-amber-400" />
+                        <span>
+                          <span className="font-medium text-zinc-200">{node.id}</span>
+                          {node.summary ? ` — ${node.summary}` : ""}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            </div>
+          </section>
+        )}
+        {hasVerificationWarnings && (
+          <section className="rounded-2xl border border-amber-500/20 bg-amber-500/[0.06] p-4">
+            <div className="flex items-start gap-3">
+              <div className="mt-0.5 rounded-xl bg-amber-500/10 p-2 text-amber-300">
+                <AlertTriangle size={16} />
+              </div>
+              <div>
+                <h3 className="text-sm font-semibold text-amber-100">
+                  Verified with warnings
+                </h3>
+                <p className="mt-2 text-xs leading-5 text-zinc-300">
+                  Deliverables passed verification, but the run retained partial
+                  evidence, verifier warnings, or an explicitly recovered executor
+                  failure. Review the validity scorecard before relying on material claims.
+                </p>
+              </div>
+            </div>
+          </section>
+        )}
+        {qualityEntries.length > 0 && (
+          <section className="rounded-2xl border border-zinc-700/70 bg-zinc-900/60 p-4">
+            <div className="flex items-start gap-3">
+              <div className="mt-0.5 rounded-xl bg-sky-500/10 p-2 text-sky-300">
+                <Shield size={16} />
+              </div>
+              <div className="min-w-0 flex-1">
+                <h3 className="text-sm font-semibold text-zinc-100">
+                  Output quality scorecard
+                </h3>
+                <p className="mt-1 text-xs leading-5 text-zinc-400">
+                  Completeness and decision-usefulness checks across audited artifacts.
+                </p>
+                <div className="mt-3 space-y-3">
+                  {qualityEntries.map((entry) => (
+                    <div
+                      key={entry.subtaskId}
+                      className="rounded-xl border border-zinc-800 bg-black/20 px-3 py-2.5"
+                    >
+                      <div className="flex flex-wrap items-center gap-2 text-xs">
+                        <span className="font-medium text-zinc-200">{entry.subtaskId}</span>
+                        <span className={cn(
+                          "rounded-full px-2 py-0.5 font-medium",
+                          entry.meetsFloor
+                            ? "bg-emerald-500/10 text-emerald-300"
+                            : "bg-amber-500/10 text-amber-300",
+                        )}>
+                          {entry.meetsFloor ? "quality floor met" : "quality floor missed"}
+                        </span>
+                        {entry.overall !== null && (
+                          <span className="text-zinc-400">
+                            {Math.round(entry.overall * 100)}% overall
+                          </span>
+                        )}
+                        {entry.requirementCoverage !== null && (
+                          <span className="text-zinc-400">
+                            {Math.round(entry.requirementCoverage * 100)}% requirements
+                          </span>
+                        )}
+                      </div>
+                      {entry.dimensions.length > 0 && (
+                        <div className="mt-2 flex flex-wrap gap-1.5">
+                          {entry.dimensions.map(([name, score]) => (
+                            <span
+                              key={name}
+                              className="rounded-md bg-zinc-800 px-1.5 py-0.5 text-[10px] text-zinc-400"
+                            >
+                              {name.replace(/_/g, " ")} {Math.round(score * 100)}%
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                      {entry.missingTargets.length > 0 && (
+                        <p className="mt-2 text-xs leading-5 text-amber-200/80">
+                          Needs work: {entry.missingTargets.join(", ")}
+                        </p>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </section>
+        )}
         {runStatus === "failed" && failureAnalysis && (
           <section className="rounded-2xl border border-red-500/20 bg-red-500/[0.06] p-4">
             <div className="flex items-start gap-3">
@@ -1787,6 +1948,8 @@ function RunDetailView({
                 const statusColor =
                   status === "completed"
                     ? "border-emerald-500/40 bg-emerald-500/5"
+                    : status === "partial"
+                      ? "border-amber-500/40 bg-amber-500/5"
                     : status === "failed"
                       ? "border-red-500/40 bg-red-500/5"
                       : status === "running"
@@ -1795,6 +1958,8 @@ function RunDetailView({
                 const lineColor =
                   status === "completed"
                     ? "bg-emerald-500/40"
+                    : status === "partial"
+                      ? "bg-amber-500/40"
                     : status === "failed"
                       ? "bg-red-500/30"
                       : "bg-zinc-700/50";
@@ -1809,7 +1974,7 @@ function RunDetailView({
                       {/* Node dot */}
                       <div className="shrink-0 my-1">
                         <SubtaskStatusIcon
-                          status={status as "pending" | "running" | "completed" | "failed"}
+                          status={status as RunSubtaskStatus}
                           animated={liveAnimationsEnabled}
                         />
                       </div>

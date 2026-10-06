@@ -1076,6 +1076,31 @@ class TestShellSafety:
         )
         assert not result.success
         assert "Safety violation" in result.error
+        assert result.data == {
+            "reason_code": "dangerous_command_blocked",
+            "policy_rule": r"\brm\b.*\s+-[a-zA-Z]*r[a-zA-Z]*\s+/(?:\s|$)",
+            "repairability": "terminal",
+            "executed": False,
+        }
+
+    async def test_inline_python_rejection_is_structured_as_recoverable(
+        self,
+        ctx: ToolContext,
+    ):
+        registry = create_default_registry()
+        result = await registry.execute(
+            "shell_execute",
+            {"command": 'python3 -c "print(1)"'},
+            workspace=ctx.workspace,
+        )
+
+        assert not result.success
+        assert result.data == {
+            "reason_code": "command_policy_rejected",
+            "policy_rule": r"\bpython[23]?\s+-c\s",
+            "repairability": "automatic",
+            "executed": False,
+        }
 
     async def test_high_risk_wp_command_requires_confirmation(self, ctx: ToolContext):
         registry = create_default_registry()

@@ -38,8 +38,8 @@ from .types import (
 
 logger = logging.getLogger(__name__)
 
-_COMPACTOR_EVENT_CONTEXT: contextvars.ContextVar[tuple[str, str] | None] = (
-    contextvars.ContextVar("verification_compactor_event_context", default=None)
+_COMPACTOR_EVENT_CONTEXT: contextvars.ContextVar[tuple[str, str] | None] = contextvars.ContextVar(
+    "verification_compactor_event_context", default=None
 )
 _HTTP_STATUS_PATTERN = re.compile(
     r"\b(?:http|status(?:\s*code)?)\s*[:=]?\s*([1-5]\d{2})\b",
@@ -276,24 +276,28 @@ class LLMVerifier:
     _MAX_ARTIFACT_FILE_EXCERPT_CHARS = 420
     _ADVISORY_TOOL_FAILURES = frozenset({"web_fetch", "web_fetch_html", "web_search"})
     _SOURCE_ATTRIBUTION_TOOLS = frozenset({"web_fetch", "web_fetch_html"})
-    _TOOL_OUTPUT_EVIDENCE_TOOLS = frozenset({
-        "read_file",
-        "spreadsheet",
-        "document_write",
-        "write_file",
-    })
-    _ARTIFACT_PREVIEW_SUFFIXES = frozenset({
-        ".md",
-        ".txt",
-        ".csv",
-        ".json",
-        ".yaml",
-        ".yml",
-        ".xml",
-        ".html",
-        ".htm",
-        ".rst",
-    })
+    _TOOL_OUTPUT_EVIDENCE_TOOLS = frozenset(
+        {
+            "read_file",
+            "spreadsheet",
+            "document_write",
+            "write_file",
+        }
+    )
+    _ARTIFACT_PREVIEW_SUFFIXES = frozenset(
+        {
+            ".md",
+            ".txt",
+            ".csv",
+            ".json",
+            ".yaml",
+            ".yml",
+            ".xml",
+            ".html",
+            ".htm",
+            ".rst",
+        }
+    )
 
     @staticmethod
     def _hard_cap_text(text: str, max_chars: int) -> str:
@@ -340,43 +344,38 @@ class LLMVerifier:
         max_chars: int = 80,
     ) -> object:
         if isinstance(value, str):
-            return await self._compact_text(
-                value,
-                max_chars=max_chars,
-                label="tool argument value",
-            )
+            return self._hard_cap_text(value, max_chars)
         if isinstance(value, (int, float, bool)) or value is None:
             return value
         if isinstance(value, dict):
-            return await self._compact_text(
-                json.dumps(value, ensure_ascii=False, default=str),
-                max_chars=max_chars,
-                label="tool argument object",
+            return self._hard_cap_text(
+                json.dumps(value, ensure_ascii=False, default=str), max_chars
             )
         if isinstance(value, list):
-            return await self._compact_text(
-                json.dumps(value, ensure_ascii=False, default=str),
-                max_chars=max_chars,
-                label="tool argument list",
+            return self._hard_cap_text(
+                json.dumps(value, ensure_ascii=False, default=str), max_chars
             )
-        return await self._compact_text(
-            str(value),
-            max_chars=max_chars,
-            label="tool argument scalar",
-        )
+        return self._hard_cap_text(str(value), max_chars)
 
     async def _summarize_tool_args(self, args: object, *, max_chars: int) -> str:
         if not isinstance(args, dict):
-            return await self._compact_text(
-                json.dumps(args, default=str),
-                max_chars=max_chars,
-                label="tool call args",
-            )
+            return self._hard_cap_text(json.dumps(args, default=str), max_chars)
 
         preferred = (
-            "path", "file_path", "url", "query", "pattern", "command",
-            "operation", "source", "destination", "name", "column_name",
-            "row_index", "action", "subtask_id",
+            "path",
+            "file_path",
+            "url",
+            "query",
+            "pattern",
+            "command",
+            "operation",
+            "source",
+            "destination",
+            "name",
+            "column_name",
+            "row_index",
+            "action",
+            "subtask_id",
         )
         summary: dict[str, object] = {}
         for key in preferred:
@@ -389,11 +388,7 @@ class LLMVerifier:
         text = json.dumps(summary, ensure_ascii=False, sort_keys=True)
         if len(text) <= max_chars:
             return text
-        return await self._compact_text(
-            text,
-            max_chars=max_chars,
-            label="tool call args summary",
-        )
+        return self._hard_cap_text(text, max_chars)
 
     async def _format_tool_calls_compact(self, tool_calls: list) -> str:
         if not tool_calls:
@@ -421,10 +416,8 @@ class LLMVerifier:
                 status = "OK"
             else:
                 error_text = str(getattr(result, "error", "") or "unknown error")
-                compact_error = await self._compact_text(
-                    error_text,
-                    max_chars=self._max_tool_status_chars,
-                    label="tool status detail",
+                compact_error = self._hard_cap_text(
+                    error_text, self._max_tool_status_chars
                 )
                 if self._is_advisory_tool_failure(
                     str(getattr(tc, "tool", "") or ""),
@@ -512,10 +505,8 @@ class LLMVerifier:
                 output = str(getattr(result, "output", "") or "").strip()
             if not output:
                 return ""
-            compacted = await self._compact_text(
-                output,
-                max_chars=self._max_tool_output_excerpt_chars,
-                label="verification tool output excerpt (document_write)",
+            compacted = self._hard_cap_text(
+                output, self._max_tool_output_excerpt_chars
             )
             return compacted.strip()
 
@@ -525,39 +516,103 @@ class LLMVerifier:
             if not raw_content:
                 return ""
             prefix = f"Path: {path}\n\n" if path else ""
-            compacted = await self._compact_text(
-                f"{prefix}{raw_content}",
-                max_chars=self._max_tool_output_excerpt_chars,
-                label="verification tool output excerpt (write_file)",
+            compacted = self._hard_cap_text(
+                f"{prefix}{raw_content}", self._max_tool_output_excerpt_chars
             )
             return compacted.strip()
 
         output = str(getattr(result, "output", "") or "").strip()
         if not output:
             return ""
-        compacted = await self._compact_text(
-            output,
-            max_chars=self._max_tool_output_excerpt_chars,
-            label=f"verification tool output excerpt ({tool_name})",
-        )
+        compacted = self._hard_cap_text(output, self._max_tool_output_excerpt_chars)
         return compacted.strip()
+
+    @staticmethod
+    def _claim_extraction_enabled(subtask: Subtask) -> bool:
+        contract = getattr(subtask, "validity_contract_snapshot", {})
+        if not isinstance(contract, dict) or not bool(contract.get("enabled", False)):
+            return False
+        extraction = contract.get("claim_extraction", {})
+        return isinstance(extraction, dict) and bool(extraction.get("enabled", False))
+
+    def _augment_verifier_prompt(
+        self,
+        prompt: str,
+        *,
+        subtask: Subtask,
+        quality_contract: dict[str, object],
+    ) -> str:
+        """Inject inferred contracts that a process-owned assembler cannot know."""
+        additions: list[str] = []
+        if bool(quality_contract.get("enabled", False)) and bool(
+            quality_contract.get("inferred", False)
+        ):
+            dimensions = [
+                str(item).strip()
+                for item in quality_contract.get("dimensions", [])
+                if str(item).strip()
+            ]
+            additions.append(
+                "INFERRED QUALITY AUDIT CONTRACT: Return metadata.quality with "
+                "numeric 0..1 fields `overall` and `requirement_coverage`, a "
+                "`dimensions` object containing every named dimension, and a "
+                "`missing_targets` array of concrete repair targets. Required "
+                f"dimensions: {', '.join(dimensions)}. Assess the actual artifacts; "
+                "do not omit this object even when the verification passes."
+            )
+        if self._claim_extraction_enabled(subtask):
+            additions.append(
+                "CLAIM LIFECYCLE CONTRACT: Return metadata.claim_lifecycle as an "
+                "array for material factual claims. Each item must contain "
+                "claim_id, text, claim_type, criticality, status, evidence_refs, "
+                "reason_code, and lifecycle. Mark a claim supported only when an "
+                "explicit evidence reference supports it; otherwise use "
+                "insufficient_evidence or contradicted. Do not invent references."
+            )
+        if not additions:
+            return prompt
+        return f"{prompt}\n\n" + "\n\n".join(additions)
 
     async def _build_artifact_content_section(
         self,
         *,
+        subtask: Subtask,
         workspace: Path | None,
         tool_calls: list | None,
         max_chars: int,
+        quality_contract: dict[str, object] | None = None,
     ) -> str:
         """Build bounded excerpts from changed artifacts for semantic review."""
-        if workspace is None or not tool_calls:
+        if workspace is None:
             return ""
 
         workspace_resolved = workspace.resolve()
         changed_files: list[tuple[str, Path]] = []
         seen: set[str] = set()
 
-        for tc in tool_calls:
+        quality_enabled = bool(
+            isinstance(quality_contract, dict) and quality_contract.get("enabled", False)
+        )
+        process = getattr(self._prompts, "process", None)
+        if quality_enabled and process is not None:
+            for raw_path, _artifact_role in self._quality_artifact_paths(subtask):
+                rel = str(raw_path or "").strip()
+                if not rel or rel in seen:
+                    continue
+                candidate = (workspace / rel).resolve()
+                try:
+                    candidate.relative_to(workspace_resolved)
+                except ValueError:
+                    continue
+                if not candidate.exists() or not candidate.is_file():
+                    continue
+                suffix = candidate.suffix.lower()
+                if suffix and suffix not in self._ARTIFACT_PREVIEW_SUFFIXES:
+                    continue
+                seen.add(rel)
+                changed_files.append((rel, candidate))
+
+        for tc in tool_calls or []:
             result = getattr(tc, "result", None)
             if result is None or not getattr(result, "success", False):
                 continue
@@ -584,26 +639,619 @@ class LLMVerifier:
 
         lines = [
             "ARTIFACT CONTENT SNAPSHOT (for semantic review):",
-            "- Excerpts from files changed in this subtask. Use these to judge output quality.",
+            (
+                "- Complete expected phase artifacts are included when the quality "
+                "contract is enabled; otherwise this contains changed-file excerpts."
+            ),
         ]
-        for rel, path in changed_files[:6]:
+        selected_files = changed_files if quality_enabled else changed_files[:6]
+        for rel, path in selected_files:
             try:
                 content = path.read_text(encoding="utf-8", errors="replace").strip()
             except Exception:
                 continue
             if not content:
                 continue
-            excerpt = await self._compact_text(
-                content,
-                max_chars=self._max_artifact_file_excerpt_chars,
-                label=f"verification artifact excerpt ({path.name})",
-            )
             lines.append(f"- {rel}:")
-            lines.append(self._indent_text_block(excerpt, prefix="    "))
+            lines.append(self._indent_text_block(content, prefix="    "))
 
         if len(lines) <= 2:
             return ""
-        return self._hard_cap_text("\n".join(lines), max_chars=max_chars)
+        snapshot = "\n".join(lines)
+        if len(snapshot) <= max_chars:
+            return snapshot
+        return await self._compact_text(
+            snapshot,
+            max_chars=max_chars,
+            label="verification artifact snapshot batch",
+        )
+
+    def _quality_contract_for_subtask(self, subtask: Subtask) -> dict[str, object]:
+        process = getattr(self._prompts, "process", None)
+        resolver = getattr(process, "resolve_quality_contract_for_phase", None)
+        if not callable(resolver):
+            if not bool(getattr(subtask, "is_synthesis", False)):
+                return {}
+            return {
+                "enabled": True,
+                "dimensions": [
+                    "completeness",
+                    "evidence_traceability",
+                    "analytical_depth",
+                    "cross_artifact_synthesis",
+                    "uncertainty_handling",
+                    "internal_consistency",
+                ],
+                "minimum_overall_score": 0.72,
+                "minimum_dimension_score": 0.60,
+                "minimum_requirement_coverage": 0.80,
+                "required_sections": [],
+                "inferred": True,
+            }
+        phase_id = str(getattr(subtask, "phase_id", "") or "").strip() or subtask.id
+        resolved = resolver(phase_id)
+        return dict(resolved) if isinstance(resolved, dict) else {}
+
+    def _quality_artifact_paths(self, subtask: Subtask) -> list[tuple[str, str]]:
+        """Return current and transitive upstream artifacts for a quality audit."""
+        process = getattr(self._prompts, "process", None)
+        if process is None:
+            return []
+        deliverables = process.get_deliverables()
+        phase_id = str(getattr(subtask, "phase_id", "") or "").strip() or subtask.id
+        phase_by_id = {
+            str(phase.id or "").strip(): phase
+            for phase in process.phases
+            if str(phase.id or "").strip()
+        }
+        paths: list[tuple[str, str]] = []
+        seen_paths: set[str] = set()
+
+        def add_phase(artifact_phase_id: str, role: str) -> None:
+            for raw_path in deliverables.get(artifact_phase_id, []):
+                path = str(raw_path or "").strip()
+                if path and path not in seen_paths:
+                    seen_paths.add(path)
+                    paths.append((path, role))
+
+        add_phase(phase_id, "current")
+        phase = phase_by_id.get(phase_id)
+        pending = [
+            str(item or "").strip()
+            for item in (
+                list(phase.depends_on or [])
+                if phase is not None
+                else list(getattr(subtask, "depends_on", []) or [])
+            )
+            if str(item or "").strip()
+        ]
+        visited: set[str] = set()
+        while pending:
+            dependency_id = pending.pop(0)
+            if dependency_id in visited:
+                continue
+            visited.add(dependency_id)
+            add_phase(dependency_id, "upstream")
+            dependency = phase_by_id.get(dependency_id)
+            if dependency is not None:
+                pending.extend(
+                    str(item or "").strip()
+                    for item in list(dependency.depends_on or [])
+                    if str(item or "").strip()
+                )
+        return paths
+
+    @staticmethod
+    def _quality_score(value: object) -> float | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            score = float(value)
+        except (TypeError, ValueError):
+            return None
+        if score > 1.0 and score <= 100.0:
+            score /= 100.0
+        return max(0.0, min(1.0, score))
+
+    @staticmethod
+    def _normalize_quality_label(value: object) -> str:
+        return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+
+    @classmethod
+    def _quality_dimension_key(cls, value: object) -> str:
+        return cls._normalize_quality_label(value).replace(" ", "_")
+
+    @classmethod
+    def _quality_heading_matches(cls, requirement: object, heading: object) -> bool:
+        required = cls._normalize_quality_label(requirement)
+        candidate = cls._normalize_quality_label(heading)
+        if not required or not candidate:
+            return False
+        if required in candidate or candidate in required:
+            return True
+
+        def meaningful_tokens(value: str) -> set[str]:
+            stopwords = {"a", "an", "and", "for", "of", "the", "to", "with"}
+            return {
+                token[:-1] if len(token) > 4 and token.endswith("s") else token
+                for token in value.split()
+                if token not in stopwords
+            }
+
+        required_tokens = meaningful_tokens(required)
+        candidate_tokens = meaningful_tokens(candidate)
+        if len(required_tokens) < 2:
+            return required_tokens == candidate_tokens
+        return (len(required_tokens.intersection(candidate_tokens)) / len(required_tokens)) >= 0.75
+
+    @staticmethod
+    def _normalize_source_url(value: object) -> str:
+        """Normalize public source URLs for deterministic traceability matching."""
+        raw = str(value or "").strip().rstrip(".,;:!?)]}>'\"")
+        try:
+            parsed = urlparse(raw)
+        except ValueError:
+            return ""
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+            return ""
+        scheme = parsed.scheme.lower()
+        try:
+            hostname = (parsed.hostname or "").lower()
+            parsed_port = parsed.port
+        except ValueError:
+            return ""
+        if not hostname:
+            return ""
+        port = f":{parsed_port}" if parsed_port else ""
+        path = parsed.path or "/"
+        if path != "/":
+            path = path.rstrip("/") or "/"
+        return parsed._replace(
+            scheme=scheme,
+            netloc=f"{hostname}{port}",
+            path=path,
+            fragment="",
+        ).geturl()
+
+    def _artifact_quality_diagnostics(
+        self,
+        *,
+        subtask: Subtask,
+        workspace: Path | None,
+        quality_contract: dict[str, object],
+    ) -> dict[str, object]:
+        if workspace is None or not bool(quality_contract.get("enabled", False)):
+            return {}
+        process = getattr(self._prompts, "process", None)
+        if process is None:
+            return {}
+        audit_paths = self._quality_artifact_paths(subtask)
+        expected = [path for path, role in audit_paths if role == "current"]
+        artifacts: list[dict[str, object]] = []
+        current_evidence_refs: set[str] = set()
+        upstream_evidence_refs: set[str] = set()
+        current_source_urls: set[str] = set()
+        upstream_source_urls: set[str] = set()
+        headings: list[str] = []
+        url_count = 0
+        workspace_resolved = workspace.resolve()
+        for rel, artifact_role in audit_paths:
+            path = (workspace / rel).resolve()
+            try:
+                path.relative_to(workspace_resolved)
+            except ValueError:
+                artifacts.append(
+                    {
+                        "path": rel,
+                        "role": artifact_role,
+                        "exists": False,
+                        "unsafe_path": True,
+                    }
+                )
+                continue
+            row: dict[str, object] = {
+                "path": rel,
+                "role": artifact_role,
+                "exists": path.is_file(),
+            }
+            if not path.is_file():
+                artifacts.append(row)
+                continue
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                artifacts.append(row)
+                continue
+            row["chars"] = len(text)
+            row["nonempty"] = bool(text.strip())
+            discovered_urls = {
+                normalized
+                for match in re.findall(r"https?://[^\s<>\]]+", text)
+                if (normalized := self._normalize_source_url(match))
+            }
+            url_count += len(discovered_urls)
+            if path.name.lower() not in {"source-index.csv", "references.csv"}:
+                refs = {
+                    match.strip().upper()
+                    for match in re.findall(
+                        (
+                            r"\b(?:EV|EVID|SRC|WEB)(?:[-_][A-Za-z0-9]"
+                            r"[A-Za-z0-9_-]*|[0-9][A-Za-z0-9_-]*)\b"
+                        ),
+                        text,
+                        flags=re.IGNORECASE,
+                    )
+                    if match.strip()
+                }
+                if artifact_role == "current":
+                    current_evidence_refs.update(refs)
+                    current_source_urls.update(discovered_urls)
+                else:
+                    upstream_evidence_refs.update(refs)
+                    upstream_source_urls.update(discovered_urls)
+            if path.suffix.lower() in {".md", ".markdown"}:
+                artifact_headings = re.findall(r"^#{1,6}\s+(.+?)\s*$", text, re.MULTILINE)
+                headings.extend(artifact_headings)
+                row.update(
+                    {
+                        "kind": "markdown",
+                        "word_count": len(re.findall(r"\b\w+\b", text)),
+                        "heading_count": len(artifact_headings),
+                    }
+                )
+            elif path.suffix.lower() in {".csv", ".tsv"}:
+                delimiter = "\t" if path.suffix.lower() == ".tsv" else ","
+                try:
+                    parsed = list(csv.reader(text.splitlines(), delimiter=delimiter))
+                except csv.Error:
+                    parsed = []
+                header = parsed[0] if parsed else []
+                body = parsed[1:] if len(parsed) > 1 else []
+                cells = [str(cell).strip() for record in body for cell in record]
+                row.update(
+                    {
+                        "kind": "table",
+                        "row_count": len(body),
+                        "column_count": len(header),
+                        "empty_cell_ratio": (
+                            round(sum(not cell for cell in cells) / len(cells), 4) if cells else 0.0
+                        ),
+                    }
+                )
+            artifacts.append(row)
+
+        source_index_ids: set[str] = set()
+        source_index_urls: set[str] = set()
+        source_index_id_to_url: dict[str, str] = {}
+        duplicate_source_index_ids: set[str] = set()
+        source_index_missing_url_count = 0
+        source_index = workspace / "source-index.csv"
+        if source_index.is_file():
+            try:
+                with source_index.open(newline="", encoding="utf-8-sig") as handle:
+                    for row in csv.DictReader(handle):
+                        value = str(row.get("evidence_id", "") or "").strip()
+                        if value:
+                            normalized_value = value.upper()
+                            if normalized_value in source_index_ids:
+                                duplicate_source_index_ids.add(normalized_value)
+                            source_index_ids.add(normalized_value)
+                        source_url = next(
+                            (
+                                str(row.get(key, "") or "").strip()
+                                for key in ("source_url", "url", "source", "citation")
+                                if str(row.get(key, "") or "").strip()
+                            ),
+                            "",
+                        )
+                        if value and not source_url:
+                            source_index_missing_url_count += 1
+                        normalized_url = self._normalize_source_url(source_url)
+                        if normalized_url:
+                            source_index_urls.add(normalized_url)
+                            if value:
+                                source_index_id_to_url[normalized_value] = normalized_url
+            except (OSError, csv.Error):
+                source_index_ids = set()
+                source_index_urls = set()
+                source_index_id_to_url = {}
+
+        def canonical_reference_atoms(
+            evidence_ids: set[str],
+            source_urls: set[str],
+        ) -> set[str]:
+            return {
+                *source_urls,
+                *(
+                    source_index_id_to_url.get(evidence_id, f"id:{evidence_id}")
+                    for evidence_id in evidence_ids
+                ),
+            }
+
+        current_reference_atoms = canonical_reference_atoms(
+            current_evidence_refs,
+            current_source_urls,
+        )
+        upstream_reference_atoms = canonical_reference_atoms(
+            upstream_evidence_refs,
+            upstream_source_urls,
+        )
+        indexed_reference_atoms = {
+            *source_index_urls,
+            *(
+                source_index_id_to_url.get(evidence_id, f"id:{evidence_id}")
+                for evidence_id in source_index_ids
+            ),
+        }
+        current_reference_count = len(current_reference_atoms)
+        matched_current_reference_count = len(
+            current_reference_atoms.intersection(indexed_reference_atoms),
+        )
+        traceability_ratio = (
+            matched_current_reference_count / current_reference_count
+            if current_reference_count
+            else 0.0
+        )
+        upstream_reference_count = len(upstream_reference_atoms)
+        reused_upstream_reference_count = len(
+            current_reference_atoms.intersection(upstream_reference_atoms),
+        )
+        upstream_evidence_reuse_ratio = (
+            reused_upstream_reference_count / upstream_reference_count
+            if upstream_reference_count
+            else 1.0
+        )
+        required_sections = [
+            str(item or "").strip()
+            for item in quality_contract.get("required_sections", [])
+            if str(item or "").strip()
+        ]
+        covered_sections = 0
+        missing_sections: list[str] = []
+        for requirement in required_sections:
+            matched = any(
+                self._quality_heading_matches(requirement, heading) for heading in headings
+            )
+            if matched:
+                covered_sections += 1
+            else:
+                missing_sections.append(requirement)
+        return {
+            "expected_artifact_count": len(expected),
+            "present_artifact_count": sum(
+                bool(item.get("exists")) for item in artifacts if item.get("role") == "current"
+            ),
+            "nonempty_artifact_count": sum(
+                bool(item.get("nonempty")) for item in artifacts if item.get("role") == "current"
+            ),
+            "upstream_artifact_count": sum(item.get("role") == "upstream" for item in artifacts),
+            "missing_upstream_artifact_count": sum(
+                item.get("role") == "upstream"
+                and (not bool(item.get("exists", False)) or not bool(item.get("nonempty", False)))
+                for item in artifacts
+            ),
+            "artifact_metrics": artifacts,
+            "evidence_reference_count": len(current_evidence_refs),
+            "source_url_reference_count": len(current_source_urls),
+            "upstream_evidence_reference_count": len(upstream_evidence_refs),
+            "upstream_source_url_reference_count": len(upstream_source_urls),
+            "source_index_evidence_count": len(source_index_ids),
+            "source_index_url_count": len(source_index_urls),
+            "matched_evidence_reference_count": len(
+                current_evidence_refs.intersection(source_index_ids),
+            ),
+            "matched_source_url_reference_count": len(
+                current_source_urls.intersection(source_index_urls),
+            ),
+            "traceability_ratio": round(traceability_ratio, 4),
+            "upstream_evidence_reuse_ratio": round(
+                upstream_evidence_reuse_ratio,
+                4,
+            ),
+            "orphan_evidence_reference_count": len(
+                current_reference_atoms.difference(indexed_reference_atoms),
+            ),
+            "duplicate_source_index_id_count": len(duplicate_source_index_ids),
+            "source_index_missing_url_count": source_index_missing_url_count,
+            "url_count": url_count,
+            "required_section_count": len(required_sections),
+            "covered_section_count": covered_sections,
+            "missing_sections": missing_sections,
+            "section_coverage_ratio": (
+                round(covered_sections / len(required_sections), 4) if required_sections else 1.0
+            ),
+        }
+
+    def _apply_quality_contract(
+        self,
+        *,
+        result: VerificationResult,
+        quality_contract: dict[str, object],
+        diagnostics: dict[str, object],
+    ) -> VerificationResult:
+        if not bool(quality_contract.get("enabled", False)):
+            return result
+        metadata = dict(result.metadata) if isinstance(result.metadata, dict) else {}
+        quality = metadata.get("quality", {})
+        if not isinstance(quality, dict):
+            quality = {}
+        overall = self._quality_score(quality.get("overall"))
+        dimensions_raw = quality.get("dimensions", {})
+        dimensions: dict[str, float] = {}
+        if isinstance(dimensions_raw, dict):
+            for key, value in dimensions_raw.items():
+                score = self._quality_score(value)
+                if score is not None and str(key or "").strip():
+                    dimensions[self._quality_dimension_key(key)] = score
+        required_dimensions = [
+            self._quality_dimension_key(item)
+            for item in quality_contract.get("dimensions", [])
+            if self._quality_dimension_key(item)
+        ]
+        missing_dimensions = [item for item in required_dimensions if item not in dimensions]
+        minimum_overall = (
+            self._quality_score(
+                quality_contract.get("minimum_overall_score", 0.0),
+            )
+            or 0.0
+        )
+        minimum_dimension = (
+            self._quality_score(
+                quality_contract.get("minimum_dimension_score", 0.0),
+            )
+            or 0.0
+        )
+        minimum_requirement_coverage = (
+            self._quality_score(
+                quality_contract.get("minimum_requirement_coverage", 0.0),
+            )
+            or 0.0
+        )
+        minimum_traceability = (
+            self._quality_score(
+                quality_contract.get("minimum_traceability_ratio", 0.0),
+            )
+            or 0.0
+        )
+        minimum_upstream_reuse = (
+            self._quality_score(
+                quality_contract.get("minimum_upstream_evidence_reuse_ratio", 0.0),
+            )
+            or 0.0
+        )
+        traceability = self._quality_score(diagnostics.get("traceability_ratio")) or 0.0
+        upstream_reuse = (
+            self._quality_score(
+                diagnostics.get("upstream_evidence_reuse_ratio"),
+            )
+            or 0.0
+        )
+        section_coverage = (
+            self._quality_score(
+                diagnostics.get("section_coverage_ratio"),
+            )
+            or 0.0
+        )
+        requirement_coverage = self._quality_score(
+            quality.get("requirement_coverage"),
+        )
+        missing_targets = (
+            [
+                str(item or "").strip()
+                for item in quality.get("missing_targets", [])
+                if str(item or "").strip()
+            ]
+            if isinstance(quality.get("missing_targets", []), list)
+            else []
+        )
+        missing_targets.extend(
+            str(item or "").strip()
+            for item in diagnostics.get("missing_sections", [])
+            if str(item or "").strip()
+        )
+        artifact_metrics = diagnostics.get("artifact_metrics", [])
+        if isinstance(artifact_metrics, list):
+            missing_targets.extend(
+                f"artifact content: {str(item.get('path', '')).strip()}"
+                for item in artifact_metrics
+                if isinstance(item, dict)
+                and str(item.get("path", "")).strip()
+                and (not bool(item.get("exists", False)) or not bool(item.get("nonempty", False)))
+            )
+        dimension_failures = [key for key, score in dimensions.items() if score < minimum_dimension]
+        failure_reason = ""
+        if overall is None or missing_dimensions or requirement_coverage is None:
+            failure_reason = "quality_assessment_missing"
+            missing_targets.extend(f"quality score: {item}" for item in missing_dimensions)
+            if requirement_coverage is None:
+                missing_targets.append("quality score: requirement_coverage")
+        elif (
+            overall < minimum_overall
+            or dimension_failures
+            or section_coverage < 1.0
+            or (
+                requirement_coverage is not None
+                and requirement_coverage < minimum_requirement_coverage
+            )
+            or int(diagnostics.get("present_artifact_count", 0) or 0)
+            < int(diagnostics.get("expected_artifact_count", 0) or 0)
+            or int(diagnostics.get("nonempty_artifact_count", 0) or 0)
+            < int(diagnostics.get("expected_artifact_count", 0) or 0)
+            or int(diagnostics.get("missing_upstream_artifact_count", 0) or 0) > 0
+        ):
+            failure_reason = "quality_below_threshold"
+            missing_targets.extend(f"quality dimension: {item}" for item in dimension_failures)
+        elif (
+            (minimum_traceability > 0 and traceability < minimum_traceability)
+            or (
+                minimum_upstream_reuse > 0
+                and int(diagnostics.get("upstream_evidence_reference_count", 0) or 0) > 0
+                and upstream_reuse < minimum_upstream_reuse
+            )
+            or (
+                bool(quality_contract.get("require_source_index_urls", False))
+                and int(diagnostics.get("source_index_missing_url_count", 0) or 0) > 0
+            )
+            or int(diagnostics.get("duplicate_source_index_id_count", 0) or 0) > 0
+        ):
+            failure_reason = "evidence_traceability_below_threshold"
+            if minimum_upstream_reuse > 0 and upstream_reuse < minimum_upstream_reuse:
+                missing_targets.append("upstream evidence carried into synthesis")
+            if int(diagnostics.get("source_index_missing_url_count", 0) or 0) > 0:
+                missing_targets.append("source-index rows with source URLs")
+            if int(diagnostics.get("duplicate_source_index_id_count", 0) or 0) > 0:
+                missing_targets.append("unique source-index evidence IDs")
+
+        quality.update(
+            {
+                "overall": overall,
+                "dimensions": dimensions,
+                "minimum_overall_score": minimum_overall,
+                "minimum_dimension_score": minimum_dimension,
+                "minimum_requirement_coverage": minimum_requirement_coverage,
+                "minimum_traceability_ratio": minimum_traceability,
+                "minimum_upstream_evidence_reuse_ratio": minimum_upstream_reuse,
+                "requirement_coverage": requirement_coverage,
+                "diagnostics": diagnostics,
+                "missing_targets": list(dict.fromkeys(missing_targets)),
+                "meets_floor": not bool(failure_reason),
+                "reason_code": failure_reason,
+                "policy_mode": str(
+                    getattr(self._config, "quality_policy_mode", "enforce") or "enforce"
+                )
+                .strip()
+                .lower(),
+            }
+        )
+        metadata["quality"] = quality
+        metadata["missing_targets"] = list(
+            dict.fromkeys(
+                [
+                    *(
+                        metadata.get("missing_targets", [])
+                        if isinstance(metadata.get("missing_targets", []), list)
+                        else []
+                    ),
+                    *missing_targets,
+                ],
+            )
+        )
+        result.metadata = metadata
+        policy_mode = str(quality.get("policy_mode", "enforce") or "enforce")
+        if not failure_reason or not result.passed or policy_mode == "observe":
+            return result
+        result.passed = False
+        result.outcome = "fail"
+        result.reason_code = failure_reason
+        result.severity_class = "semantic"
+        result.confidence = min(float(result.confidence or 0.0), 0.8)
+        detail = (
+            "Output quality audit did not meet the process quality floor. "
+            "Revise only the listed missing requirements or weak dimensions, "
+            "preserving already-supported work."
+        )
+        result.feedback = f"{result.feedback}\n{detail}".strip() if result.feedback else detail
+        return result
 
     def _is_advisory_tool_failure(
         self,
@@ -626,16 +1274,19 @@ class LLMVerifier:
         status_code = _extract_http_status(error)
         if status_code is not None and 400 <= status_code < 600:
             return True
-        return any(marker in text for marker in (
-            "timeout",
-            "timed out",
-            "connection failed",
-            "temporarily unavailable",
-            "not found",
-            "rate limit",
-            "rate-limited",
-            "response too large",
-        ))
+        return any(
+            marker in text
+            for marker in (
+                "timeout",
+                "timed out",
+                "connection failed",
+                "temporarily unavailable",
+                "not found",
+                "rate limit",
+                "rate-limited",
+                "response too large",
+            )
+        )
 
     def _build_prompt(
         self,
@@ -746,6 +1397,7 @@ class LLMVerifier:
     ) -> list[dict]:
         try:
             from loom.state.evidence import merge_evidence_records
+
             return merge_evidence_records(base or [], extra or [])
         except Exception:
             merged: list[dict] = []
@@ -824,8 +1476,7 @@ class LLMVerifier:
 
         lines = ["EVIDENCE CONTEXT SNAPSHOT (advisory, non-binding):"]
         lines.append(
-            "- Treat this as support context for LLM judgment, not a strict "
-            "schema validator."
+            "- Treat this as support context for LLM judgment, not a strict schema validator."
         )
         lines.append(
             "- Structured outputs may vary by process; infer schema from "
@@ -834,20 +1485,11 @@ class LLMVerifier:
         if tools:
             lines.append("- observed_tools: " + ", ".join(sorted(tools)[:10]))
         if facet_keys:
-            lines.append(
-                "- observed_facet_keys: "
-                + ", ".join(sorted(facet_keys)[:12])
-            )
+            lines.append("- observed_facet_keys: " + ", ".join(sorted(facet_keys)[:12]))
         if facet_examples:
-            lines.append(
-                "- observed_facet_examples: "
-                + ", ".join(sorted(facet_examples)[:12])
-            )
+            lines.append("- observed_facet_examples: " + ", ".join(sorted(facet_examples)[:12]))
         if domains:
-            lines.append(
-                "- observed_source_domain_examples: "
-                + ", ".join(sorted(domains)[:10])
-            )
+            lines.append("- observed_source_domain_examples: " + ", ".join(sorted(domains)[:10]))
 
         csv_lines = cls._csv_schema_lines(
             workspace=workspace,
@@ -872,9 +1514,7 @@ class LLMVerifier:
                 }
             facet_preview = "none"
             if facets:
-                facet_preview = ", ".join(
-                    f"{key}={value}" for key, value in sorted(facets.items())
-                )
+                facet_preview = ", ".join(f"{key}={value}" for key, value in sorted(facets.items()))
                 if len(facet_preview) > 96:
                     facet_preview = facet_preview[:93] + "..."
             source = (
@@ -884,9 +1524,7 @@ class LLMVerifier:
             )
             if len(source) > 96:
                 source = source[:93] + "..."
-            lines.append(
-                f"  - {evidence_id} | facets={facet_preview} | source={source}"
-            )
+            lines.append(f"  - {evidence_id} | facets={facet_preview} | source={source}")
 
         return cls._hard_cap_text("\n".join(lines), max_chars=max_chars)
 
@@ -936,10 +1574,7 @@ class LLMVerifier:
                 with path.open("r", encoding="utf-8", errors="replace", newline="") as f:
                     reader = csv.DictReader(f)
                     headers = list(reader.fieldnames or [])
-                    attrib_cols = [
-                        col for col in headers
-                        if cls._is_attribution_column(col)
-                    ]
+                    attrib_cols = [col for col in headers if cls._is_attribution_column(col)]
                     rows = list(reader)
             except Exception:
                 continue
@@ -964,11 +1599,7 @@ class LLMVerifier:
         task_id, subtask_id = context
         model_name = str(payload.get("model", "")).strip() or "unknown"
         phase = str(payload.get("phase", "")).strip() or "done"
-        details = {
-            key: value
-            for key, value in payload.items()
-            if key not in {"model", "phase"}
-        }
+        details = {key: value for key, value in payload.items() if key not in {"model", "phase"}}
         self._emit_model_event(
             task_id=task_id,
             subtask_id=subtask_id,
@@ -1100,13 +1731,9 @@ class LLMVerifier:
     @classmethod
     def _normalize_verifier_metadata(cls, metadata: dict[str, object]) -> dict[str, object]:
         normalized: dict[str, object] = {
-            str(key).strip(): value
-            for key, value in metadata.items()
-            if str(key).strip()
+            str(key).strip(): value for key, value in metadata.items() if str(key).strip()
         }
-        lookup: dict[str, str] = {
-            key.lower(): key for key in normalized
-        }
+        lookup: dict[str, str] = {key.lower(): key for key in normalized}
 
         def value_for(field_name: str) -> object | None:
             key = lookup.get(field_name)
@@ -1123,9 +1750,13 @@ class LLMVerifier:
 
         remediation_mode_raw = value_for("remediation_mode")
         if remediation_mode_raw is not None:
-            normalized["remediation_mode"] = str(
-                remediation_mode_raw or "",
-            ).strip().lower()
+            normalized["remediation_mode"] = (
+                str(
+                    remediation_mode_raw or "",
+                )
+                .strip()
+                .lower()
+            )
 
         missing_targets_raw = value_for("missing_targets")
         if missing_targets_raw is not None:
@@ -1629,10 +2260,7 @@ class LLMVerifier:
     def _exception_feedback(error: Exception) -> str:
         detail = str(error) or type(error).__name__
         detail = " ".join(detail.split())
-        return (
-            "Verification inconclusive: verifier raised an exception: "
-            f"{detail}"
-        )
+        return f"Verification inconclusive: verifier raised an exception: {detail}"
 
     async def verify(
         self,
@@ -1651,7 +2279,9 @@ class LLMVerifier:
             logger.warning("Verifier model not available: %s", e)
             _COMPACTOR_EVENT_CONTEXT.reset(compactor_context_token)
             return VerificationResult(
-                tier=0, passed=True, confidence=0.5,
+                tier=0,
+                passed=True,
+                confidence=0.5,
                 feedback="Verification skipped: verifier model not configured",
                 outcome="pass_with_warnings",
                 reason_code="infra_verifier_error",
@@ -1678,11 +2308,36 @@ class LLMVerifier:
             tool_calls=tool_calls,
             max_chars=self._max_evidence_section_chars,
         )
+        quality_contract = self._quality_contract_for_subtask(subtask)
+        quality_enabled = bool(quality_contract.get("enabled", False))
+        quality_diagnostics = self._artifact_quality_diagnostics(
+            subtask=subtask,
+            workspace=workspace,
+            quality_contract=quality_contract,
+        )
+        artifact_max_chars = self._max_artifact_section_chars
+        if quality_enabled:
+            # Quality audits must see the complete expected artifact set whenever
+            # it fits. Semantic compaction remains the overflow path; arbitrary
+            # first-N-file clipping is not a valid quality assessment strategy.
+            artifact_max_chars = max(
+                artifact_max_chars,
+                min(30_000, self._max_verifier_prompt_tokens * 3),
+            )
         artifact_section = await self._build_artifact_content_section(
+            subtask=subtask,
             workspace=workspace,
             tool_calls=tool_calls,
-            max_chars=self._max_artifact_section_chars,
+            max_chars=artifact_max_chars,
+            quality_contract=quality_contract,
         )
+        quality_diagnostics_section = ""
+        if quality_enabled:
+            quality_diagnostics_section = (
+                "ARTIFACT QUALITY DIAGNOSTICS (deterministic inventory; use alongside "
+                "semantic review):\n"
+                + json.dumps(quality_diagnostics, ensure_ascii=True, sort_keys=True)
+            )
         phase_scope_default = self._phase_scope_default()
         selected_rules = self._select_phase_scoped_rules(
             subtask,
@@ -1695,10 +2350,17 @@ class LLMVerifier:
             llm_rules=selected_rules,
             phase_scope_default=phase_scope_default,
         )
+        prompt = self._augment_verifier_prompt(
+            prompt,
+            subtask=subtask,
+            quality_contract=quality_contract,
+        )
         if evidence_section:
             prompt = prompt + "\n\n" + evidence_section
         if artifact_section:
             prompt = prompt + "\n\n" + artifact_section
+        if quality_diagnostics_section:
+            prompt = prompt + "\n\n" + quality_diagnostics_section
         if estimate_tokens(prompt) > self._max_verifier_prompt_tokens:
             summary_for_prompt = await self._compact_text(
                 summary_for_prompt,
@@ -1713,6 +2375,11 @@ class LLMVerifier:
                 llm_rules=selected_rules,
                 phase_scope_default=phase_scope_default,
             )
+            prompt = self._augment_verifier_prompt(
+                prompt,
+                subtask=subtask,
+                quality_contract=quality_contract,
+            )
             if evidence_section:
                 prompt = (
                     prompt
@@ -1723,14 +2390,19 @@ class LLMVerifier:
                     )
                 )
             if artifact_section:
+                compact_artifact_chars = self._max_artifact_section_compact_chars
+                if quality_enabled:
+                    compact_artifact_chars = max(compact_artifact_chars, 12_000)
                 prompt = (
                     prompt
                     + "\n\n"
                     + self._hard_cap_text(
                         artifact_section,
-                        self._max_artifact_section_compact_chars,
+                        compact_artifact_chars,
                     )
                 )
+            if quality_diagnostics_section:
+                prompt = prompt + "\n\n" + quality_diagnostics_section
 
         request_messages = [{"role": "user", "content": prompt}]
         request_diag = collect_request_diagnostics(
@@ -1759,6 +2431,42 @@ class LLMVerifier:
             )
             if not first_result.reason_code and not first_result.passed:
                 first_result.reason_code = "llm_semantic_failed"
+            first_result = self._apply_quality_contract(
+                result=first_result,
+                quality_contract=quality_contract,
+                diagnostics=quality_diagnostics,
+            )
+            if first_result.reason_code == "quality_assessment_missing":
+                audit_retry_prompt = (
+                    f"{prompt}\n\n"
+                    "VERIFIER SELF-CORRECTION: Your previous response omitted part of "
+                    "the required metadata.quality audit. Reassess the same supplied "
+                    "artifacts without requesting new research. Return the complete "
+                    "verifier JSON contract, including every required quality dimension, "
+                    "overall, requirement_coverage, and concrete missing_targets."
+                )
+                try:
+                    repaired_result = await self._invoke_and_parse(
+                        model,
+                        audit_retry_prompt,
+                        task_id=task_id,
+                        subtask_id=subtask.id,
+                        origin="verification.tier2.quality_contract_retry.complete",
+                    )
+                    if not repaired_result.reason_code and not repaired_result.passed:
+                        repaired_result.reason_code = "llm_semantic_failed"
+                    first_result = self._apply_quality_contract(
+                        result=repaired_result,
+                        quality_contract=quality_contract,
+                        diagnostics=quality_diagnostics,
+                    )
+                    first_result.metadata = dict(first_result.metadata)
+                    first_result.metadata["quality_contract_retry"] = True
+                except Exception as quality_retry_error:
+                    logger.warning(
+                        "Verifier quality-contract self-correction failed: %s",
+                        quality_retry_error,
+                    )
             self._emit_model_event(
                 task_id=task_id,
                 subtask_id=subtask.id,
@@ -1790,6 +2498,11 @@ class LLMVerifier:
                 llm_rules=selected_rules,
                 phase_scope_default=phase_scope_default,
             )
+            compact_prompt = self._augment_verifier_prompt(
+                compact_prompt,
+                subtask=subtask,
+                quality_contract=quality_contract,
+            )
             if evidence_section:
                 compact_prompt = (
                     compact_prompt
@@ -1800,14 +2513,19 @@ class LLMVerifier:
                     )
                 )
             if artifact_section:
+                compact_artifact_chars = self._max_artifact_section_compact_chars
+                if quality_enabled:
+                    compact_artifact_chars = max(compact_artifact_chars, 12_000)
                 compact_prompt = (
                     compact_prompt
                     + "\n\n"
                     + self._hard_cap_text(
                         artifact_section,
-                        self._max_artifact_section_compact_chars,
+                        compact_artifact_chars,
                     )
                 )
+            if quality_diagnostics_section:
+                compact_prompt = compact_prompt + "\n\n" + quality_diagnostics_section
             retry_messages = [{"role": "user", "content": compact_prompt}]
             retry_diag = collect_request_diagnostics(
                 messages=retry_messages,
@@ -1835,6 +2553,11 @@ class LLMVerifier:
                 )
                 if not retry_result.reason_code and not retry_result.passed:
                     retry_result.reason_code = "llm_semantic_failed"
+                retry_result = self._apply_quality_contract(
+                    result=retry_result,
+                    quality_contract=quality_contract,
+                    diagnostics=quality_diagnostics,
+                )
                 self._emit_model_event(
                     task_id=task_id,
                     subtask_id=subtask.id,

@@ -831,11 +831,11 @@ async def _restore_process_run_tabs(self, chat: ChatLog | None = None) -> None:
 
         if self._is_process_run_busy_status(run.status):
             interrupted += 1
-            self._set_process_run_status(run, "failed")
-            run.ended_at = time.monotonic()
-            note = "Run interrupted before session resume; marked failed."
+            self._set_process_run_status(run, "paused")
+            run.paused_started_at = time.monotonic()
+            note = "Run interrupted before session resume; checkpoint preserved."
             run.activity_log.append(note)
-            run.result_log.append({"text": note, "success": False})
+            run.result_log.append({"text": note, "success": True})
 
         self._process_runs[run_id] = run
         await tabs.add_pane(
@@ -873,7 +873,7 @@ async def _restore_process_run_tabs(self, chat: ChatLog | None = None) -> None:
         if interrupted:
             info += (
                 "\n"
-                f"  [#f7768e]{interrupted} interrupted run(s) were marked failed. "
+                f"  [#e0af68]{interrupted} interrupted run(s) were paused. "
                 "Use /run resume <run-id-prefix> to continue.[/]"
             )
         chat.add_info(info)

@@ -33,6 +33,7 @@ logger = logging.getLogger(__name__)
 # Exceptions
 # ---------------------------------------------------------------------------
 
+
 class ProcessNotFoundError(Exception):
     """Raised when a process definition cannot be found."""
 
@@ -61,6 +62,7 @@ class ProcessValidationError(Exception):
 # ---------------------------------------------------------------------------
 # Dataclasses
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class IterationBudget:
@@ -133,6 +135,7 @@ class PhaseTemplate:
     acceptance_criteria: str = ""
     deliverables: list[str] = field(default_factory=list)
     validity_contract: dict[str, Any] = field(default_factory=dict)
+    quality_contract: dict[str, Any] = field(default_factory=dict)
     iteration: IterationPolicy | None = None
 
 
@@ -178,6 +181,10 @@ class ProcessTestAcceptance:
     phases_must_include: list[str] = field(default_factory=list)
     deliverables_must_exist: list[str] = field(default_factory=list)
     verification_forbidden_patterns: list[str] = field(default_factory=list)
+    allowed_completion_grades: list[str] = field(default_factory=list)
+    artifact_minimum_characters: dict[str, int] = field(default_factory=dict)
+    artifact_required_patterns: dict[str, list[str]] = field(default_factory=dict)
+    csv_minimum_rows: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -310,6 +317,7 @@ class ProcessDefinition:
     )
     evidence: EvidenceContract = field(default_factory=EvidenceContract)
     validity_contract: dict[str, Any] = field(default_factory=dict)
+    quality_contract: dict[str, Any] = field(default_factory=dict)
     prompt_contracts: PromptContracts = field(default_factory=PromptContracts)
 
     # Package metadata
@@ -318,19 +326,21 @@ class ProcessDefinition:
     # Resolved paths (set by loader)
     source_path: Path | None = None
     package_dir: Path | None = None
-    _HIGH_RISK_INTENT_TOKENS = frozenset({
-        "investment",
-        "investing",
-        "finance",
-        "financial",
-        "medical",
-        "medicine",
-        "healthcare",
-        "health",
-        "legal",
-        "law",
-        "compliance",
-    })
+    _HIGH_RISK_INTENT_TOKENS = frozenset(
+        {
+            "investment",
+            "investing",
+            "finance",
+            "financial",
+            "medical",
+            "medicine",
+            "healthcare",
+            "health",
+            "legal",
+            "law",
+            "compliance",
+        }
+    )
     _RISK_LEVEL_ALIASES = {
         "normal": "medium",
         "med": "medium",
@@ -343,13 +353,15 @@ class ProcessDefinition:
     _OUTPUT_PUBLISH_MODES = frozenset({"transactional", "best_effort"})
     _OUTPUT_CONFLICT_POLICIES = frozenset({"defer_fifo", "fail_fast"})
     _FINALIZER_INPUT_POLICIES = frozenset({"require_all_workers", "allow_partial"})
-    _VERIFIER_CAPABILITIES = frozenset({
-        "artifact_static",
-        "command_execution",
-        "service_runtime",
-        "browser_runtime",
-        "report_rendering",
-    })
+    _VERIFIER_CAPABILITIES = frozenset(
+        {
+            "artifact_static",
+            "command_execution",
+            "service_runtime",
+            "browser_runtime",
+            "report_rendering",
+        }
+    )
     _PHASE_FINALIZER_SUFFIX = "__finalize_output"
 
     def has_phases(self) -> bool:
@@ -383,9 +395,14 @@ class ProcessDefinition:
         return default_strategy
 
     def phase_finalizer_input_policy(self, phase_id: str) -> str:
-        default_policy = str(
-            getattr(self.output_coordination, "finalizer_input_policy", "require_all_workers"),
-        ).strip().lower() or "require_all_workers"
+        default_policy = (
+            str(
+                getattr(self.output_coordination, "finalizer_input_policy", "require_all_workers"),
+            )
+            .strip()
+            .lower()
+            or "require_all_workers"
+        )
         if default_policy not in self._FINALIZER_INPUT_POLICIES:
             default_policy = "require_all_workers"
         normalized_phase_id = str(phase_id or "").strip()
@@ -481,12 +498,14 @@ class ProcessDefinition:
                 continue
             helper_spec = get_verification_helper(helper)
             description = helper_spec.description if helper_spec else ""
-            specs.append({
-                "helper": helper,
-                "capability": capability,
-                "description": str(description or "").strip(),
-                "bound": bool(verification_helper_is_bound(helper)),
-            })
+            specs.append(
+                {
+                    "helper": helper,
+                    "capability": capability,
+                    "description": str(description or "").strip(),
+                    "bound": bool(verification_helper_is_bound(helper)),
+                }
+            )
             seen.add((helper, capability))
         return specs
 
@@ -541,6 +560,37 @@ class ProcessDefinition:
                 if text:
                     fields.append(text)
         return list(dict.fromkeys(fields))
+
+    def resolve_quality_contract_for_phase(self, phase_id: str) -> dict[str, Any]:
+        """Return the merged, normalized output-quality contract for a phase."""
+        base = dict(self.quality_contract) if isinstance(self.quality_contract, dict) else {}
+        normalized_phase_id = str(phase_id or "").strip()
+        applies = base.get("applies_to_phases", [])
+        if isinstance(applies, str):
+            applies = [applies]
+        if isinstance(applies, list) and applies:
+            normalized_applies = {
+                str(item or "").strip() for item in applies if str(item or "").strip()
+            }
+            if "*" not in normalized_applies and normalized_phase_id not in normalized_applies:
+                return {"enabled": False}
+
+        phase_overrides = base.pop("phase_overrides", {})
+        base.pop("applies_to_phases", None)
+        override: dict[str, Any] = {}
+        if isinstance(phase_overrides, dict):
+            candidate = phase_overrides.get(normalized_phase_id, {})
+            if isinstance(candidate, dict):
+                override.update(candidate)
+        for phase in self.phases:
+            if str(phase.id or "").strip() != normalized_phase_id:
+                continue
+            if isinstance(phase.quality_contract, dict):
+                override.update(phase.quality_contract)
+            break
+        base.update(override)
+        base["enabled"] = self._to_bool(base.get("enabled", False), False)
+        return base
 
     def verifier_optional_capabilities(self) -> list[str]:
         """Return normalized optional verifier capabilities from outcome policy."""
@@ -611,9 +661,13 @@ class ProcessDefinition:
         include_adhoc_fallback: bool = False,
     ) -> str:
         """Return the normalized tier-1 tool-failure policy."""
-        policy = str(
-            self.verifier_static_checks().get("tool_success_policy", "") or "",
-        ).strip().lower()
+        policy = (
+            str(
+                self.verifier_static_checks().get("tool_success_policy", "") or "",
+            )
+            .strip()
+            .lower()
+        )
         if policy in {
             "all_tools_hard",
             "development_balanced",
@@ -695,11 +749,13 @@ class ProcessDefinition:
             critical_claim_types_raw = [critical_claim_types_raw]
         if not isinstance(critical_claim_types_raw, list):
             critical_claim_types_raw = []
-        critical_claim_types = list(dict.fromkeys(
-            str(item or "").strip().lower()
-            for item in critical_claim_types_raw
-            if str(item or "").strip()
-        ))
+        critical_claim_types = list(
+            dict.fromkeys(
+                str(item or "").strip().lower()
+                for item in critical_claim_types_raw
+                if str(item or "").strip()
+            )
+        )
 
         prune_mode = str(payload.get("prune_mode", "drop") or "").strip().lower()
         if prune_mode not in {"drop", "rewrite_uncertainty"}:
@@ -773,10 +829,14 @@ class ProcessDefinition:
                 or incoming.get("claim_extraction", {}).get("enabled", False)
             ),
         }
-        merged["critical_claim_types"] = list(dict.fromkeys([
-            *list(merged.get("critical_claim_types", [])),
-            *list(incoming.get("critical_claim_types", [])),
-        ]))
+        merged["critical_claim_types"] = list(
+            dict.fromkeys(
+                [
+                    *list(merged.get("critical_claim_types", [])),
+                    *list(incoming.get("critical_claim_types", [])),
+                ]
+            )
+        )
         merged["min_supported_ratio"] = max(
             cls._to_ratio(merged.get("min_supported_ratio", 0.75), 0.75),
             cls._to_ratio(incoming.get("min_supported_ratio", 0.75), 0.75),
@@ -817,8 +877,7 @@ class ProcessDefinition:
         temporal = dict(final_gate.get("temporal_consistency", {}))
         incoming_temporal = dict(incoming_final_gate.get("temporal_consistency", {}))
         temporal["enabled"] = bool(
-            temporal.get("enabled", False)
-            or incoming_temporal.get("enabled", False)
+            temporal.get("enabled", False) or incoming_temporal.get("enabled", False)
         )
         temporal["require_as_of_alignment"] = bool(
             temporal.get("require_as_of_alignment", False)
@@ -884,22 +943,24 @@ class ProcessDefinition:
                 "enforce_cross_claim_date_conflict_check": False,
                 "max_source_age_days": 0,
             }
-        return self._normalize_validity_contract({
-            "enabled": True,
-            "claim_extraction": {"enabled": True},
-            "critical_claim_types": ["numeric", "date", "entity_fact"],
-            "min_supported_ratio": min_supported_ratio,
-            "max_unverified_ratio": max_unverified_ratio,
-            "max_contradicted_count": 0,
-            "prune_mode": "rewrite_uncertainty",
-            "require_fact_checker_for_synthesis": require_fact_checker,
-            "final_gate": {
-                "enforce_verified_context_only": bool(is_synthesis),
-                "synthesis_min_verification_tier": 2,
-                "critical_claim_support_ratio": critical_support_ratio,
-                "temporal_consistency": temporal_consistency,
-            },
-        })
+        return self._normalize_validity_contract(
+            {
+                "enabled": True,
+                "claim_extraction": {"enabled": True},
+                "critical_claim_types": ["numeric", "date", "entity_fact"],
+                "min_supported_ratio": min_supported_ratio,
+                "max_unverified_ratio": max_unverified_ratio,
+                "max_contradicted_count": 0,
+                "prune_mode": "rewrite_uncertainty",
+                "require_fact_checker_for_synthesis": require_fact_checker,
+                "final_gate": {
+                    "enforce_verified_context_only": bool(is_synthesis),
+                    "synthesis_min_verification_tier": 2,
+                    "critical_claim_support_ratio": critical_support_ratio,
+                    "temporal_consistency": temporal_consistency,
+                },
+            }
+        )
 
     def resolve_validity_contract_for_phase(
         self,
@@ -938,11 +999,7 @@ class ProcessDefinition:
         raw = record_schema.get("facets", [])
         if not isinstance(raw, list):
             return []
-        return [
-            str(item).strip()
-            for item in raw
-            if isinstance(item, str) and str(item).strip()
-        ]
+        return [str(item).strip() for item in raw if isinstance(item, str) and str(item).strip()]
 
     def requires_evidence_contract(self, subtask_id: str) -> bool:
         evidence_contract = self.prompt_contracts.evidence_contract
@@ -986,9 +1043,13 @@ class ProcessDefinition:
         return ""
 
     def remediation_critical_path_behavior(self) -> str:
-        raw = str(
-            self.verification_remediation.critical_path_behavior or "",
-        ).strip().lower()
+        raw = (
+            str(
+                self.verification_remediation.critical_path_behavior or "",
+            )
+            .strip()
+            .lower()
+        )
         if raw in {"block", "confirm_or_prune_then_queue", "queue_follow_up"}:
             return raw
         return "block"
@@ -1046,7 +1107,8 @@ class ProcessDefinition:
     ) -> list[VerificationRule]:
         """Return regex rules applicable to the current subtask."""
         return [
-            r for r in self.regex_rules()
+            r
+            for r in self.regex_rules()
             if self._rule_applies_to_subtask(
                 r,
                 subtask_id,
@@ -1062,7 +1124,8 @@ class ProcessDefinition:
     ) -> list[VerificationRule]:
         """Return llm rules applicable to the current subtask."""
         return [
-            r for r in self.llm_rules()
+            r
+            for r in self.llm_rules()
             if self._rule_applies_to_subtask(
                 r,
                 subtask_id,
@@ -1093,21 +1156,15 @@ class ProcessDefinition:
             }
             if requirement.modes:
                 payload["modes"] = [
-                    str(item).strip()
-                    for item in requirement.modes
-                    if str(item).strip()
+                    str(item).strip() for item in requirement.modes if str(item).strip()
                 ]
             if requirement.scopes:
                 payload["scopes"] = [
-                    str(item).strip()
-                    for item in requirement.scopes
-                    if str(item).strip()
+                    str(item).strip() for item in requirement.scopes if str(item).strip()
                 ]
             if requirement.required_env_keys:
                 payload["required_env_keys"] = [
-                    str(item).strip()
-                    for item in requirement.required_env_keys
-                    if str(item).strip()
+                    str(item).strip() for item in requirement.required_env_keys if str(item).strip()
                 ]
             if str(requirement.mcp_server or "").strip():
                 payload["mcp_server"] = str(requirement.mcp_server).strip()
@@ -1115,11 +1172,7 @@ class ProcessDefinition:
                 payload["resource_ref"] = str(requirement.resource_ref).strip()
             if str(requirement.resource_id or "").strip():
                 payload["resource_id"] = str(requirement.resource_id).strip()
-            if (
-                payload.get("provider")
-                or payload.get("resource_ref")
-                or payload.get("resource_id")
-            ):
+            if payload.get("provider") or payload.get("resource_ref") or payload.get("resource_id"):
                 items.append(payload)
         return items
 
@@ -1127,6 +1180,7 @@ class ProcessDefinition:
 # ---------------------------------------------------------------------------
 # Loader
 # ---------------------------------------------------------------------------
+
 
 class ProcessLoader:
     """Discovers and loads process definition files.
@@ -1141,14 +1195,16 @@ class ProcessLoader:
 
     BUILTIN_DIR = Path(__file__).parent / "builtin"
     _ITERATION_STRATEGIES = frozenset({"targeted_remediation", "full_rerun"})
-    _ARTIFACT_REGEX_TARGETS = frozenset({
-        "",
-        "auto",
-        "deliverables",
-        "changed_files",
-        "summary",
-        "output",
-    })
+    _ARTIFACT_REGEX_TARGETS = frozenset(
+        {
+            "",
+            "auto",
+            "deliverables",
+            "changed_files",
+            "summary",
+            "output",
+        }
+    )
     _COMMAND_EXIT_ALLOWLIST_PREFIXES = (
         ("pytest",),
         ("uv", "run", "pytest"),
@@ -1234,22 +1290,26 @@ class ProcessLoader:
         for name, path in sorted(self.discover().items()):
             try:
                 defn = self._load_metadata_only(path)
-                result.append({
-                    "name": defn.name,
-                    "version": defn.version,
-                    "description": defn.description,
-                    "author": defn.author,
-                    "path": str(path),
-                })
+                result.append(
+                    {
+                        "name": defn.name,
+                        "version": defn.version,
+                        "description": defn.description,
+                        "author": defn.author,
+                        "path": str(path),
+                    }
+                )
             except Exception as e:
                 logger.warning("Failed to load process %s: %s", name, e)
-                result.append({
-                    "name": name,
-                    "version": "?",
-                    "description": "(failed to load)",
-                    "author": "",
-                    "path": str(path),
-                })
+                result.append(
+                    {
+                        "name": name,
+                        "version": "?",
+                        "description": "(failed to load)",
+                        "author": "",
+                        "path": str(path),
+                    }
+                )
         return result
 
     # --- Internal ---
@@ -1295,7 +1355,8 @@ class ProcessLoader:
             raw = yaml.safe_load(f)
         if not raw or not isinstance(raw, dict):
             raise ProcessValidationError(
-                ["Empty or invalid YAML file"], path,
+                ["Empty or invalid YAML file"],
+                path,
             )
 
         defn = self._build_definition(raw)
@@ -1325,35 +1386,42 @@ class ProcessLoader:
                 phase_validity_contract = {"enabled": phase_validity_contract}
             if not isinstance(phase_validity_contract, dict):
                 phase_validity_contract = {}
-            phases.append(PhaseTemplate(
-                id=p.get("id", ""),
-                description=p.get("description", ""),
-                depends_on=p.get("depends_on", []),
-                model_tier=p.get("model_tier", 2),
-                verification_tier=p.get("verification_tier", 1),
-                is_critical_path=p.get("is_critical_path", False),
-                is_synthesis=p.get("is_synthesis", False),
-                output_strategy=str(p.get("output_strategy", "") or "").strip().lower(),
-                finalizer_input_policy=str(
-                    p.get("finalizer_input_policy", "") or "",
-                ).strip().lower(),
-                acceptance_criteria=p.get("acceptance_criteria", ""),
-                deliverables=p.get("deliverables", []),
-                validity_contract=phase_validity_contract,
-                iteration=self._parse_iteration_policy(p.get("iteration")),
-            ))
+            phase_quality_contract = p.get("quality_contract", {})
+            if isinstance(phase_quality_contract, bool):
+                phase_quality_contract = {"enabled": phase_quality_contract}
+            if not isinstance(phase_quality_contract, dict):
+                phase_quality_contract = {}
+            phases.append(
+                PhaseTemplate(
+                    id=p.get("id", ""),
+                    description=p.get("description", ""),
+                    depends_on=p.get("depends_on", []),
+                    model_tier=p.get("model_tier", 2),
+                    verification_tier=p.get("verification_tier", 1),
+                    is_critical_path=p.get("is_critical_path", False),
+                    is_synthesis=p.get("is_synthesis", False),
+                    output_strategy=str(p.get("output_strategy", "") or "").strip().lower(),
+                    finalizer_input_policy=str(
+                        p.get("finalizer_input_policy", "") or "",
+                    )
+                    .strip()
+                    .lower(),
+                    acceptance_criteria=p.get("acceptance_criteria", ""),
+                    deliverables=p.get("deliverables", []),
+                    validity_contract=phase_validity_contract,
+                    quality_contract=phase_quality_contract,
+                    iteration=self._parse_iteration_policy(p.get("iteration")),
+                )
+            )
 
         # Output coordination policy
         output_coordination_raw = raw.get("output_coordination", {})
         if not isinstance(output_coordination_raw, dict):
             output_coordination_raw = {}
         output_coordination = OutputCoordination(
-            strategy=str(output_coordination_raw.get("strategy", "direct") or "")
-            .strip()
-            .lower(),
+            strategy=str(output_coordination_raw.get("strategy", "direct") or "").strip().lower(),
             intermediate_root=str(
-                output_coordination_raw.get("intermediate_root", ".loom/phase-artifacts")
-                or "",
+                output_coordination_raw.get("intermediate_root", ".loom/phase-artifacts") or "",
             ).strip(),
             enforce_single_writer=self._bool_or_default(
                 output_coordination_raw.get("enforce_single_writer", True),
@@ -1366,9 +1434,10 @@ class ProcessLoader:
             .strip()
             .lower(),
             finalizer_input_policy=str(
-                output_coordination_raw.get("finalizer_input_policy", "require_all_workers")
-                or "",
-            ).strip().lower(),
+                output_coordination_raw.get("finalizer_input_policy", "require_all_workers") or "",
+            )
+            .strip()
+            .lower(),
         )
 
         # Verification rules + contract v2 verification blocks
@@ -1382,23 +1451,23 @@ class ProcessLoader:
                 applies_to = [applies_to]
             if not isinstance(applies_to, list):
                 applies_to = []
-            rules.append(VerificationRule(
-                name=r.get("name", ""),
-                description=r.get("description", ""),
-                check=r.get("check", ""),
-                severity=r.get("severity", "warning"),
-                type=r.get("type", "llm"),
-                target=r.get("target", "output"),
-                enforcement=r.get("enforcement", ""),
-                failure_class=str(r.get("failure_class", "") or "").strip().lower(),
-                remediation_mode=str(r.get("remediation_mode", "") or "").strip().lower(),
-                scope=r.get("scope", ""),
-                applies_to_phases=[str(p).strip() for p in applies_to if str(p).strip()],
-                requires_exact_cardinality=bool(
-                    r.get("requires_exact_cardinality", False)
-                ),
-                min_count=r.get("min_count"),
-            ))
+            rules.append(
+                VerificationRule(
+                    name=r.get("name", ""),
+                    description=r.get("description", ""),
+                    check=r.get("check", ""),
+                    severity=r.get("severity", "warning"),
+                    type=r.get("type", "llm"),
+                    target=r.get("target", "output"),
+                    enforcement=r.get("enforcement", ""),
+                    failure_class=str(r.get("failure_class", "") or "").strip().lower(),
+                    remediation_mode=str(r.get("remediation_mode", "") or "").strip().lower(),
+                    scope=r.get("scope", ""),
+                    applies_to_phases=[str(p).strip() for p in applies_to if str(p).strip()],
+                    requires_exact_cardinality=bool(r.get("requires_exact_cardinality", False)),
+                    min_count=r.get("min_count"),
+                )
+            )
 
         policy_raw = verif.get("policy", {})
         if not isinstance(policy_raw, dict):
@@ -1409,10 +1478,7 @@ class ProcessLoader:
         semantic_checks = policy_raw.get("semantic_checks", [])
         if not isinstance(semantic_checks, list):
             semantic_checks = []
-        semantic_checks = [
-            item for item in semantic_checks
-            if isinstance(item, dict)
-        ]
+        semantic_checks = [item for item in semantic_checks if isinstance(item, dict)]
         output_contract = policy_raw.get("output_contract", {})
         if not isinstance(output_contract, dict):
             output_contract = {}
@@ -1420,9 +1486,7 @@ class ProcessLoader:
         if not isinstance(outcome_policy, dict):
             outcome_policy = {}
         verification_policy = VerificationPolicyContract(
-            mode=str(policy_raw.get("mode", "llm_first") or "llm_first")
-            .strip()
-            .lower(),
+            mode=str(policy_raw.get("mode", "llm_first") or "llm_first").strip().lower(),
             static_checks=static_checks,
             semantic_checks=semantic_checks,
             output_contract=output_contract,
@@ -1435,10 +1499,7 @@ class ProcessLoader:
         strategies = remediation_raw.get("strategies", [])
         if not isinstance(strategies, list):
             strategies = []
-        strategies = [
-            item for item in strategies
-            if isinstance(item, dict)
-        ]
+        strategies = [item for item in strategies if isinstance(item, dict)]
         retry_budget = remediation_raw.get("retry_budget", {})
         if not isinstance(retry_budget, dict):
             retry_budget = {}
@@ -1450,7 +1511,9 @@ class ProcessLoader:
             default_strategy=str(remediation_raw.get("default_strategy", "") or "").strip(),
             critical_path_behavior=str(
                 remediation_raw.get("critical_path_behavior", "") or "",
-            ).strip().lower(),
+            )
+            .strip()
+            .lower(),
             retry_budget=retry_budget,
             transient_retry_policy=transient_retry_policy,
         )
@@ -1458,21 +1521,30 @@ class ProcessLoader:
         # Memory types
         memory_raw = raw.get("memory", {})
         memory_types = []
-        for m in memory_raw.get("extract_types", []) if isinstance(
-            memory_raw, dict,
-        ) else []:
-            memory_types.append(MemoryType(
-                type=m.get("type", ""),
-                description=m.get("description", ""),
-            ))
+        for m in (
+            memory_raw.get("extract_types", [])
+            if isinstance(
+                memory_raw,
+                dict,
+            )
+            else []
+        ):
+            memory_types.append(
+                MemoryType(
+                    type=m.get("type", ""),
+                    description=m.get("description", ""),
+                )
+            )
 
         # Planner examples
         examples = []
         for ex in raw.get("planner_examples", []):
-            examples.append(PlannerExample(
-                goal=ex.get("goal", ""),
-                subtasks=ex.get("subtasks", []),
-            ))
+            examples.append(
+                PlannerExample(
+                    goal=ex.get("goal", ""),
+                    subtasks=ex.get("subtasks", []),
+                )
+            )
 
         # Process tests
         tests: list[ProcessTestCase] = []
@@ -1499,38 +1571,99 @@ class ProcessLoader:
                 verification_raw = acceptance_raw.get("verification", {})
                 if not isinstance(verification_raw, dict):
                     verification_raw = {}
+                quality_raw = acceptance_raw.get("quality", {})
+                if not isinstance(quality_raw, dict):
+                    quality_raw = {}
 
-                tests.append(ProcessTestCase(
-                    id=str(t.get("id", "")).strip(),
-                    mode=str(t.get("mode", "deterministic")).strip(),
-                    goal=str(t.get("goal", "")).strip(),
-                    timeout_seconds=timeout_seconds,
-                    requires_network=bool(t.get("requires_network", False)),
-                    requires_tools=[
-                        item
-                        for item in t.get("requires_tools", [])
-                        if isinstance(item, str) and item.strip()
-                    ] if isinstance(t.get("requires_tools", []), list) else [],
-                    acceptance=ProcessTestAcceptance(
-                        phases_must_include=[
-                            item
-                            for item in phases_raw.get("must_include", [])
+                def _integer_mapping(value: object) -> dict[str, int]:
+                    if not isinstance(value, dict):
+                        return {}
+                    normalized: dict[str, int] = {}
+                    for key, raw_value in value.items():
+                        path = str(key or "").strip()
+                        if not path:
+                            continue
+                        if isinstance(raw_value, bool):
+                            normalized[path] = -1
+                            continue
+                        try:
+                            normalized[path] = int(raw_value)
+                        except (TypeError, ValueError):
+                            normalized[path] = -1
+                    return normalized
+
+                artifact_required_patterns: dict[str, list[str]] = {}
+                raw_patterns = quality_raw.get("artifact_required_patterns", {})
+                if isinstance(raw_patterns, dict):
+                    for key, value in raw_patterns.items():
+                        path = str(key or "").strip()
+                        if not path or not isinstance(value, list):
+                            continue
+                        artifact_required_patterns[path] = [
+                            str(item).strip()
+                            for item in value
                             if isinstance(item, str) and item.strip()
-                        ] if isinstance(phases_raw.get("must_include", []), list) else [],
-                        deliverables_must_exist=[
+                        ]
+
+                tests.append(
+                    ProcessTestCase(
+                        id=str(t.get("id", "")).strip(),
+                        mode=str(t.get("mode", "deterministic")).strip(),
+                        goal=str(t.get("goal", "")).strip(),
+                        timeout_seconds=timeout_seconds,
+                        requires_network=bool(t.get("requires_network", False)),
+                        requires_tools=[
                             item
-                            for item in deliverables_raw.get("must_exist", [])
+                            for item in t.get("requires_tools", [])
                             if isinstance(item, str) and item.strip()
-                        ] if isinstance(deliverables_raw.get("must_exist", []), list) else [],
-                        verification_forbidden_patterns=[
-                            item
-                            for item in verification_raw.get("forbidden_patterns", [])
-                            if isinstance(item, str) and item.strip()
-                        ] if isinstance(
-                            verification_raw.get("forbidden_patterns", []), list
-                        ) else [],
-                    ),
-                ))
+                        ]
+                        if isinstance(t.get("requires_tools", []), list)
+                        else [],
+                        acceptance=ProcessTestAcceptance(
+                            phases_must_include=[
+                                item
+                                for item in phases_raw.get("must_include", [])
+                                if isinstance(item, str) and item.strip()
+                            ]
+                            if isinstance(phases_raw.get("must_include", []), list)
+                            else [],
+                            deliverables_must_exist=[
+                                item
+                                for item in deliverables_raw.get("must_exist", [])
+                                if isinstance(item, str) and item.strip()
+                            ]
+                            if isinstance(deliverables_raw.get("must_exist", []), list)
+                            else [],
+                            verification_forbidden_patterns=[
+                                item
+                                for item in verification_raw.get("forbidden_patterns", [])
+                                if isinstance(item, str) and item.strip()
+                            ]
+                            if isinstance(verification_raw.get("forbidden_patterns", []), list)
+                            else [],
+                            allowed_completion_grades=[
+                                item.strip()
+                                for item in quality_raw.get(
+                                    "allowed_completion_grades",
+                                    [],
+                                )
+                                if isinstance(item, str) and item.strip()
+                            ]
+                            if isinstance(
+                                quality_raw.get("allowed_completion_grades", []),
+                                list,
+                            )
+                            else [],
+                            artifact_minimum_characters=_integer_mapping(
+                                quality_raw.get("artifact_minimum_characters", {}),
+                            ),
+                            artifact_required_patterns=artifact_required_patterns,
+                            csv_minimum_rows=_integer_mapping(
+                                quality_raw.get("csv_minimum_rows", {}),
+                            ),
+                        ),
+                    )
+                )
 
         # Tool requirements
         tool_raw = raw.get("tools", {})
@@ -1568,47 +1701,59 @@ class ProcessLoader:
                     env_keys_raw = [env_keys_raw]
                 if not isinstance(env_keys_raw, list):
                     env_keys_raw = []
-                auth_required.append(AuthRequirement(
-                    provider=str(entry.get("provider", "")).strip(),
-                    source=str(entry.get("source", "api") or "api").strip().lower(),
-                    modes=[
-                        str(item).strip()
-                        for item in modes_raw
-                        if str(item).strip()
-                    ],
-                    scopes=[
-                        str(item).strip()
-                        for item in scopes_raw
-                        if str(item).strip()
-                    ],
-                    required_env_keys=[
-                        str(item).strip()
-                        for item in env_keys_raw
-                        if str(item).strip()
-                    ],
-                    mcp_server=str(entry.get("mcp_server", "")).strip(),
-                    resource_ref=str(entry.get("resource_ref", "")).strip(),
-                    resource_id=str(entry.get("resource_id", "")).strip(),
-                ))
+                auth_required.append(
+                    AuthRequirement(
+                        provider=str(entry.get("provider", "")).strip(),
+                        source=str(entry.get("source", "api") or "api").strip().lower(),
+                        modes=[str(item).strip() for item in modes_raw if str(item).strip()],
+                        scopes=[str(item).strip() for item in scopes_raw if str(item).strip()],
+                        required_env_keys=[
+                            str(item).strip() for item in env_keys_raw if str(item).strip()
+                        ],
+                        mcp_server=str(entry.get("mcp_server", "")).strip(),
+                        resource_ref=str(entry.get("resource_ref", "")).strip(),
+                        resource_id=str(entry.get("resource_id", "")).strip(),
+                    )
+                )
         auth = AuthRequirements(required=auth_required)
 
         # Workspace analysis
         ws_raw = raw.get("workspace_analysis", {})
-        ws_scan = ws_raw.get("scan_for", []) if isinstance(
-            ws_raw, dict,
-        ) else []
-        ws_guidance = ws_raw.get("guidance", "") if isinstance(
-            ws_raw, dict,
-        ) else ""
+        ws_scan = (
+            ws_raw.get("scan_for", [])
+            if isinstance(
+                ws_raw,
+                dict,
+            )
+            else []
+        )
+        ws_guidance = (
+            ws_raw.get("guidance", "")
+            if isinstance(
+                ws_raw,
+                dict,
+            )
+            else ""
+        )
 
         # Replanning
         replan_raw = raw.get("replanning", {})
-        replan_triggers = replan_raw.get("triggers", "") if isinstance(
-            replan_raw, dict,
-        ) else ""
-        replan_guidance = replan_raw.get("guidance", "") if isinstance(
-            replan_raw, dict,
-        ) else ""
+        replan_triggers = (
+            replan_raw.get("triggers", "")
+            if isinstance(
+                replan_raw,
+                dict,
+            )
+            else ""
+        )
+        replan_guidance = (
+            replan_raw.get("guidance", "")
+            if isinstance(
+                replan_raw,
+                dict,
+            )
+            else ""
+        )
 
         # Evidence contract v2
         evidence_raw = raw.get("evidence", {})
@@ -1635,6 +1780,12 @@ class ProcessLoader:
             validity_contract_raw = {"enabled": validity_contract_raw}
         if not isinstance(validity_contract_raw, dict):
             validity_contract_raw = {}
+
+        quality_contract_raw = raw.get("quality_contract", {})
+        if isinstance(quality_contract_raw, bool):
+            quality_contract_raw = {"enabled": quality_contract_raw}
+        if not isinstance(quality_contract_raw, dict):
+            quality_contract_raw = {}
 
         # Prompt contracts v2
         prompt_contracts_raw = raw.get("prompt_contracts", {})
@@ -1703,8 +1854,11 @@ class ProcessLoader:
             verification_rules=rules,
             memory_types=memory_types,
             extraction_guidance=memory_raw.get(
-                "extraction_guidance", "",
-            ) if isinstance(memory_raw, dict) else "",
+                "extraction_guidance",
+                "",
+            )
+            if isinstance(memory_raw, dict)
+            else "",
             workspace_scan=ws_scan,
             workspace_guidance=ws_guidance,
             planner_examples=examples,
@@ -1715,6 +1869,7 @@ class ProcessLoader:
             verification_remediation=verification_remediation,
             evidence=evidence_contract,
             validity_contract=validity_contract_raw,
+            quality_contract=quality_contract_raw,
             prompt_contracts=prompt_contracts,
             dependencies=deps_raw,
         )
@@ -1823,27 +1978,29 @@ class ProcessLoader:
                 if not isinstance(gate_raw, dict):
                     continue
                 gate_id = str(gate_raw.get("id", "")).strip() or f"gate-{index + 1}"
-                gates.append(IterationGate(
-                    id=gate_id,
-                    type=str(gate_raw.get("type", "")).strip().lower(),
-                    blocking=bool(gate_raw.get("blocking", False)),
-                    operator=str(gate_raw.get("operator", "")).strip().lower(),
-                    value=gate_raw.get("value"),
-                    tool=str(gate_raw.get("tool", "")).strip(),
-                    metric_path=str(gate_raw.get("metric_path", "")).strip(),
-                    target=str(gate_raw.get("target", "")).strip().lower(),
-                    pattern=str(gate_raw.get("pattern", "")),
-                    expect_match=self._bool_or_default(
-                        gate_raw.get("expect_match", True),
-                        True,
-                    ),
-                    verifier_field=str(gate_raw.get("field", "")).strip(),
-                    command=self._command_tokens(gate_raw.get("command")),
-                    timeout_seconds=self._int_or_default(
-                        gate_raw.get("timeout_seconds", 60),
-                        60,
-                    ),
-                ))
+                gates.append(
+                    IterationGate(
+                        id=gate_id,
+                        type=str(gate_raw.get("type", "")).strip().lower(),
+                        blocking=bool(gate_raw.get("blocking", False)),
+                        operator=str(gate_raw.get("operator", "")).strip().lower(),
+                        value=gate_raw.get("value"),
+                        tool=str(gate_raw.get("tool", "")).strip(),
+                        metric_path=str(gate_raw.get("metric_path", "")).strip(),
+                        target=str(gate_raw.get("target", "")).strip().lower(),
+                        pattern=str(gate_raw.get("pattern", "")),
+                        expect_match=self._bool_or_default(
+                            gate_raw.get("expect_match", True),
+                            True,
+                        ),
+                        verifier_field=str(gate_raw.get("field", "")).strip(),
+                        command=self._command_tokens(gate_raw.get("command")),
+                        timeout_seconds=self._int_or_default(
+                            gate_raw.get("timeout_seconds", 60),
+                            60,
+                        ),
+                    )
+                )
 
         return IterationPolicy(
             enabled=bool(raw.get("enabled", False)),
@@ -1998,8 +2155,7 @@ class ProcessLoader:
                 max_contradicted_count = 0
             if max_contradicted_count > 0:
                 errors.append(
-                    f"{label} high-risk validity_contract.max_contradicted_count "
-                    "must be 0",
+                    f"{label} high-risk validity_contract.max_contradicted_count must be 0",
                 )
         if "require_fact_checker_for_synthesis" in contract and not ProcessDefinition._to_bool(
             contract.get("require_fact_checker_for_synthesis", True),
@@ -2061,6 +2217,65 @@ class ProcessLoader:
                 "enforce_cross_claim_date_conflict_check must be true when explicitly set",
             )
 
+    @staticmethod
+    def _validate_quality_contract(
+        contract: dict[str, Any],
+        *,
+        label: str,
+        errors: list[str],
+    ) -> None:
+        if not isinstance(contract, dict):
+            errors.append(f"{label} quality_contract must be a mapping")
+            return
+        for key in (
+            "minimum_overall_score",
+            "minimum_dimension_score",
+            "minimum_requirement_coverage",
+            "minimum_traceability_ratio",
+            "minimum_upstream_evidence_reuse_ratio",
+        ):
+            if key not in contract:
+                continue
+            try:
+                value = float(contract.get(key))
+            except (TypeError, ValueError):
+                errors.append(f"{label} quality_contract.{key} must be numeric")
+                continue
+            if not 0.0 <= value <= 1.0:
+                errors.append(f"{label} quality_contract.{key} must be between 0 and 1")
+        dimensions = contract.get("dimensions", [])
+        if dimensions and not isinstance(dimensions, list):
+            errors.append(f"{label} quality_contract.dimensions must be a list")
+        elif isinstance(dimensions, list) and any(
+            not str(item or "").strip() for item in dimensions
+        ):
+            errors.append(f"{label} quality_contract.dimensions cannot contain empty values")
+        required_sections = contract.get("required_sections", [])
+        if required_sections and not isinstance(required_sections, list):
+            errors.append(f"{label} quality_contract.required_sections must be a list")
+        phase_overrides = contract.get("phase_overrides", {})
+        if phase_overrides and not isinstance(phase_overrides, dict):
+            errors.append(f"{label} quality_contract.phase_overrides must be a mapping")
+        elif isinstance(phase_overrides, dict):
+            for phase_id, override in phase_overrides.items():
+                if not isinstance(override, dict):
+                    errors.append(
+                        f"{label} quality_contract.phase_overrides.{phase_id} must be a mapping"
+                    )
+                    continue
+                ProcessLoader._validate_quality_contract(
+                    override,
+                    label=f"{label} quality_contract.phase_overrides.{phase_id}",
+                    errors=errors,
+                )
+        if "require_source_index_urls" in contract and not isinstance(
+            contract.get("require_source_index_urls"),
+            bool,
+        ):
+            errors.append(
+                f"{label} quality_contract.require_source_index_urls must be boolean",
+            )
+
     def _validate(self, defn: ProcessDefinition) -> list[str]:
         """Validate a ProcessDefinition beyond schema structure."""
         errors: list[str] = []
@@ -2076,8 +2291,7 @@ class ProcessLoader:
             normalized_risk = ProcessDefinition._normalize_risk_level(defn.risk_level)
             if not normalized_risk:
                 errors.append(
-                    "risk_level must be one of {'low', 'medium', 'high', 'critical'} "
-                    "when provided",
+                    "risk_level must be one of {'low', 'medium', 'high', 'critical'} when provided",
                 )
             else:
                 defn.risk_level = normalized_risk
@@ -2090,16 +2304,14 @@ class ProcessLoader:
         # Name format
         if defn.name and not re.match(r"^[a-z0-9][a-z0-9-]*$", defn.name):
             errors.append(
-                f"Invalid name {defn.name!r}: must be lowercase "
-                f"alphanumeric with hyphens",
+                f"Invalid name {defn.name!r}: must be lowercase alphanumeric with hyphens",
             )
 
         # Phase mode
         valid_modes = {"strict", "guided", "suggestive"}
         if defn.phase_mode not in valid_modes:
             errors.append(
-                f"Invalid phase_mode {defn.phase_mode!r}: "
-                f"must be one of {valid_modes}",
+                f"Invalid phase_mode {defn.phase_mode!r}: must be one of {valid_modes}",
             )
 
         output_coordination = defn.output_coordination
@@ -2116,8 +2328,7 @@ class ProcessLoader:
         )
         if publish_mode not in ProcessDefinition._OUTPUT_PUBLISH_MODES:
             errors.append(
-                "output_coordination.publish_mode must be one of "
-                "{'transactional', 'best_effort'}",
+                "output_coordination.publish_mode must be one of {'transactional', 'best_effort'}",
             )
         else:
             output_coordination.publish_mode = publish_mode
@@ -2127,8 +2338,7 @@ class ProcessLoader:
         )
         if conflict_policy not in ProcessDefinition._OUTPUT_CONFLICT_POLICIES:
             errors.append(
-                "output_coordination.conflict_policy must be one of "
-                "{'defer_fifo', 'fail_fast'}",
+                "output_coordination.conflict_policy must be one of {'defer_fifo', 'fail_fast'}",
             )
         else:
             output_coordination.conflict_policy = conflict_policy
@@ -2150,8 +2360,7 @@ class ProcessLoader:
         )
         if root_error:
             errors.append(
-                "output_coordination.intermediate_root "
-                f"{root_error}",
+                f"output_coordination.intermediate_root {root_error}",
             )
         else:
             output_coordination.intermediate_root = normalized_intermediate_root
@@ -2167,8 +2376,7 @@ class ProcessLoader:
             required_fields = defn.verifier_required_response_fields()
             if "passed" not in required_fields:
                 errors.append(
-                    "verification.policy.output_contract.required_fields "
-                    "must include 'passed'",
+                    "verification.policy.output_contract.required_fields must include 'passed'",
                 )
             if "metadata" not in required_fields and defn.verifier_metadata_fields():
                 errors.append(
@@ -2205,9 +2413,13 @@ class ProcessLoader:
                     "evidence.record_schema.facets must be a list when provided",
                 )
 
-            critical_path_behavior = str(
-                defn.verification_remediation.critical_path_behavior or "",
-            ).strip().lower()
+            critical_path_behavior = (
+                str(
+                    defn.verification_remediation.critical_path_behavior or "",
+                )
+                .strip()
+                .lower()
+            )
             if critical_path_behavior and critical_path_behavior not in {
                 "block",
                 "confirm_or_prune_then_queue",
@@ -2221,6 +2433,12 @@ class ProcessLoader:
         if isinstance(defn.validity_contract, dict) and defn.validity_contract:
             self._validate_validity_contract(
                 defn.validity_contract,
+                label="process",
+                errors=errors,
+            )
+        if isinstance(defn.quality_contract, dict) and defn.quality_contract:
+            self._validate_quality_contract(
+                defn.quality_contract,
                 label="process",
                 errors=errors,
             )
@@ -2250,9 +2468,13 @@ class ProcessLoader:
                 )
             else:
                 phase.output_strategy = output_strategy
-            finalizer_input_policy = str(
-                getattr(phase, "finalizer_input_policy", "") or "",
-            ).strip().lower()
+            finalizer_input_policy = (
+                str(
+                    getattr(phase, "finalizer_input_policy", "") or "",
+                )
+                .strip()
+                .lower()
+            )
             if (
                 finalizer_input_policy
                 and finalizer_input_policy not in ProcessDefinition._FINALIZER_INPUT_POLICIES
@@ -2266,6 +2488,12 @@ class ProcessLoader:
             if isinstance(phase.validity_contract, dict) and phase.validity_contract:
                 self._validate_validity_contract(
                     phase.validity_contract,
+                    label=f"phase {phase.id!r}",
+                    errors=errors,
+                )
+            if isinstance(phase.quality_contract, dict) and phase.quality_contract:
+                self._validate_quality_contract(
+                    phase.quality_contract,
                     label=f"phase {phase.id!r}",
                     errors=errors,
                 )
@@ -2383,8 +2611,7 @@ class ProcessLoader:
             for dep in phase.depends_on:
                 if dep not in phase_ids:
                     errors.append(
-                        f"Phase {phase.id!r} depends on unknown phase "
-                        f"{dep!r}",
+                        f"Phase {phase.id!r} depends on unknown phase {dep!r}",
                     )
 
         # Cycle detection (topological sort)
@@ -2411,8 +2638,7 @@ class ProcessLoader:
             overlap = set(defn.tools.required) & set(defn.tools.excluded)
             if overlap:
                 errors.append(
-                    f"Tool(s) both required and excluded: "
-                    f"{', '.join(sorted(overlap))}",
+                    f"Tool(s) both required and excluded: {', '.join(sorted(overlap))}",
                 )
 
         # Auth requirements
@@ -2421,9 +2647,7 @@ class ProcessLoader:
             resource_ref = str(requirement.resource_ref or "").strip()
             resource_id = str(requirement.resource_id or "").strip()
             if not provider and not resource_ref and not resource_id:
-                errors.append(
-                    "auth.required entry missing provider/resource_ref/resource_id"
-                )
+                errors.append("auth.required entry missing provider/resource_ref/resource_id")
                 continue
             source = str(requirement.source or "api").strip().lower()
             if source not in {"api", "mcp"}:
@@ -2492,6 +2716,53 @@ class ProcessLoader:
                 errors.append(
                     f"Process test {test_case.id!r}: timeout_seconds must be > 0",
                 )
+            valid_completion_grades = {
+                "verified",
+                "verified_with_warnings",
+                "degraded",
+            }
+            invalid_completion_grades = sorted(
+                set(test_case.acceptance.allowed_completion_grades) - valid_completion_grades
+            )
+            if invalid_completion_grades:
+                errors.append(
+                    f"Process test {test_case.id!r}: invalid allowed completion grades "
+                    + ", ".join(invalid_completion_grades),
+                )
+            for field_name, values in (
+                (
+                    "artifact_minimum_characters",
+                    test_case.acceptance.artifact_minimum_characters,
+                ),
+                ("csv_minimum_rows", test_case.acceptance.csv_minimum_rows),
+            ):
+                for path, value in values.items():
+                    candidate = Path(path)
+                    if candidate.is_absolute() or ".." in candidate.parts:
+                        errors.append(
+                            f"Process test {test_case.id!r}: quality.{field_name} "
+                            f"contains unsafe artifact path {path!r}",
+                        )
+                    if value < 0:
+                        errors.append(
+                            f"Process test {test_case.id!r}: quality.{field_name}"
+                            f"[{path!r}] must be >= 0",
+                        )
+            for path, patterns in test_case.acceptance.artifact_required_patterns.items():
+                candidate = Path(path)
+                if candidate.is_absolute() or ".." in candidate.parts:
+                    errors.append(
+                        f"Process test {test_case.id!r}: quality."
+                        f"artifact_required_patterns contains unsafe path {path!r}",
+                    )
+                for pattern in patterns:
+                    try:
+                        re.compile(pattern)
+                    except re.error as error:
+                        errors.append(
+                            f"Process test {test_case.id!r}: invalid artifact pattern "
+                            f"for {path!r}: {error}",
+                        )
 
         # Verification rule validation
         for rule in defn.verification_rules:
@@ -2503,8 +2774,7 @@ class ProcessLoader:
                 )
             if rule.severity not in ("warning", "error"):
                 errors.append(
-                    f"Rule {rule.name!r}: invalid severity "
-                    f"{rule.severity!r}",
+                    f"Rule {rule.name!r}: invalid severity {rule.severity!r}",
                 )
             if rule.type not in ("llm", "regex"):
                 errors.append(
@@ -2520,8 +2790,7 @@ class ProcessLoader:
                 "semantic",
             ):
                 errors.append(
-                    f"Rule {rule.name!r}: invalid failure_class "
-                    f"{rule.failure_class!r}",
+                    f"Rule {rule.name!r}: invalid failure_class {rule.failure_class!r}",
                 )
             if rule.remediation_mode and rule.remediation_mode not in (
                 "none",
@@ -2531,8 +2800,7 @@ class ProcessLoader:
                 "remediate_and_retry",
             ):
                 errors.append(
-                    f"Rule {rule.name!r}: invalid remediation_mode "
-                    f"{rule.remediation_mode!r}",
+                    f"Rule {rule.name!r}: invalid remediation_mode {rule.remediation_mode!r}",
                 )
             if rule.scope and rule.scope not in ("phase", "global"):
                 errors.append(
@@ -2604,18 +2872,15 @@ class ProcessLoader:
             )
         if policy.stop_on_no_improvement_attempts < 0:
             errors.append(
-                f"Phase {phase_id!r}: iteration.stop_on_no_improvement_attempts "
-                "must be >= 0",
+                f"Phase {phase_id!r}: iteration.stop_on_no_improvement_attempts must be >= 0",
             )
         if policy.max_replans_after_exhaustion < 0:
             errors.append(
-                f"Phase {phase_id!r}: iteration.max_replans_after_exhaustion "
-                "must be >= 0",
+                f"Phase {phase_id!r}: iteration.max_replans_after_exhaustion must be >= 0",
             )
         if policy.max_total_runner_invocations <= 0:
             errors.append(
-                f"Phase {phase_id!r}: iteration.max_total_runner_invocations "
-                "must be > 0",
+                f"Phase {phase_id!r}: iteration.max_total_runner_invocations must be > 0",
             )
         elif policy.max_total_runner_invocations < policy.max_attempts:
             errors.append(
@@ -2633,8 +2898,7 @@ class ProcessLoader:
             )
         if policy.budget.max_tool_calls <= 0:
             errors.append(
-                f"Phase {phase_id!r}: iteration.iteration_budget.max_tool_calls "
-                "must be > 0",
+                f"Phase {phase_id!r}: iteration.iteration_budget.max_tool_calls must be > 0",
             )
         if not policy.gates:
             errors.append(
@@ -2662,8 +2926,7 @@ class ProcessLoader:
             gate_type = str(gate.type or "").strip().lower()
             if gate_type not in gate_types:
                 errors.append(
-                    f"Phase {phase_id!r}: gate {gate_id!r} has invalid type "
-                    f"{gate.type!r}",
+                    f"Phase {phase_id!r}: gate {gate_id!r} has invalid type {gate.type!r}",
                 )
                 continue
 
@@ -2691,10 +2954,12 @@ class ProcessLoader:
                     errors.append(
                         f"Phase {phase_id!r}: gate {gate_id!r} missing metric_path",
                     )
-                path_hint = " ".join([
-                    str(gate.metric_path or "").strip().lower(),
-                    gate_id.lower(),
-                ])
+                path_hint = " ".join(
+                    [
+                        str(gate.metric_path or "").strip().lower(),
+                        gate_id.lower(),
+                    ]
+                )
                 if "score" in path_hint and isinstance(gate.value, (int, float)):
                     score_like_gate = True
 
@@ -2729,8 +2994,7 @@ class ProcessLoader:
                     )
                 if gate.timeout_seconds <= 0:
                     errors.append(
-                        f"Phase {phase_id!r}: gate {gate_id!r} timeout_seconds "
-                        "must be > 0",
+                        f"Phase {phase_id!r}: gate {gate_id!r} timeout_seconds must be > 0",
                     )
                 for token in gate.command:
                     text = str(token or "")
@@ -2758,8 +3022,7 @@ class ProcessLoader:
 
         if deterministic_blockers == 0:
             errors.append(
-                f"Phase {phase_id!r}: iteration requires at least one deterministic "
-                "blocking gate",
+                f"Phase {phase_id!r}: iteration requires at least one deterministic blocking gate",
             )
         if score_like_gate and policy.stop_on_no_improvement_attempts <= 0:
             errors.append(
@@ -2771,12 +3034,12 @@ class ProcessLoader:
             and policy.stop_on_no_improvement_attempts >= policy.max_attempts
         ):
             errors.append(
-                f"Phase {phase_id!r}: stop_on_no_improvement_attempts must be < "
-                "max_attempts",
+                f"Phase {phase_id!r}: stop_on_no_improvement_attempts must be < max_attempts",
             )
 
     def _detect_cycles(
-        self, phases: list[PhaseTemplate],
+        self,
+        phases: list[PhaseTemplate],
     ) -> list[str] | None:
         """Detect dependency cycles using DFS. Returns cycle path or None."""
         adj: dict[str, list[str]] = {p.id: p.depends_on for p in phases}
@@ -2906,7 +3169,8 @@ class ProcessLoader:
             module_name = f"loom.processes._bundled.{safe_pkg}.{py_file.stem}"
             try:
                 spec = importlib.util.spec_from_file_location(
-                    module_name, py_file,
+                    module_name,
+                    py_file,
                 )
                 if spec and spec.loader:
                     module = importlib.util.module_from_spec(spec)
@@ -2916,9 +3180,7 @@ class ProcessLoader:
                     # Detect and suppress bundled tools that collide on name
                     # with already-registered tools.
                     new_classes = [
-                        cls
-                        for cls in Tool._registered_classes
-                        if cls not in before_classes
+                        cls for cls in Tool._registered_classes if cls not in before_classes
                     ]
                     name_owner: dict[str, type] = dict(before_name_map)
                     for cls in new_classes:
@@ -2941,5 +3203,7 @@ class ProcessLoader:
                         )
             except Exception as e:
                 logger.warning(
-                    "Failed to load bundled tool %s: %s", py_file, e,
+                    "Failed to load bundled tool %s: %s",
+                    py_file,
+                    e,
                 )

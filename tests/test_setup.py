@@ -127,7 +127,10 @@ class TestGenerateToml:
         assert parsed["execution"]["enable_agent_tools"] is True
         assert parsed["execution"]["enable_wp_tools"] is True
         assert parsed["execution"]["enable_process_iteration_loops"] is True
-        assert parsed["limits"]["runner"]["runner_compaction_policy_mode"] == "off"
+        assert (
+            parsed["limits"]["runner"]["runner_compaction_policy_mode"]
+            == "hybrid"
+        )
         assert parsed["telemetry"]["mode"] == "active"
         assert parsed["telemetry"]["runtime_override_enabled"] is True
         assert parsed["telemetry"]["runtime_override_api_enabled"] is False
@@ -171,7 +174,7 @@ class TestGenerateToml:
         assert config.execution.enable_agent_tools is True
         assert config.execution.enable_wp_tools is True
         assert config.execution.enable_process_iteration_loops is True
-        assert config.limits.runner.runner_compaction_policy_mode == "off"
+        assert config.limits.runner.runner_compaction_policy_mode == "hybrid"
 
 
 class TestRunSetup:
@@ -220,7 +223,7 @@ class TestRunSetup:
         assert "enable_agent_tools = true" in content
         assert "enable_wp_tools = true" in content
         assert "enable_process_iteration_loops = true" in content
-        assert 'runner_compaction_policy_mode = "off"' in content
+        assert 'runner_compaction_policy_mode = "hybrid"' in content
         assert "[telemetry]" in content
         assert 'mode = "active"' in content
         assert "ingest_artifact_retention_max_age_days = 14" in content

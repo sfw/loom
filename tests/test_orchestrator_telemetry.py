@@ -47,6 +47,28 @@ def test_accumulate_subtask_telemetry_updates_rollup() -> None:
     assert orchestrator._telemetry_rollup["sealed_reseal_applied"] == 2
 
 
+def test_accumulate_subtask_telemetry_is_isolated_by_task() -> None:
+    orchestrator = SimpleNamespace(_telemetry_rollups_by_task={})
+    first = SimpleNamespace(telemetry_counters={"model_invocations": 2, "tool_calls": 3})
+    second = SimpleNamespace(telemetry_counters={"model_invocations": 7, "tool_calls": 11})
+
+    orchestrator_telemetry.accumulate_subtask_telemetry(
+        orchestrator,
+        "task-a",
+        first,  # type: ignore[arg-type]
+    )
+    orchestrator_telemetry.accumulate_subtask_telemetry(
+        orchestrator,
+        "task-b",
+        second,  # type: ignore[arg-type]
+    )
+
+    assert orchestrator._telemetry_rollups_by_task["task-a"]["model_invocations"] == 2
+    assert orchestrator._telemetry_rollups_by_task["task-a"]["tool_calls"] == 3
+    assert orchestrator._telemetry_rollups_by_task["task-b"]["model_invocations"] == 7
+    assert orchestrator._telemetry_rollups_by_task["task-b"]["tool_calls"] == 11
+
+
 def test_task_event_counts_and_verification_reason_counts() -> None:
     bus = EventBus()
     bus.emit(Event(event_type="task_started", task_id="t1", data={}))
@@ -146,6 +168,20 @@ def test_emit_telemetry_run_summary_includes_reliability_metrics() -> None:
     orchestrator = SimpleNamespace(
         _emitted_telemetry_summary_runs=set(),
         _telemetry_rollup=orchestrator_telemetry.new_telemetry_rollup(),
+        _semantic_compactor_rollup={
+            "model_calls": 7,
+            "model_call_duration_ms": 1250,
+            "validation_attempts": 9,
+            "validation_failures": 2,
+            "retry_attempts": 2,
+            "warning_outputs": 1,
+        },
+        _task_correction_cycle_states={
+            "t-run": {
+                "corr-resolved": "resolved",
+                "corr-open": "retrying",
+            },
+        },
         _events=bus,
         _task_run_id=lambda task: "run-1",
         _new_telemetry_rollup=orchestrator_telemetry.new_telemetry_rollup,
@@ -232,3 +268,7 @@ def test_emit_telemetry_run_summary_includes_reliability_metrics() -> None:
         == 1
     )
     assert summary["development_verification_health"]["verifier_infra_reasons"] == 2
+    assert summary["semantic_compactor"]["model_calls"] == 7
+    assert summary["semantic_compactor"]["validation_failures"] == 2
+    assert summary["correction_lifecycle_counts"]["unique_cycles"] == 2
+    assert summary["correction_lifecycle_counts"]["open"] == 1

@@ -20,19 +20,19 @@ This is exactly the kind of issue the frontend refactor should fix with local-fi
 
 ## Observed Runtime Evidence
 From the desktop runtime database for the reported run:
-1. task id: `0cd532ca`
+1. task id: `task-example-1`
 2. created at: `2026-04-01T20:00:50.143155`
 3. updated at: `2026-04-01T20:03:43.912195`
 4. status: `failed`
-5. stored `workspace_path`: `/Users/sfw/Documents/loom-root/AI-Native/can-you-research-who-is-going`
+5. stored `workspace_path`: `/Users/example/workspaces/Demo-Workspace/research-run`
 6. stored metadata:
-   - `source_workspace_root = /Users/sfw/Documents/loom-root/AI-Native`
-   - `run_workspace_relative = can-you-research-who-is-going`
+   - `source_workspace_root = /Users/example/workspaces/Demo-Workspace`
+   - `run_workspace_relative = research-run`
    - `run_workspace_mode = scoped_subfolder`
 7. registered workspace row:
-   - `ws-027ce6429feb -> /Users/sfw/Documents/loom-root/AI-Native`
+   - `ws-example-1 -> /Users/example/workspaces/Demo-Workspace`
 
-This means the task is correctly grouped under `AI-Native`, but only if consumers use `source_workspace_root` fallback logic.
+This means the task is correctly grouped under `Demo-Workspace`, but only if consumers use `source_workspace_root` fallback logic.
 
 ## Repo-Accurate Diagnosis
 
