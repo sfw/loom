@@ -26,6 +26,7 @@ jobs:
       APPLE_PROVIDER_SHORT_NAME: ${{ secrets.APPLE_PROVIDER_SHORT_NAME }}
       APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
       APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+      APPLE_API_AUTH_READY: ${{ secrets.APPLE_API_KEY != '' && secrets.APPLE_API_ISSUER != '' && secrets.APPLE_API_KEY_P8 != '' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -60,12 +61,14 @@ jobs:
         run: cargo test
 
       - name: Materialize App Store Connect API key
-        if: ${{ secrets.APPLE_API_KEY != '' && secrets.APPLE_API_KEY_P8 != '' }}
+        if: ${{ env.APPLE_API_AUTH_READY == 'true' }}
         shell: bash
+        env:
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
         run: |
           mkdir -p "$RUNNER_TEMP/private_keys"
           key_path="$RUNNER_TEMP/private_keys/AuthKey_${APPLE_API_KEY}.p8"
-          printf '%s' "${{ secrets.APPLE_API_KEY_P8 }}" > "$key_path"
+          printf '%s' "$APPLE_API_KEY_P8" > "$key_path"
           chmod 600 "$key_path"
           echo "APPLE_API_KEY_PATH=$key_path" >> "$GITHUB_ENV"
 
@@ -117,11 +120,11 @@ jobs:
         run: codesign --force --sign "${APPLE_SIGNING_IDENTITY}" "apps/desktop/src-tauri/target/release/bundle/dmg/Loom Desktop.dmg"
 
       - name: Notarize DMG with App Store Connect API key
-        if: ${{ secrets.APPLE_API_KEY != '' && secrets.APPLE_API_KEY_P8 != '' }}
+        if: ${{ env.APPLE_API_AUTH_READY == 'true' }}
         run: xcrun notarytool submit "apps/desktop/src-tauri/target/release/bundle/dmg/Loom Desktop.dmg" --key "${APPLE_API_KEY_PATH}" --key-id "${APPLE_API_KEY}" --issuer "${APPLE_API_ISSUER}" --wait
 
       - name: Notarize DMG with Apple ID
-        if: ${{ !(secrets.APPLE_API_KEY != '' && secrets.APPLE_API_KEY_P8 != '') }}
+        if: ${{ env.APPLE_API_AUTH_READY != 'true' }}
         run: xcrun notarytool submit "apps/desktop/src-tauri/target/release/bundle/dmg/Loom Desktop.dmg" --apple-id "${APPLE_ID}" --password "${APPLE_PASSWORD}" --team-id "${APPLE_TEAM_ID}" --wait
 
       - name: Staple DMG notarization ticket
